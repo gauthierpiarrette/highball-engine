@@ -1,0 +1,171 @@
+name: build-dxmt
+
+# Builds Highball's DXMT branch (github.com/gauthierpiarrette/dxmt, upstream 3Shain/dxmt plus
+# patches) the way upstream's own CI does: LLVM 15 built once for the host (airconv) and cached,
+# then the x86_64 and i386 Windows halves cross-compiled with mingw-w64, packaged in the layout
+# Highball's engine manifest extracts (renderers/dxmt/wine/{x86_64-windows,i386-windows,x86_64-unix}).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "dxmt fork ref to build"
+        default: "main"
+      publish_release:
+        description: "publish a GitHub release with the tarball"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  LLVM_VERSION: llvmorg-15.0.7
+  WINE_VERSION: v8.16-3shain
+  WINE_URL: https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
+  DXMT_REPO: gauthierpiarrette/dxmt
+
+jobs:
+  llvm-darwin:
+    runs-on: macos-15
+    steps:
+      - name: Cache LLVM (host build for airconv)
+        id: cache
+        uses: actions/cache@v4
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+          lookup-only: true
+      - name: Clone LLVM
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch ${{ env.LLVM_VERSION }} https://github.com/llvm/llvm-project.git toolchains/llvm-project
+      - name: Build LLVM for the host (x86_64)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          brew install ninja >/dev/null
+          mkdir -p ./toolchains/llvm-darwin-build
+          cmake -B ./toolchains/llvm-darwin-build -S ./toolchains/llvm-project/llvm \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/toolchains/llvm-darwin" \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DLLVM_HOST_TRIPLE=x86_64-apple-darwin \
+            -DLLVM_ENABLE_ASSERTIONS=On \
+            -DLLVM_ENABLE_ZSTD=Off \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_BUILD_TOOLS=Off \
+            -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
+            -G Ninja
+          cmake --build ./toolchains/llvm-darwin-build
+          cmake --install ./toolchains/llvm-darwin-build
+      - name: Save LLVM cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+
+  build-win64:
+    runs-on: macos-15
+    needs: llvm-darwin
+    steps:
+      - name: Checkout the DXMT fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DXMT_REPO }}
+          ref: ${{ inputs.ref }}
+          submodules: true
+      - name: Wine headers and tools
+        run: |
+          mkdir -p ./toolchains/wine
+          curl -sSL "${{ env.WINE_URL }}" | tar -xz -C ./toolchains/wine
+      - name: Restore LLVM cache
+        uses: actions/cache/restore@v4
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+          fail-on-cache-miss: true
+      - name: mingw-w64 and meson
+        run: |
+          brew install mingw-w64 >/dev/null
+          pip3 install meson==1.10.0 --break-system-packages
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+      - name: Build (x86_64)
+        run: |
+          meson setup --cross-file build-win64.txt -Denable_nvapi=true -Denable_nvngx=true \
+            -Dnative_llvm_path=toolchains/llvm-darwin -Dwine_install_path=toolchains/wine \
+            build --buildtype release --prefix "$(pwd)/install" --strip
+          meson compile -C build
+          meson install -C build
+          git rev-parse --short HEAD > install/DXMT_COMMIT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dxmt-win64
+          path: install
+
+  build-win32:
+    runs-on: macos-15
+    steps:
+      - name: Checkout the DXMT fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DXMT_REPO }}
+          ref: ${{ inputs.ref }}
+          submodules: true
+      - name: Wine headers and tools
+        run: |
+          mkdir -p ./toolchains/wine
+          curl -sSL "${{ env.WINE_URL }}" | tar -xz -C ./toolchains/wine
+      - name: mingw-w64 and meson
+        run: |
+          brew install mingw-w64 >/dev/null
+          pip3 install meson==1.10.0 --break-system-packages
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+      - name: Build (i386, WoW64 half)
+        run: |
+          meson setup --cross-file build-win32.txt -Dwine_install_path=toolchains/wine \
+            build --buildtype release --prefix "$(pwd)/install" --strip
+          meson compile -C build
+          meson install -C build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dxmt-win32
+          path: install
+
+  package:
+    runs-on: macos-15
+    needs: [build-win64, build-win32]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dxmt-win64
+          path: ./combined/highball
+      - uses: actions/download-artifact@v4
+        with:
+          name: dxmt-win32
+          path: ./combined/highball
+      - name: Tarball
+        id: tar
+        run: |
+          commit=$(cat ./combined/highball/DXMT_COMMIT)
+          rm -f ./combined/highball/DXMT_COMMIT
+          name="dxmt-highball-$(date -u +%Y%m%dT%H%M%SZ)-${commit}"
+          tar -czf "$name.tar.gz" -C ./combined --exclude='*.a' highball
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -la ./combined/highball; cat "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tar.outputs.name }}
+          path: |
+            ${{ steps.tar.outputs.name }}.tar.gz
+            ${{ steps.tar.outputs.name }}.tar.gz.sha256
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n="${{ steps.tar.outputs.name }}"
+          gh release create "$n" "$n.tar.gz" "$n.tar.gz.sha256" -R "${{ github.repository }}" \
+            --title "$n" --notes "DXMT from ${{ env.DXMT_REPO }}@${{ inputs.ref }} (SwapDeviceContextState implemented, cross-process swapchain opt-in). Extracts into renderers/dxmt/wine with subpath highball."
