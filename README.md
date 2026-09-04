@@ -59,4 +59,4 @@ are unwelcome by their own policies.
 
 ## Releases
 
-A dispatch with `publish_release=true` creates a GitHub release tagged after the artifact (`engine-wine-<version>-<date>-<note>`) with the tarball and its `.sha256`. Highball's engine manifest (`spike/engines/<id>.json` in the app repository) names the tarball's URL, size and checksum, and extracts its `engine/` subtree; the app never builds anything itself. Current: `engine-wine-11.0-20260904T130339Z-username`, the first release with Wine Mono and Gecko included and the user-name patch applied.
+A dispatch with `publish_release=true` creates a GitHub release tagged after the artifact (`engine-wine-<version>-<date>-<note>`) with the tarball and its `.sha256`. Highball's engine manifest (`spike/engines/<id>.json` in the app repository) names the tarball's URL, size and checksum, and extracts its `engine/` subtree; the app never builds anything itself. Current: `engine-wine-11.0-20260904T134906Z-overlays`, with Wine Mono and Gecko included and patches 0001 to 0003 applied (real user name, OpenGL-first wined3d, WINEDLLPATH_PREPEND).
