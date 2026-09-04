@@ -71,3 +71,5 @@ by another process, which public DXMT refuses; with the browser kept off the GPU
 starts. The fix is a driver change (a Cocoa overlay window for foreign client surfaces in
 winemac.drv, and DXMT reading the layer through it) or a DXMT change CodeWeavers has not
 published. Highball issue #56 tracks the question of Wine 11 support.
+
+- `0005-ntdll-yield-after-auto-event-set.patch`: after an auto-reset event goes 0→1 (msync) or the server reports a 0→1 set (sync=none), yield once so the woken waiter runs before the setter can signal again. Windows boosts the woken thread; without it a job hand-off that signals twice loses the second wake-up (CS:GO legacy's map-load freeze on macOS 26 under Rosetta, reproduced 2026-09-04).
