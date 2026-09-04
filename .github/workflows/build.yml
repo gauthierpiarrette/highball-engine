@@ -12,6 +12,8 @@ on:
         description: "why this build (free text, goes in the artifact name)"
         required: false
         default: "manual"
+permissions:
+  contents: write   # the optional release step creates a release and uploads the tarball
 jobs:
   build:
     # Intel runner on purpose: the Unix side of this tree is x86_64 only (the Mac driver's
