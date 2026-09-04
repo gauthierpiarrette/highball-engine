@@ -43,6 +43,8 @@ jobs:
           path: ~/Library/Caches/ccache
           key: ccache-${{ runner.os }}-${{ hashFiles('inputs.json', 'patches/**') }}
           restore-keys: ccache-${{ runner.os }}-
+      # OpenGL is not passed explicitly: configure then treats the missing EGL headers
+      # (there is no EGL on macOS) as a notice, and the Mac driver links OpenGL.framework.
       - name: configure and build
         run: |
           set -euo pipefail
@@ -53,7 +55,7 @@ jobs:
             --with-mingw \
             --without-alsa --without-capi --with-coreaudio --without-cups --without-dbus \
             --without-fontconfig --with-freetype --with-gnutls --without-gphoto --with-gstreamer \
-            --without-krb5 --without-netapi --with-opengl --without-oss --without-pulse \
+            --without-krb5 --without-netapi --without-oss --without-pulse \
             --without-sane --with-sdl --without-udev --without-usb --without-v4l2 --without-x \
             --disable-tests \
             CC="ccache clang" CXX="ccache clang++" \
