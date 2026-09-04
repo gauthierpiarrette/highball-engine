@@ -93,6 +93,17 @@ jobs:
             tar -xJf "wine-gecko-${arch}.tar.xz" -C out/engine/share/wine/gecko
           done
           ls out/engine/share/wine/mono out/engine/share/wine/gecko
+          # DXMT's bridge library as a Wine built-in, like Sikarugir's engines ship it. Wine only
+          # loads a built-in from the overlay when the prefix carries a placeholder for it, and
+          # wineboot writes placeholders for the engine's own built-ins only; without this copy
+          # DXMT's dxgi failed to find winemetal.dll on every launch (2026-09-04). The overlay's
+          # copy still wins at load time because it is searched first.
+          curl -sSfL -o dxmt.tar.gz "https://github.com/3Shain/dxmt/releases/download/v0.80/dxmt-v0.80-builtin.tar.gz"
+          mkdir -p dxmt && tar -xzf dxmt.tar.gz -C dxmt
+          for arch in x86_64 i386; do
+            f=$(find dxmt -path "*${arch}-windows/winemetal.dll" | head -1)
+            [ -n "$f" ] && cp "$f" "out/engine/lib/wine/${arch}-windows/winemetal.dll" && echo "winemetal.dll ($arch) added"
+          done
           # Strip debug info: the PE builtins come out of the compile 5 to 7 times larger than
           # the ones Sikarugir ships (ntdll.dll 4.7 MB against 0.7 MB). Exports and the Unix
           # side's global symbols stay, which is what Wine's loader needs.
