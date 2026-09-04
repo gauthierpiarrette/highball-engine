@@ -1,0 +1,77 @@
+# Builds the engine from the pinned CrossOver sources. Manual dispatch only until the first
+# build is green and boots a bottle through Highball; nothing in the app points here yet.
+name: build-engine
+on:
+  workflow_dispatch:
+    inputs:
+      ref_note:
+        description: "why this build (free text, goes in the artifact name)"
+        required: false
+        default: "manual"
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: pinned source
+        run: |
+          set -euo pipefail
+          url=$(python3 -c 'import json;print(json.load(open("inputs.json"))["wine"]["url"])')
+          sha=$(python3 -c 'import json;print(json.load(open("inputs.json"))["wine"]["sha256"])')
+          curl -sSL -o crossover-sources.tar.gz "$url"
+          echo "$sha  crossover-sources.tar.gz" | shasum -a 256 -c -
+          mkdir -p src && tar -xzf crossover-sources.tar.gz -C src
+          ls src/sources/wine | head -3
+      - name: apply patch series
+        run: |
+          set -euo pipefail
+          cd src/sources/wine
+          for p in ../../../patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; patch -p1 < "$p"; done
+      - name: toolchain
+        run: |
+          set -euo pipefail
+          brew install -q mingw-w64 bison pkg-config ccache gnutls freetype sdl2 libpng jpeg-turbo gstreamer || true
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          x86_64-w64-mingw32-gcc --version | head -1
+          i686-w64-mingw32-gcc --version | head -1
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('inputs.json', 'patches/**') }}
+          restore-keys: ccache-${{ runner.os }}-
+      - name: configure and build
+        run: |
+          set -euo pipefail
+          mkdir -p build && cd build
+          ../src/sources/wine/configure \
+            --prefix="$PWD/../out/engine" \
+            --enable-archs=i386,x86_64 \
+            --with-mingw \
+            --without-alsa --without-capi --with-coreaudio --without-cups --without-dbus \
+            --without-fontconfig --with-freetype --with-gnutls --without-gphoto --with-gstreamer \
+            --without-krb5 --without-netapi --with-opengl --without-oss --without-pulse \
+            --without-sane --with-sdl --without-udev --without-usb --without-v4l2 --without-x \
+            --disable-tests \
+            CC="ccache clang" CXX="ccache clang++" \
+            CROSSCC="ccache x86_64-w64-mingw32-gcc" \
+            i386_CC="ccache i686-w64-mingw32-gcc" x86_64_CC="ccache x86_64-w64-mingw32-gcc"
+          make -j"$(sysctl -n hw.ncpu)"
+          make install-lib
+      - name: engine layout
+        run: |
+          set -euo pipefail
+          # Highball's engine layout: engine/{bin,lib,share}, renderers/, frameworks/, tools/, manifest.json
+          mkdir -p out/renderers out/frameworks out/tools
+          test -x out/engine/bin/wine
+          out/engine/bin/wine --version || true
+          tar -C out -czf "engine-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}.tar.gz" .
+          shasum -a 256 engine-*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine
+          path: engine-*.tar.gz
+          retention-days: 14

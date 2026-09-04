@@ -1,0 +1,19 @@
+{
+  "wine": {
+    "name": "CrossOver 26.3.0 sources (LGPL)",
+    "url": "https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.3.0.tar.gz",
+    "size": 149054023,
+    "sha256": "ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872",
+    "subdir": "sources/wine"
+  },
+  "moltenvk": {
+    "name": "MoltenVK 1.4.2",
+    "url": "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar",
+    "sha256": null,
+    "note": "pin the sha before the first real build; Highball may substitute its own patched build as a component"
+  },
+  "toolchain": {
+    "runner": "macos-15",
+    "mingw": "mingw-w64 (gcc) via Homebrew; llvm-mingw is known to break Steam's login (frankea, 2026-08-04)"
+  }
+}
