@@ -9,6 +9,9 @@ Current series:
 
 - `0001-use-the-real-user-name.patch`: CrossOver Hack 12735 names the Windows user "crossover" and hardcodes `C:\users\crossover`; Highball bottles carry `C:\users\<macOS user>`, and a bottle moved to this engine would get a second profile directory. Restores upstream Wine's behaviour in advapi32 and shell32. Verified 2026-09-04 (M1 Pro, macOS 26.6.2).
 
+- `0002-wined3d-auto-renderer-opengl-first.patch`: CrossOver hack 18311 tries the Vulkan wined3d adapter first on macOS; with MoltenVK present it is created and then fails Direct3D 11 feature checks (Warframe's launcher, Rockstar's launcher). Upstream's OpenGL-first choice, which Sikarugir's engine shows in practice, restored; renderer=vulkan stays selectable.
+- `0003-ntdll-winedllpath-prepend.patch`: WINEDLLPATH_PREPEND support (MacPorts GPTK patch 1005), without which none of Highball's renderer overlays applied on this engine.
+
 Candidates, in order, from the 2026-09 investigation:
 
 1. Rockstar Games Launcher installer: the service start that the CrossOver tree completes and the
