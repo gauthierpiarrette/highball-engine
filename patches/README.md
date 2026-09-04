@@ -19,3 +19,12 @@ Candidates, in order, from the 2026-09 investigation:
    only if the diff between the two trees is not already in this base.
 2. CS:GO Legacy: a wait-completion boost emulation for Source's thread pool hand-off (lost wake-up
    race measured 2026-09-02). Experimental.
+
+## 0004-foreign-client-surface-overlay.patch
+
+winemac.drv: a client surface for a window another process owns draws into a borderless,
+mouse-transparent overlay window of ours, framed on the foreign window's client rect and kept
+above it on every present. This is the driver half of cross-process presenting for CEF-based
+launchers (Steam's browser, Rockstar, Ubisoft) under DXMT; the DXMT half is the
+DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN opt-in in github.com/gauthierpiarrette/dxmt. Unverified until
+build 12 and the Steam-on-r2 test.
