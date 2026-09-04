@@ -10,7 +10,10 @@ on:
         default: "manual"
 jobs:
   build:
-    runs-on: macos-15
+    # Intel runner on purpose: the Unix side of this tree is x86_64 only (the Mac driver's
+    # Metal layer class in d3dmetal_objc.h sits behind #if defined(__x86_64__)), as in
+    # CrossOver's and Sikarugir's own builds. It runs under Rosetta on Apple Silicon.
+    runs-on: macos-15-intel
     timeout-minutes: 300
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"

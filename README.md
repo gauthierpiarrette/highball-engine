@@ -48,3 +48,8 @@ LGPL sources.
 A game that misbehaves on an engine built here is a bug for this repository or for Highball, not
 for CodeWeavers, Sikarugir or WineHQ. Reports there about a patched build waste their time and
 are unwelcome by their own policies.
+
+## Build notes
+
+- The Unix side is built as x86_64 on an Intel runner (`macos-15-intel`). The CrossOver tree guards its Metal layer class with `#if defined(__x86_64__)`, and the Mac driver uses it unconditionally, so an arm64 host compile fails in `cocoa_window.m`. CrossOver and Sikarugir ship x86_64 Unix libraries that run under Rosetta.
+- `--with-opengl` must not be passed: configure makes the missing EGL headers a hard error when OpenGL is requested explicitly, and macOS has no EGL. Without the flag the Mac driver links OpenGL.framework.

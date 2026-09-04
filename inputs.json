@@ -13,7 +13,8 @@
     "note": "pin the sha before the first real build; Highball may substitute its own patched build as a component"
   },
   "toolchain": {
-    "runner": "macos-15",
-    "mingw": "mingw-w64 (gcc) via Homebrew; llvm-mingw is known to break Steam's login (frankea, 2026-08-04)"
+    "runner": "macos-15-intel",
+    "mingw": "mingw-w64 (gcc) via Homebrew; llvm-mingw is known to break Steam's login (frankea, 2026-08-04)",
+    "hostArch": "x86_64"
   }
 }
