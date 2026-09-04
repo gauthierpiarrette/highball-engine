@@ -55,3 +55,4 @@ are unwelcome by their own policies.
 - `--with-opengl` must not be passed: configure makes the missing EGL headers a hard error when OpenGL is requested explicitly, and macOS has no EGL. Without the flag the Mac driver links OpenGL.framework.
 - MoltenVK must be present at build time (`brew install molten-vk`): configure defines the Vulkan library name from `-lMoltenVK`, and the tree's win32u uses that name unguarded, so without it the compile fails in `dlls/win32u/vulkan.c`. The engine still ships its own libMoltenVK at runtime.
 - Wine Mono and Gecko are unpacked into `share/wine/mono` and `share/wine/gecko` at the versions the tree names in `dlls/appwiz.cpl/addons.c`. Without them a bottle's first boot stops at Wine's "download Mono?" prompt, which no unattended run can answer.
+- The tree's CrossOver hack that names the Windows user "crossover" is reverted by the first patch in the series, so bottles keep `C:\users\<macOS user>` like on the Sikarugir engines.
