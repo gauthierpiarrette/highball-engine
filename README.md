@@ -70,5 +70,4 @@ by another process, which public DXMT refuses; with the browser kept off the GPU
 (`-cef-disable-gpu`) Steam's window stays black and a game launched through that client never
 starts. The fix is a driver change (a Cocoa overlay window for foreign client surfaces in
 winemac.drv, and DXMT reading the layer through it) or a DXMT change CodeWeavers has not
-published. Details and the experiments are in the Highball app repository's private notes; the
-public summary is in Highball issue #56.
+published. Highball issue #56 tracks the question of Wine 11 support.
