@@ -56,3 +56,7 @@ are unwelcome by their own policies.
 - MoltenVK must be present at build time (`brew install molten-vk`): configure defines the Vulkan library name from `-lMoltenVK`, and the tree's win32u uses that name unguarded, so without it the compile fails in `dlls/win32u/vulkan.c`. The engine still ships its own libMoltenVK at runtime.
 - Wine Mono and Gecko are unpacked into `share/wine/mono` and `share/wine/gecko` at the versions the tree names in `dlls/appwiz.cpl/addons.c`. Without them a bottle's first boot stops at Wine's "download Mono?" prompt, which no unattended run can answer.
 - The tree's CrossOver hack that names the Windows user "crossover" is reverted by the first patch in the series, so bottles keep `C:\users\<macOS user>` like on the Sikarugir engines.
+
+## Releases
+
+A dispatch with `publish_release=true` creates a GitHub release tagged after the artifact (`engine-wine-<version>-<date>-<note>`) with the tarball and its `.sha256`. Highball's engine manifest (`spike/engines/<id>.json` in the app repository) names the tarball's URL, size and checksum, and extracts its `engine/` subtree; the app never builds anything itself. Current: `engine-wine-11.0-20260904T130339Z-username`, the first release with Wine Mono and Gecko included and the user-name patch applied.
