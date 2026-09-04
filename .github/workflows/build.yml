@@ -73,10 +73,24 @@ jobs:
           mkdir -p out/renderers out/frameworks out/tools
           test -x out/engine/bin/wine
           out/engine/bin/wine --version || true
-          tar -C out -czf "engine-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}.tar.gz" .
-          shasum -a 256 engine-*.tar.gz
+          # Strip debug info: the PE builtins come out of the compile 5 to 7 times larger than
+          # the ones Sikarugir ships (ntdll.dll 4.7 MB against 0.7 MB). Exports and the Unix
+          # side's global symbols stay, which is what Wine's loader needs.
+          before=$(du -sm out/engine | cut -f1)
+          find out/engine/lib/wine/x86_64-windows out/engine/lib/wine/i386-windows \( -name '*.dll' -o -name '*.exe' -o -name '*.sys' -o -name '*.drv' -o -name '*.cpl' -o -name '*.ocx' -o -name '*.acm' -o -name '*.tlb' \) -type f -print0 \
+            | xargs -0 -n 50 x86_64-w64-mingw32-strip --strip-debug 2>/dev/null || true
+          find out/engine/lib/wine/x86_64-unix -name '*.so' -type f -print0 | xargs -0 -n 50 strip -x -S 2>/dev/null || true
+          strip -x -S out/engine/bin/wine out/engine/bin/wineserver 2>/dev/null || true
+          echo "engine size: ${before} MB -> $(du -sm out/engine | cut -f1) MB"
+          out/engine/bin/wine --version
+          name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
+          tar -C out -czf "${name}.tar.gz" .
+          shasum -a 256 "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
+          ls -la "${name}.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: engine
-          path: engine-*.tar.gz
+          path: |
+            engine-*.tar.gz
+            engine-*.tar.gz.sha256
           retention-days: 14
