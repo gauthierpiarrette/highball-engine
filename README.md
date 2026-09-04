@@ -73,3 +73,4 @@ winemac.drv, and DXMT reading the layer through it) or a DXMT change CodeWeavers
 published. Highball issue #56 tracks the question of Wine 11 support.
 
 - `0005-ntdll-yield-after-auto-event-set.patch`: after an auto-reset event goes 0→1 (msync) or the server reports a 0→1 set (sync=none), yield once so the woken waiter runs before the setter can signal again. Windows boosts the woken thread; without it a job hand-off that signals twice loses the second wake-up (CS:GO legacy's map-load freeze on macOS 26 under Rosetta, reproduced 2026-09-04).
+- `0006-kernelbase-per-exe-command-line-append.patch`: `HKCU\Software\Wine\AppDefaults\<exe>\CommandLineAppend` (REG_SZ) is appended to that executable's command line at CreateProcess. Data-driven per-app switches for programs that never forward them to their subprocesses (a launcher's CEF browser: --log-severity, --log-file, GPU switches). Proton keeps a hard-coded table for the same purpose.
