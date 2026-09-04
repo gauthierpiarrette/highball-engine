@@ -113,6 +113,7 @@ jobs:
           path: |
             engine-*.tar.gz
             engine-*.tar.gz.sha256
+          retention-days: 14
       - name: publish release
         if: ${{ github.event.inputs.publish_release == 'true' }}
         env:
@@ -122,4 +123,3 @@ jobs:
           f=$(ls engine-*.tar.gz | head -1)
           tag="${f%.tar.gz}"
           gh release create "$tag" "$f" "$f.sha256" --title "$tag" --notes "Wine from the pinned CrossOver source (inputs.json) with the patch series in patches/. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."
-          retention-days: 14
