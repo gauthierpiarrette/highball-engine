@@ -1,3 +1,27 @@
+Highball: winemac.drv presents a Metal swapchain for a window whose root another process owns.
+
+Wine bug 60263. A CEF GPU process (Rockstar's SocialClubHelper, Steam's steamwebhelper, Ubisoft
+Connect) asks D3DMetal/DXMT for a swapchain on a child window whose root window belongs to the
+CEF browser process. The driver's win data is per process, so get_win_data() cannot see the
+root, the macdrv_functions shim handed DXMT no view, the swapchain failed and Chromium restarted
+the GPU process until it gave up: a black launcher window. Launch switches do not help.
+
+The rendering process now draws into a CAMetalLayer exported through a CAContext, and the
+process that owns the root window hosts that layer in its content view through a CALayerHost,
+positioned on the child's rect, clipped to it, stacked in Win32 paint order and kept in place
+as the child and the root move. This is upstream Wine's CAContext/CALayerHost route (11.11+,
+reached there only from vulkan.c) backported to this wine-11.0 base, plus the child window
+geometry, z-order, 0x0 and lifetime handling from the bug's reference patch, wired into the
+macdrv_functions shim that D3DMetal and DXMT use, so DXMT needs no change. Messages:
+WM_MACDRV_CREATE_REMOTE_LAYER / RELEASE / UPDATE, posted to the root window's owner. vulkan.c
+takes the same route through macdrv_client_surface_acquire_metal_swapchain().
+
+Applies on top of 0001-0003, 0005 and 0006 with 0004 (the overlay-window attempt at the same
+problem) dropped; none of those touch dlls/winemac.drv. Compile-checked with clang -fsyntax-only
+against the CrossOver 26.3 include tree and link-checked for the private CoreAnimation symbols;
+not yet run. Upstream status: bug open, reference implementation attached to the bug by its
+author, not submitted.
+
 --- a/dlls/winemac.drv/macdrv.h
 +++ b/dlls/winemac.drv/macdrv.h
 @@ -100,6 +100,12 @@
