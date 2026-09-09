@@ -12,6 +12,7 @@ Current series:
 - `0002-wined3d-auto-renderer-opengl-first.patch`: CrossOver hack 18311 tries the Vulkan wined3d adapter first on macOS; with MoltenVK present it is created and then fails Direct3D 11 feature checks (Warframe's launcher, Rockstar's launcher). Upstream's OpenGL-first choice, which Sikarugir's engine shows in practice, restored; renderer=vulkan stays selectable.
 - `0003-ntdll-winedllpath-prepend.patch`: WINEDLLPATH_PREPEND support (MacPorts GPTK patch 1005), without which none of Highball's renderer overlays applied on this engine.
 
+- `0008-macos-mirror-teb-fiberdata.patch`: on macOS the %gs base is the host thread block, so signal_init_process() mirrors Tib.Self, ThreadLocalStoragePointer and Peb into it but not Tib.FiberData. GetCurrentFiber() is an intrinsic reading %gs:0x20 directly, so a fiber-based job system reads a host value (measured: a constant 0x8ff on every thread) and hands it back to SwitchToFiber, which faults. Mirrors the field at thread start and in the three places kernelbase changes it. Measured on M1 Pro, macOS 26.6.2, engine x64-crossover26.3-r4, 2026-09-09; reproducers need no game. NOT yet verified to make Marvel's Guardians of the Galaxy run, and does not explain why CodeWeavers' own testers report that game working on M1 from this same tree. Upstream: not yet reported.
 Candidates, in order, from the 2026-09 investigation:
 
 1. Rockstar Games Launcher installer: the service start that the CrossOver tree completes and the

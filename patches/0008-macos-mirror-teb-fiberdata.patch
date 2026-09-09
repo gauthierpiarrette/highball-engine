@@ -1,0 +1,95 @@
+macOS: mirror Tib.FiberData into the %gs block so GetCurrentFiber() works.
+
+On macOS the %gs base is the host thread block rather than the TEB, so
+signal_init_process() mirrors individual TEB fields into it: Tib.Self,
+ThreadLocalStoragePointer and Peb. Tib.FiberData is not mirrored.
+
+GetCurrentFiber() is a compiler intrinsic that reads %gs:0x20 directly, so Wine
+never sees the call and cannot correct the value. A game whose job system reads
+it therefore gets a host value and passes it straight back to SwitchToFiber,
+which dereferences it and faults.
+
+MEASURED (M1 Pro, macOS 26.6.2, engine x64-crossover26.3-r4, 2026-09-09):
+gs:0x30 and gs:0x60 track the TEB and PEB correctly, while gs:0x20 returns a
+constant 0x8ff on every thread and does not follow writes to
+TEB->Tib.FiberData. Wine's own fiber bookkeeping is correct throughout; only
+the mirror is missing. Marvel's Guardians of the Galaxy (Steam 1088850) renders
+its splash under D3DMetal and then faults on "Play Game" reading 0x907, which
+is 0x8ff + 8, the offset SwitchToFiber reads from the fiber it is handed.
+Reproducers: private/notes/fibertest2.c and gstest.c in the Highball repo;
+neither needs the game.
+
+NOT YET VERIFIED: that this patch makes Guardians run. It is built to fix the
+defect above, which is measured; whether that defect is the only thing stopping
+the game is untested. Note also that CodeWeavers' own testers report this game
+running on M1 Max and M1 Ultra with D3DMetal on CrossOver 24.0 and 25.0.1,
+built from this same tree, which this patch does not explain.
+
+UPSTREAM: not yet reported.
+
+Mirror the field at thread start, and keep the mirror in step in the three
+places kernelbase changes it (ConvertFiberToThread, ConvertThreadToFiberEx,
+SwitchToFiber).
+
+---
+--- a/dlls/kernelbase/thread.c	2026-09-09 13:50:32
++++ b/dlls/kernelbase/thread.c	2026-09-09 13:50:32
+@@ -1145,6 +1145,21 @@
+ }
+ 
+ 
++/* On macOS the %gs base is the host thread block, not the TEB, so signal_init_process()
++ * mirrors individual TEB fields into it. Tib.FiberData was never mirrored, but
++ * GetCurrentFiber() is an intrinsic that reads %gs:0x20 directly and cannot be intercepted,
++ * so a game's job system reads a host value and hands it back to SwitchToFiber, which
++ * dereferences it (Marvel's Guardians of the Galaxy: read of 0x907, i.e. 0x8ff + 8).
++ * Keep the mirror in step wherever Tib.FiberData changes. */
++static inline void set_teb_fiber_data( void *fiber )
++{
++    NtCurrentTeb()->Tib.FiberData = fiber;
++#if defined(__APPLE__) && defined(__x86_64__)
++    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (fiber), "n" (FIELD_OFFSET(TEB, Tib.FiberData)));
++#endif
++}
++
++
+ /***********************************************************************
+  *           ConvertFiberToThread   (kernelbase.@)
+  */
+@@ -1155,7 +1170,7 @@
+     if (fiber)
+     {
+         relocate_thread_actctx_stack( &NtCurrentTeb()->ActivationContextStack );
+-        NtCurrentTeb()->Tib.FiberData = NULL;
++        set_teb_fiber_data( NULL );
+         HeapFree( GetProcessHeap(), 0, fiber );
+     }
+     return TRUE;
+@@ -1217,7 +1232,7 @@
+     fiber->flags            = flags;
+     fiber->fls_slots        = NtCurrentTeb()->FlsSlots;
+     relocate_thread_actctx_stack( &fiber->actctx.stack_space );
+-    NtCurrentTeb()->Tib.FiberData = fiber;
++    set_teb_fiber_data( fiber );
+     return fiber;
+ }
+ 
+@@ -1267,7 +1282,7 @@
+     /* stack_allocation and stack_base never change */
+ 
+     /* FIXME: should save floating point context if requested in fiber->flags */
+-    NtCurrentTeb()->Tib.FiberData     = new_fiber;
++    set_teb_fiber_data( new_fiber );
+     NtCurrentTeb()->Tib.ExceptionList = new_fiber->except;
+     NtCurrentTeb()->Tib.StackBase     = new_fiber->stack_base;
+     NtCurrentTeb()->Tib.StackLimit    = new_fiber->stack_limit;
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-09-09 13:50:32
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-09-09 13:50:32
+@@ -3074,6 +3074,7 @@
+     sysarch( X86_64_SET_GSBASE, &teb );
+ #elif defined (__APPLE__)
+     __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Tib.Self), "n" (FIELD_OFFSET(TEB, Tib.Self)));
++    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Tib.FiberData), "n" (FIELD_OFFSET(TEB, Tib.FiberData)));
+     __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->ThreadLocalStoragePointer), "n" (FIELD_OFFSET(TEB, ThreadLocalStoragePointer)));
+     __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Peb), "n" (FIELD_OFFSET(TEB, Peb)));
+     thread_data->pthread_teb = mac_thread_gsbase();
