@@ -58,8 +58,17 @@ handlers do not call libdispatch, so this is accepted.
 NOT VERIFIED at the time of writing: that Metaphor plays with this patch, and
 that Guardians still does. Both are the tests for the engine built from it.
 
-UPSTREAM: not yet reported. The right upstream shape is probably the same
-swap, since upstream Wine on macOS has the same slot conflict.
+UPSTREAM: nothing to send, and the earlier sentence here claiming upstream Wine
+has the same conflict was wrong. Upstream solved the whole class in Wine 10.5
+(Brendan Shanks, 3a16aabbf5, "ntdll: On macOS x86_64, swap GSBASE between the
+TEB and macOS TSD when entering/leaving PE code"): the dispatchers switch the
+entire gs base with the private _thread_set_tsd_base syscall, so PE code sees
+the real TEB (including Tib.FiberData at 0x20) and unix code sees the pthread
+block. Wine 10.0 to 10.4 and the CrossOver 26.3 source tree this engine is
+built from do not carry that change (measured: zero references in either).
+This patch is the one-slot alternative for such trees, two moves per crossing
+instead of a syscall. The better long-term fix for this engine is to backport
+the upstream gs base switch.
 
 --- a/dlls/ntdll/unix/signal_x86_64.c	2026-09-12 19:10:21
 +++ b/dlls/ntdll/unix/signal_x86_64.c	2026-09-12 19:37:50
