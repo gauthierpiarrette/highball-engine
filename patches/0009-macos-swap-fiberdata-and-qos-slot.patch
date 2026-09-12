@@ -33,8 +33,17 @@ they can take turns. This patch gives the slot to whichever side is running:
     dispatcher, the unix-call dispatcher, and user_mode_callback_return.
   * Every return to PE code writes Tib.FiberData into %gs:0x20:
     __wine_syscall_dispatcher_return (which also covers thread start, APC and
-    exception delivery, since they all leave through it) and
-    call_user_mode_callback (window procedures and other callbacks).
+    exception delivery, since they all leave through it), the unix-call
+    dispatcher's own fast return (it does not pass through the label above
+    unless restore_flags is set), and call_user_mode_callback (window
+    procedures and other callbacks).
+
+Register choice matters in the unix-call dispatcher: its fast return restores
+only %r13, %rsi and %rdi and relies on the SysV callee-saved registers for the
+rest, so the swap there uses %rax on entry (dead until the call) and %rdx on
+return (volatile for the PE caller). The first build of this patch used %r15
+on entry and every process died at the first unix call after it, in
+build_module, reading through the clobbered %r15 (measured, 2026-09-12).
   * The three kernelbase sites from 0008 keep writing the slot while PE code
     owns it; TEB->Tib.FiberData stays the source of truth.
 
@@ -52,8 +61,8 @@ that Guardians still does. Both are the tests for the engine built from it.
 UPSTREAM: not yet reported. The right upstream shape is probably the same
 swap, since upstream Wine on macOS has the same slot conflict.
 
---- a/dlls/ntdll/unix/signal_x86_64.c
-+++ b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-09-12 19:10:21
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-09-12 19:37:50
 @@ -508,11 +508,13 @@
      void                **instrumentation_callback; /* 0330 */
      DWORD                 fs;            /* 0338 WOW TEB selector */
@@ -131,9 +140,20 @@ swap, since upstream Wine on macOS has the same slot conflict.
                     __ASM_CFI_REG_IS_AT2(rbp, rcx, 0x98, 0x01)
                     "movq %gs:0x30,%r13\n\t"
 +#ifdef __APPLE__
-+                   "movq 0x340(%r13),%r15\n\t"     /* amd64_thread_data()->host_qos */
-+                   "movq %r15,%gs:0x20\n\t"        /* unix code sees the pthread QoS slot again */
++                   "movq 0x340(%r13),%rax\n\t"     /* amd64_thread_data()->host_qos; %rax is dead until the call below */
++                   "movq %rax,%gs:0x20\n\t"        /* unix code sees the pthread QoS slot again */
 +#endif
                     "stmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
                     "movdqa %xmm6,0x1c0(%rcx)\n\t"
                     "movdqa %xmm7,0x1d0(%rcx)\n\t"
+@@ -3611,6 +3640,10 @@
+                    "movw %dx,%fs\n"
+                    "1:\n\t"
+ #endif
++#ifdef __APPLE__
++                   "movq 0x20(%r13),%rdx\n\t"      /* teb->Tib.FiberData: PE code owns %gs:0x20 again (%rdx is volatile for the PE caller) */
++                   "movq %rdx,%gs:0x20\n\t"
++#endif
+                    "movq 0x58(%rcx),%r13\n\t"
+                    "movq 0x28(%rcx),%rdi\n\t"
+                    "movq 0x20(%rcx),%rsi\n\t"
