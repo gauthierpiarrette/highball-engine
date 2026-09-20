@@ -14,7 +14,10 @@ MEASURED (M1 Pro, macOS 27.0, 2026-09-20, spike/lasterr in the Highball repo): a
 a missing file, GetLastError() = 2 and TEB->LastErrorValue = 2, while %gs:0x68 = 0x840040e0 (r5) /
 0x13006070 (r11), a heap pointer.
 
-How: the unix side swaps slot 13 at the same crossings 0009 uses for the QoS slot (syscall and
+How: Wine's PE DLLs use the inline GetLastError()/SetLastError() from include/winbase.h (the TEB
+field through NtCurrentTeb(), not a call), so those inlines and ntdll's RtlGet/SetLastWin32Error read
+and write %gs:0x68 on x86_64 PE builds (a no-op on Linux, where the slot is the TEB field). The unix
+side swaps slot 13 at the same crossings 0009 uses for the QoS slot (syscall and
 unix-call dispatchers in both directions, user-mode callbacks): entering PE code it saves the host
 value in amd64_thread_data()->host_slot13 (0x348) and loads TEB->LastErrorValue; entering unix code
 it writes PE's value back to the TEB and restores the host value. The PE side writes both the TEB
@@ -28,6 +31,35 @@ Verification: pending the first engine built with it (target: spike/lasterr/last
 Upstream status: not reported yet; a macOS-only Wine bug, candidate for WineHQ once measured on
 the built engine.
 
+--- a/include/winbase.h
++++ b/include/winbase.h
+@@ -2690,7 +2690,16 @@
+ 
+ static FORCEINLINE DWORD WINAPI GetLastError(void)
+ {
++#if defined(__x86_64__) && defined(__GNUC__) && !defined(__arm64ec__) && !defined(WINE_UNIX_LIB)
++    /* Read the value where MSVC-built code reads it (%gs:0x68). On Linux that is the TEB field
++     * itself; on macOS the unix side hands PE code that slot as LastErrorValue and keeps it in
++     * step with the TEB at every crossing (ntdll/unix/signal_x86_64.c). */
++    DWORD err;
++    __asm__ volatile( "movl %%gs:0x68,%0" : "=r" (err) );
++    return err;
++#else
+     return *(DWORD *)((void **)NtCurrentTeb() + 13);
++#endif
+ }
+ 
+ static FORCEINLINE HANDLE WINAPI GetProcessHeap(void)
+@@ -2701,6 +2710,9 @@
+ static FORCEINLINE void WINAPI SetLastError( DWORD err )
+ {
+     *(DWORD *)((void **)NtCurrentTeb() + 13) = err;
++#if defined(__x86_64__) && defined(__GNUC__) && !defined(__arm64ec__) && !defined(WINE_UNIX_LIB)
++    __asm__ volatile( "movl %0,%%gs:0x68" :: "r" (err) );   /* see GetLastError() above */
++#endif
+ }
+ 
+ #else  /* __WINESRC__ */
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
 @@ -509,12 +509,14 @@
