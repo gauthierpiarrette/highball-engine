@@ -25,11 +25,16 @@ field and %gs:0x68 in RtlSetLastWin32Error, and RtlGetLastWin32Error / GetLastEr
 so a value set by MSVC-built code directly is seen too. On Linux %gs:0x68 is the TEB field itself,
 so the PE-side change is a no-op there; the unix-side change is under #ifdef __APPLE__.
 
-Verification: pending the first engine built with it (target: spike/lasterr/lasterr.exe shows
-%gs:0x68 = 2 and 1234; The Last Flame Prologue starts a run).
+Verification (2026-09-20, engine-wine-11.0-20260920T024505Z-0011b-lasterror-inline, M1 Pro,
+macOS 27.0): lasterr.exe reads GetLastError, TEB->LastErrorValue and %gs:0x68 as 2/2/2 after the
+missing-file delete and 1234 for all three after SetLastError; lasterr2.exe stays in step through
+Sleep, CreateFile and CloseHandle (7/7/7). The Last Flame Prologue starts a run, plays its first
+fight and saves, three launches, zero IOException lines; on r10 the same click threw. The first
+build (ntdll only) still failed: Wine's own PE DLLs write the error through the winbase.h inline,
+so without the inline change the TEB moved and %gs:0x68 did not.
 
-Upstream status: not reported yet; a macOS-only Wine bug, candidate for WineHQ once measured on
-the built engine.
+Upstream status: not reported yet; a macOS-only Wine bug, WineHQ draft in the Highball repo
+(private/drafts/winehq-lasterror-gs-slot.md) with lasterr.c as the reproducer.
 
 --- a/include/winbase.h
 +++ b/include/winbase.h
