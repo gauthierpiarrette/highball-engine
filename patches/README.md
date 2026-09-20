@@ -15,6 +15,8 @@ Current series:
 - `0008-macos-mirror-teb-fiberdata.patch`: on macOS the %gs base is the host thread block, so signal_init_process() mirrors Tib.Self, ThreadLocalStoragePointer and Peb into it but not Tib.FiberData. GetCurrentFiber() is an intrinsic reading %gs:0x20 directly, so a fiber-based job system reads a host value (measured: a constant 0x8ff on every thread) and hands it back to SwitchToFiber, which faults. Mirrors the field at thread start and in the three places kernelbase changes it. Measured on M1 Pro, macOS 26.6.2, engine x64-crossover26.3-r4, 2026-09-09; reproducers need no game. NOT yet verified to make Marvel's Guardians of the Galaxy run, and does not explain why CodeWeavers' own testers report that game working on M1 from this same tree. Upstream: not yet reported.
 - `0010-mfreadwrite-video-processor-sample-allocator.patch`: Proton 164af86d; the source reader lets the video processor's allocator create sample textures, so they carry the shared flags a DXGI device manager asks for and DXMT can hand a game (Unity, Unreal media players) a real shared handle instead of null (The Last Flame's menu video, highball#99; 3Shain/dxmt#135).
 
+- `0011-macos-lasterror-in-gs-slot.patch`: %gs:0x68 is where MSVC-built code (Unity's Mono, 130 sites) reads GetLastError(); on macOS that is libc's TSD slot 13, so it is swapped at the 0009 crossings and kept in step with TEB->LastErrorValue by RtlSetLastWin32Error, and the readers use it. File.Delete on a missing save no longer throws "Unknown error (0x80f13910)" (The Last Flame, highball#99).
+
 Candidates, in order, from the 2026-09 investigation:
 
 1. Rockstar Games Launcher installer: the service start that the CrossOver tree completes and the
