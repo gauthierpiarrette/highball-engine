@@ -1,20 +1,45 @@
-ntdll: recognise ROSETTA_X87_PATH and attach athei's x87sidecar cooperatively (TRIAL, highball#165).
+From a4e40c6bf867708d43c1c1a8c6be7ec3e81af190 Mon Sep 17 00:00:00 2001
+From: Alexander Theissen <alex@theissen.io>
+Date: Sun, 12 Jul 2026 15:57:56 +0200
+Subject: [PATCH] ntdll: HACK: Recognize ROSETTA_X87_PATH and attach x87sidecar
+ cooperatively.
 
-Author: Alexander Theissen <alex@theissen.io>, athei/wine commit 6788a14 (2026-07-12), carried
-unchanged. Proposed to Highball in highball#165 on 2026-09-20.
+For i386 targets, re-exec through the x87sidecar named in ROSETTA_X87_PATH
+so its x87 JIT hook accelerates Rosetta's x87 translation. The sidecar is
+run in --cooperative mode: rather than attaching with task_for_pid +
+ptrace, wine hands it our task + main-thread control ports from a handshake
+at the top of __wine_main. The voluntary handover means the sidecar needs
+no get-task-allow entitlement, so the bundle can be notarized while still
+accelerating x87.
 
-What it does: Rosetta 2 translates x87 instructions slowly and the 32-bit Direct3D 9 era games
-use them heavily. x87sidecar (github.com/athei/x87sidecar, MIT) is a separate native process
-that compiles x87 blocks faster and feeds them back through Mach IPC. For a target whose PE
-header says i386, preloader_exec re-executes wine as `x87sidecar --cooperative <loader> ...`
-when ROSETTA_X87_PATH names the sidecar, and __wine_main hands the sidecar this process's task
-and main-thread ports (X87_SIDECAR_BOOTSTRAP, pid-guarded), so no get-task-allow entitlement is
-needed and the app stays notarizable. A no-op without the variable. All under __APPLE__.
+- preloader_exec: for i386 targets, re-exec as
+  `x87sidecar --cooperative <loader> <args>`.
+- get_alternate_wineloader: verify the loader is executable before
+  returning it. The i386-unix path is built without checking it, and
+  wow64-only installations don't ship one. Unless WINEARCH=wow64
+  short-circuits the lookup, loader_exec's first call hands the sidecar a
+  loader that isn't there: the sidecar exec succeeds, so the process can
+  no longer fall back to the real loader, and the launch hangs until the
+  handshake times out. With or without the sidecar, the same bad return
+  makes build_initial_params fall back to start.exe /exec, which
+  relaunches the main exe in a separate detached process with its own
+  Dock icon. With the check, an unset WINEARCH behaves like WINEARCH=wow64.
+- __wine_main: x87_cooperative_handshake() looks up the sidecar's bootstrap
+  service (X87_SIDECAR_BOOTSTRAP, "x87sidecar.<pid>"), sends the task +
+  thread control ports plus a send-once reply right, blocks for the reply,
+  then sys_icache_invalidate()s the code ranges the sidecar patched
+  (required post-init, when translate_insn is already hot). It is
+  pid-guarded and a no-op in every process that is not the Rosetta tracee.
+- coop_proto.h: the Mach wire protocol, kept byte-identical to the copy in
+  the x87sidecar tree.
 
-Status: TRIAL build on the x87sidecar-trial branch, not in a shipped engine. Highball runs
-32-bit games through wow64 inside the 64-bit wine process; the check is on the game's PE
-architecture, not on a 32-bit loader, so it should apply there. To measure: one Direct3D 9
-32-bit game with and without ROSETTA_X87_PATH on the same engine, HUD frame rate.
+Verified: an i386 fsin test run through wine shifts by the expected 1 ULP
+(3feaed548f090cee -> ...cef) only when the cooperative sidecar is attached.
+---
+ dlls/ntdll/unix/coop_proto.h |  62 +++++++++++
+ dlls/ntdll/unix/loader.c     | 210 ++++++++++++++++++++++++++++++++++-
+ 2 files changed, 269 insertions(+), 3 deletions(-)
+ create mode 100644 dlls/ntdll/unix/coop_proto.h
 
 diff --git a/dlls/ntdll/unix/coop_proto.h b/dlls/ntdll/unix/coop_proto.h
 new file mode 100644
@@ -85,7 +110,7 @@ index 00000000000..d75777e863d
 +
 +#endif  // X87SIDECAR_COOP_PROTO_H
 diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
-index f45663e147f..301d76e3179 100644
+index 28d59fd4fb7..301d76e3179 100644
 --- a/dlls/ntdll/unix/loader.c
 +++ b/dlls/ntdll/unix/loader.c
 @@ -69,6 +69,9 @@
@@ -98,7 +123,25 @@ index f45663e147f..301d76e3179 100644
  # include <crt_externs.h>
  # ifndef _POSIX_SPAWN_DISABLE_ASLR
  #  define _POSIX_SPAWN_DISABLE_ASLR 0x0100
-@@ -662,8 +665,31 @@ static void replace_wineloader_path_with_link(char **wineloader_path, const char
+@@ -524,6 +527,17 @@ char *get_alternate_wineloader( WORD machine )
+     else if (alt_build_dir)
+         asprintf( &ret, "%s/loader/wine", alt_build_dir );
+ 
++    /* Installations without a 32-bit Unix loader (wow64-only builds) have no
++     * i386-unix directory, so the constructed path may not exist. Callers
++     * treat a non-NULL return as proof that another loader must run the
++     * image: loader_exec execs it and env.c falls back to start.exe, which
++     * relaunches the main exe in a detached process. Verify the loader is
++     * actually there so those callers behave as if WINEARCH=wow64 was set. */
++    if (ret && access( ret, X_OK ))
++    {
++        free( ret );
++        ret = NULL;
++    }
+     return ret;
+ }
+ 
+@@ -651,8 +665,31 @@ static void replace_wineloader_path_with_link(char **wineloader_path, const char
  #endif
  
  
@@ -131,7 +174,7 @@ index f45663e147f..301d76e3179 100644
  #ifdef HAVE_WINE_PRELOADER
      asprintf( &argv[0], "%s-preloader", argv[1] );
  #ifdef __APPLE__
-@@ -694,6 +720,62 @@ static void preloader_exec( char **argv, const char *image_path )
+@@ -683,6 +720,62 @@ static void preloader_exec( char **argv, const char *image_path )
          replace_wineloader_path_with_link( &(argv[1]), image_path );
  #endif
  
@@ -194,7 +237,7 @@ index f45663e147f..301d76e3179 100644
      execv( argv[1], argv + 1 );
  }
  
-@@ -704,10 +786,10 @@ static NTSTATUS loader_exec( char **argv, WORD machine, const char *image_path )
+@@ -693,10 +786,10 @@ static NTSTATUS loader_exec( char **argv, WORD machine, const char *image_path )
  
      putenv( noexec );
  
@@ -207,7 +250,7 @@ index f45663e147f..301d76e3179 100644
      return STATUS_INVALID_IMAGE_FORMAT;
  }
  
-@@ -2629,6 +2711,111 @@ static void check_command_line( int argc, char *argv[] )
+@@ -2618,6 +2711,111 @@ static void check_command_line( int argc, char *argv[] )
  }
  
  
@@ -319,7 +362,7 @@ index f45663e147f..301d76e3179 100644
  /***********************************************************************
   *           __wine_main
   *
-@@ -2639,6 +2826,12 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
+@@ -2628,6 +2826,12 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
      main_argc = argc;
      main_argv = argv;
  
