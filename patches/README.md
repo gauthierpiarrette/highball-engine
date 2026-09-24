@@ -17,6 +17,7 @@ Current series:
 
 - `0011-macos-lasterror-in-gs-slot.patch`: %gs:0x68 is where MSVC-built code (Unity's Mono, 130 sites) reads GetLastError(); on macOS that is libc's TSD slot 13, so it is swapped at the 0009 crossings and kept in step with TEB->LastErrorValue by RtlSetLastWin32Error, and the readers use it. File.Delete on a missing save no longer throws "Unknown error (0x80f13910)" (The Last Flame, highball#99).
 
+- `0012-ntdll-x87sidecar-cooperative-attach.patch`: athei's a4e40c6. Two things. get_alternate_wineloader() now checks the loader it names with access(X_OK): our builds are wow64-only, the i386-unix loader does not exist, and without the check env.c's build_initial_params() took the phantom path as a reason to relaunch every 32-bit program through `start.exe /exec`, so each ran as a child of a detached start.exe (measured 2026-09-24: two processes without WINEARCH, one with). And with ROSETTA_X87_PATH set to athei's x87sidecar, an i386 program re-execs through it in cooperative mode, no entitlement needed: fsin/fsqrt/fdiv loop 1554 ms to 20 ms, Half-Life 2 timedemo 131 to 174 fps on wined3d (M1 Pro, macOS 27.0). Off unless the variable is set. Upstream: CrossOver-only hack by athei (github.com/athei/wine), not for WineHQ.
 Candidates, in order, from the 2026-09 investigation:
 
 1. Rockstar Games Launcher installer: the service start that the CrossOver tree completes and the
