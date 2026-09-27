@@ -6,11 +6,11 @@ them into an engine tarball the app can install.
 
 ## Status
 
-Scaffold. Nothing here is used by the app yet. Highball's shipped engine is still the Sikarugir
-build described in the app's engine manifest; this repository exists so that Wine-side fixes can
-be built, tested and published in the open instead of waiting for someone else's binaries. It will
-become a second engine in the app only after it passes the same verification as the current one,
-and it will never replace a bottle's engine without the user asking.
+In use. Highball ships this build as its opt-in Wine 11 engine (the `x64-crossover26.3-r*`
+revisions in the app's engine manifests), next to the default Sikarugir Wine 10 engine. The
+Launchers that need Wine 11 (the EA app among them) and the games whose fixes only exist here
+(The Last Flame, ContractVille) have their recipes name it, and the app offers it on Play. It
+never replaces an environment's engine without the user asking.
 
 ## What it builds from
 
