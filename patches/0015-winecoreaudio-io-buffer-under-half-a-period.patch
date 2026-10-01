@@ -12,6 +12,13 @@ Before the unit is initialized, a render stream now sets the unit's I/O buffer t
 at the device's rate (240 frames at 48 kHz), when the current buffer is larger. The buffer size is
 per process, so other apps keep theirs, and a failure only logs.
 
+Trial result 2026-10-01 (run 36806082052, build engine-wine-11.0-20261001T024555Z-0015-coreaudio-trial):
+on an M4 at 48 kHz, Counter-Strike 2's menu music over the same 95 s had 20 dropouts on r12 and none
+with this build's winecoreaudio.so laid over r12 (nothing else changed); no failure warning from the
+new call. The same cap applied from outside Wine (an AudioUnitInitialize interposer) took the
+Sikarugir default engine from 324 dropouts in two minutes to none. The Half-Life 2 demo had none to
+begin with: the fault needs a game that keeps little queued.
+
 Upstream: not reported yet.
 
 --- a/dlls/winecoreaudio.drv/coreaudio.c
