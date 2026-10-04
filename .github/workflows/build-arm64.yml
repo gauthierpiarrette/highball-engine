@@ -106,7 +106,7 @@ jobs:
           # to raw Linux syscalls without it, which macOS kills. The Darwin helper: same table, BSD
           # calls, TSO through thread_set_x86_64_compat (entitled).
           for n in libarm64ecfex libwow64fex; do
-            clang++ -std=c++17 -O2 -shared -fPIC -o "$U/$n.so" fex/fexunixlib_darwin.cpp
+            /usr/bin/clang++ -std=c++17 -O2 -shared -fPIC -o "$U/$n.so" fex/fexunixlib_darwin.cpp
             codesign -f -s - "$U/$n.so"
           done
           # Under Wine's default emulator names: the registry key is per prefix, the file names are
@@ -164,8 +164,8 @@ jobs:
           # The loader: Wine's link flags (4 KB segments) get the binary killed at exec on arm64, so
           # relink it the way Highball's signed one is linked, when this Xcode's linker can
           # (26.4 or later). Development only: the app never runs this file.
-          if clang -arch arm64 -o /tmp/layout-probe -x c - -Wl,-x86_64_layout_emulation <<<'int main(){return 0;}' 2>/dev/null; then
-            MACOSX_DEPLOYMENT_TARGET=11.0 clang -arch arm64 -mmacos-version-min=11.0 -o out/engine/lib/wine/aarch64-unix/wine build/loader/main.o \
+          if /usr/bin/clang -arch arm64 -o /tmp/layout-probe -x c - -Wl,-x86_64_layout_emulation <<<'int main(){return 0;}' 2>/dev/null; then
+            MACOSX_DEPLOYMENT_TARGET=11.0 /usr/bin/clang -arch arm64 -mmacos-version-min=11.0 -o out/engine/lib/wine/aarch64-unix/wine build/loader/main.o \
               -Wl,-platform_version,macos,11.0,11.0,-pagezero_size,0x170000000,-image_base,0x170000000,-x86_64_layout_emulation,-sectcreate,__TEXT,__info_plist,build/loader/wine_info.plist
             echo "loader relinked with the arm64 layout"
           else
