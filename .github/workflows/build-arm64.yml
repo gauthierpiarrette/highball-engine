@@ -74,6 +74,9 @@ jobs:
           path: ~/Library/Caches/ccache
           key: ccache-arm64-${{ runner.os }}-${{ hashFiles('inputs-arm64.json', 'patches-arm64/**') }}
           restore-keys: ccache-arm64-${{ runner.os }}-
+      # The host compiler is Apple's by absolute path: llvm-mingw is first on PATH for the PE
+      # cross compilers and ships a plain `clang` that knows no macOS SDK (first dispatch,
+      # 2026-10-05: "C compiler cannot create executables").
       # The configure line the spike used, plus the libraries a real engine needs for fonts, TLS
       # and controllers. arm64ec is the PE architecture x86-64 programs call into, aarch64 the
       # native one (the two are linked into ARM64X images), i386 is the WoW64 half.
@@ -90,7 +93,7 @@ jobs:
             --without-krb5 --without-netapi --without-oss --without-pulse \
             --without-sane --with-sdl --without-udev --without-usb --without-v4l2 \
             --without-pcap --without-ffmpeg --disable-tests \
-            CC="ccache clang" CXX="ccache clang++" \
+            CC="ccache /usr/bin/clang" CXX="ccache /usr/bin/clang++" \
             arm64ec_CC="ccache arm64ec-w64-mingw32-clang" aarch64_CC="ccache aarch64-w64-mingw32-clang" \
             i386_CC="ccache i686-w64-mingw32-clang"
           make -j"$(sysctl -n hw.ncpu)"
