@@ -1,0 +1,29 @@
+{
+  "wine": {
+    "name": "Wine 11.18 (WineHQ development release)",
+    "url": "https://dl.winehq.org/wine/source/11.x/wine-11.18.tar.xz",
+    "size": 46763696,
+    "sha256": "c6282f6d4daecf11f3ab9f9a2b6c598f67be7e28c363ba2cae8a3c44b611e7a4",
+    "subdir": "wine-11.18",
+    "note": "Upstream, not CrossOver: the CrossOver 26.3 tree is Wine 11.0 and fails to load kernel32 when built for arm64 (c0000045); the ARM64 fixes it lacks landed upstream during 2026. Switches to CrossOver 27's sources when CodeWeavers publishes them (its DXMT driver table is the one piece this build cannot have until then)."
+  },
+  "llvm-mingw": {
+    "name": "llvm-mingw 20260922 (clang 23.1.2, ucrt, macOS universal)",
+    "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz",
+    "size": 124289672,
+    "sha256": "52e5f5a7b131021d0c39a37a38fa380a1da7885cd04bd61afd0cd4ecfb8bc1f3",
+    "note": "The PE side needs clang for ARM64EC (arm64ec-w64-mingw32-clang) and lld 23 for the ARM64X link; Homebrew's gcc mingw-w64 cannot build either. The i386 half is built with the same toolchain's i686-w64-mingw32-gcc wrapper."
+  },
+  "fex": {
+    "name": "Hangover 11.16 DLLs: FEX 2608 as libarm64ecfex.dll (x86-64 through ARM64EC) and libwow64fex.dll (x86 through WoW64), MIT",
+    "url": "https://github.com/AndreRH/hangover/releases/download/hangover-11.16/hangover_11.16_dlls.tar",
+    "size": 30126080,
+    "sha256": "645bcdf861db157b9057854c98797cedb477a00723429a1b996450dfb28fc6d2",
+    "note": "Installed under Wine's default emulator names, xtajit64.dll and xtajit.dll, with the Darwin build of FEX's Unix helper (fex/fexunixlib_darwin.cpp) beside ntdll.so. Hangover's own helper is Linux-only and its absence makes FEX issue raw Linux syscalls, which macOS answers with SIGKILL."
+  },
+  "toolchain": {
+    "runner": "macos-26",
+    "hostArch": "arm64",
+    "note": "Native arm64 Unix side. The loader in the tarball is Wine's own and is replaced at install by Highball's signed one (the app's Contents/Helpers/WineLoader.app), which carries Apple's cross-architecture entitlement; without that entitlement nothing here starts on macOS 26.5 or later."
+  }
+}

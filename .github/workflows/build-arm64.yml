@@ -1,0 +1,191 @@
+# The arm64 engine line: upstream Wine built natively for Apple silicon, with ARM64X builtins and
+# FEX for x86 programs, for the day macOS 28 drops Rosetta (Highball's
+# private/notes/rosetta-transition-plan.md; the spike that measured every step ran on an M4 on
+# 2026-10-04). Manual dispatch only. The tarball's own loader is for development: Highball replaces
+# it with its signed WineLoader.app at install, because the kernel only grants Apple's
+# cross-architecture entitlement to a signed bundle with a provisioning profile.
+#
+# What this build has: a prefix that boots in seconds, both halves populated, 32-bit and 64-bit x86
+# programs at Rosetta speed on a compute loop. What it lacks: a renderer. DXMT needs the Mac
+# driver's Metal glue, which upstream Wine does not carry (CrossOver's tree does), so no overlay is
+# packaged here until CrossOver 27's sources are out or the glue is ported. GStreamer is left out
+# for the same reason the first Intel build left things out: one thing at a time.
+name: build-engine-arm64
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish the tarball as a GitHub release (tag engine-arm64-<wine version>-<date>)"
+        type: boolean
+        default: false
+      ref_note:
+        description: "why this build (free text, goes in the artifact name)"
+        required: false
+        default: "manual"
+permissions:
+  contents: write
+jobs:
+  build:
+    # Apple silicon runner on purpose: the Unix side is native arm64.
+    runs-on: macos-26
+    timeout-minutes: 300
+    env:
+      # Binaries built against an SDK older than 26.5 keep x18, the register Windows ARM64 code
+      # holds its thread block in, across context switches (CodeWeavers' interim rule, wine-devel
+      # 2026-08-07). It only matters for the loader, and Highball's signed loader sets it too.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: pinned sources
+        run: |
+          set -euo pipefail
+          fetch() { # name -> downloads inputs-arm64.json[name] into $2 and checks its sha
+            url=$(python3 -c "import json;print(json.load(open('inputs-arm64.json'))['$1']['url'])")
+            sha=$(python3 -c "import json;print(json.load(open('inputs-arm64.json'))['$1']['sha256'])")
+            curl -sSL --retry 3 -o "$2" "$url"
+            echo "$sha  $2" | shasum -a 256 -c -
+          }
+          fetch wine wine.tar.xz
+          fetch llvm-mingw llvm-mingw.tar.xz
+          fetch fex hangover_dlls.tar
+          mkdir -p src toolchains/llvm-mingw fex-dlls
+          tar -xJf wine.tar.xz -C src
+          tar -xJf llvm-mingw.tar.xz -C toolchains/llvm-mingw --strip-components 1
+          tar -xf hangover_dlls.tar -C fex-dlls
+          ls src; ls fex-dlls
+      - name: apply patch series
+        run: |
+          set -euo pipefail
+          cd src/wine-*/
+          for p in ../../patches-arm64/*.patch; do echo "applying $p"; patch -p1 < "$p"; done
+      - name: toolchain
+        run: |
+          set -euo pipefail
+          # No gstreamer here yet (see the header). MoltenVK for winevulkan's library name.
+          brew install -q bison pkg-config ccache gnutls freetype sdl2 libpng jpeg-turbo molten-vk || true
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$PWD/toolchains/llvm-mingw/bin" >> "$GITHUB_PATH"
+          toolchains/llvm-mingw/bin/arm64ec-w64-mingw32-clang --version | head -1
+          toolchains/llvm-mingw/bin/ld.lld --version | head -1
+          clang --version | head -1
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-arm64-${{ runner.os }}-${{ hashFiles('inputs-arm64.json', 'patches-arm64/**') }}
+          restore-keys: ccache-arm64-${{ runner.os }}-
+      # The configure line the spike used, plus the libraries a real engine needs for fonts, TLS
+      # and controllers. arm64ec is the PE architecture x86-64 programs call into, aarch64 the
+      # native one (the two are linked into ARM64X images), i386 is the WoW64 half.
+      - name: configure and build
+        run: |
+          set -euo pipefail
+          mkdir -p build && cd build
+          ../src/wine-*/configure \
+            --prefix="$PWD/../out/engine" \
+            --enable-archs=arm64ec,aarch64,i386 \
+            --with-mingw \
+            --without-x --without-alsa --without-capi --with-coreaudio --without-cups --without-dbus \
+            --without-fontconfig --with-freetype --with-gnutls --without-gphoto --without-gstreamer \
+            --without-krb5 --without-netapi --without-oss --without-pulse \
+            --without-sane --with-sdl --without-udev --without-usb --without-v4l2 \
+            --without-pcap --without-ffmpeg --disable-tests \
+            CC="ccache clang" CXX="ccache clang++" \
+            arm64ec_CC="ccache arm64ec-w64-mingw32-clang" aarch64_CC="ccache aarch64-w64-mingw32-clang" \
+            i386_CC="ccache i686-w64-mingw32-clang"
+          make -j"$(sysctl -n hw.ncpu)"
+          make install-lib
+      - name: FEX
+        run: |
+          set -euo pipefail
+          U=out/engine/lib/wine/aarch64-unix; W=out/engine/lib/wine/aarch64-windows
+          # FEX's Windows DLLs load a Unix helper by name from the ntdll.so directory and fall back
+          # to raw Linux syscalls without it, which macOS kills. The Darwin helper: same table, BSD
+          # calls, TSO through thread_set_x86_64_compat (entitled).
+          for n in libarm64ecfex libwow64fex; do
+            clang++ -std=c++17 -O2 -shared -fPIC -o "$U/$n.so" fex/fexunixlib_darwin.cpp
+            codesign -f -s - "$U/$n.so"
+          done
+          # Under Wine's default emulator names: the registry key is per prefix, the file names are
+          # not. Wine's own xtajit64.dll is a stub that prints "x64 emulation not implemented".
+          mv "$W/xtajit64.dll" "$W/xtajit64.dll.wine"
+          cp fex-dlls/libarm64ecfex.dll "$W/xtajit64.dll"
+          cp fex-dlls/libwow64fex.dll "$W/xtajit.dll"
+          ls -la "$W"/xtajit* "$U"/lib*fex.so
+      - name: engine layout
+        run: |
+          set -euo pipefail
+          mkdir -p out/renderers out/frameworks out/tools
+          test -f out/engine/bin/wineserver
+          # Wine Mono and Gecko, the versions this tree asks for; without them a bottle's first boot
+          # stops at a prompt nothing unattended can answer. Their x86 builds run through FEX.
+          mono=$(sed -n 's/^#define MONO_VERSION "\(.*\)"/\1/p' src/wine-*/dlls/appwiz.cpl/addons.c)
+          gecko=$(sed -n 's/^#define GECKO_VERSION "\(.*\)"/\1/p' src/wine-*/dlls/appwiz.cpl/addons.c)
+          echo "addons: wine-mono $mono, wine-gecko $gecko"
+          mkdir -p out/engine/share/wine/mono out/engine/share/wine/gecko
+          curl -sSfL -o wine-mono.tar.xz "https://dl.winehq.org/wine/wine-mono/${mono}/wine-mono-${mono}-x86.tar.xz"
+          tar -xJf wine-mono.tar.xz -C out/engine/share/wine/mono
+          for arch in x86 x86_64; do
+            curl -sSfL -o "wine-gecko-${arch}.tar.xz" "https://dl.winehq.org/wine/wine-gecko/${gecko}/wine-gecko-${gecko}-${arch}.tar.xz"
+            tar -xJf "wine-gecko-${arch}.tar.xz" -C out/engine/share/wine/gecko
+          done
+          # The Homebrew libraries the Unix side links (freetype, gnutls, sdl2 and what they pull
+          # in), copied flat into frameworks/. Highball runs every Wine process with
+          # DYLD_FALLBACK_LIBRARY_PATH on that directory, and dyld resolves an absolute install name
+          # it cannot find by its leaf name there, so no install names are rewritten. The signed
+          # loader allows DYLD variables (its entitlements), so they reach the process.
+          python3 - <<'PY'
+          import os, re, shutil, subprocess, glob
+          todo = glob.glob("out/engine/lib/wine/aarch64-unix/*.so") + ["out/engine/bin/wineserver"]
+          seen, copied = set(), []
+          while todo:
+              f = todo.pop()
+              for line in subprocess.run(["otool", "-L", f], capture_output=True, text=True).stdout.splitlines()[1:]:
+                  dep = line.split()[0]
+                  if not dep.startswith("/opt/homebrew") and not dep.startswith("/usr/local"): continue
+                  real = os.path.realpath(dep)
+                  if real in seen: continue
+                  seen.add(real)
+                  dest = os.path.join("out/frameworks", os.path.basename(dep))
+                  shutil.copy2(real, dest); os.chmod(dest, 0o755)
+                  subprocess.run(["codesign", "-f", "-s", "-", dest], check=True)
+                  copied.append(os.path.basename(dep)); todo.append(dest)
+          print("bundled:", sorted(copied))
+          PY
+          # Strip debug info, as the Intel build does.
+          before=$(du -sm out/engine | cut -f1)
+          find out/engine/lib/wine/aarch64-windows out/engine/lib/wine/i386-windows \( -name '*.dll' -o -name '*.exe' -o -name '*.sys' -o -name '*.drv' -o -name '*.cpl' -o -name '*.ocx' -o -name '*.acm' -o -name '*.tlb' \) -type f ! -name 'xtajit*' -print0 \
+            | xargs -0 -n 50 llvm-strip --strip-debug 2>/dev/null || true
+          find out/engine/lib/wine/aarch64-unix -name '*.so' -type f ! -name 'lib*fex.so' -print0 | xargs -0 -n 50 strip -x -S 2>/dev/null || true
+          echo "engine size: ${before} MB -> $(du -sm out/engine | cut -f1) MB"
+          # The loader: Wine's link flags (4 KB segments) get the binary killed at exec on arm64, so
+          # relink it the way Highball's signed one is linked, when this Xcode's linker can
+          # (26.4 or later). Development only: the app never runs this file.
+          if clang -arch arm64 -o /tmp/layout-probe -x c - -Wl,-x86_64_layout_emulation <<<'int main(){return 0;}' 2>/dev/null; then
+            MACOSX_DEPLOYMENT_TARGET=11.0 clang -arch arm64 -mmacos-version-min=11.0 -o out/engine/lib/wine/aarch64-unix/wine build/loader/main.o \
+              -Wl,-platform_version,macos,11.0,11.0,-pagezero_size,0x170000000,-image_base,0x170000000,-x86_64_layout_emulation,-sectcreate,__TEXT,__info_plist,build/loader/wine_info.plist
+            echo "loader relinked with the arm64 layout"
+          else
+            echo "note: this Xcode's linker has no -x86_64_layout_emulation; the loader keeps Wine's flags and will not start on arm64 (Highball's own loader does)"
+          fi
+          version=$(sed -n 's/^#define PACKAGE_VERSION "\(.*\)"/\1/p' build/include/config.h)
+          name="engine-arm64-wine-${version}-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
+          tar -C out -czf "${name}.tar.gz" .
+          shasum -a 256 "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
+          ls -la "${name}.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-arm64
+          path: |
+            engine-arm64-*.tar.gz
+            engine-arm64-*.tar.gz.sha256
+          retention-days: 14
+      - name: publish release
+        if: ${{ github.event.inputs.publish_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          f=$(ls engine-arm64-*.tar.gz | head -1)
+          tag="${f%.tar.gz}"
+          gh release create "$tag" "$f" "$f.sha256" --title "$tag" --notes "Native arm64 Wine from the pinned upstream source (inputs-arm64.json) with the patch series in patches-arm64/ and FEX (Hangover 11.16) under Wine's emulator names. Runs through Highball's signed Wine loader only. No renderer overlay yet. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."

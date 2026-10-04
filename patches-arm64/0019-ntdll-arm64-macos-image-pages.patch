@@ -1,0 +1,163 @@
+--- /dev/fd/11	2026-10-04 16:50:44
++++ wine-11.18/dlls/ntdll/unix/virtual.c	2026-10-04 16:47:16
+@@ -144,6 +144,7 @@
+ #define VPROT_PLACEHOLDER      0x0400
+ #define VPROT_FREE_PLACEHOLDER 0x0800
+ 
++
+ /* Conversion from VPROT_* to Win32 flags */
+ static const BYTE VIRTUAL_Win32Flags[16] =
+ {
+@@ -266,11 +267,80 @@
+ }
+ 
+ /* mmap() anonymous memory at a fixed address */
++#if defined(__APPLE__) && defined(__aarch64__)
++/* Highball spike 2026-10-04: arm64 macOS has no RWX pages. Read-write-execute memory is kept as plain
++ * anonymous memory whose host pages flip between read-write and read-execute on faults. (MAP_JIT was
++ * tried first: a thread-state flip made inside a signal handler does not survive the return from it.)
++ * Code inside PE images stays read-execute; a mixed 16K page flips the same way. */
++#define HB_JIT 1
++#include <pthread.h>
++struct jit_range { char *base; size_t size; };
++static struct jit_range jit_ranges[2048];
++static unsigned int jit_count;
++
++static BOOL is_jit_addr( const void *addr )
++{
++    unsigned int i;
++    for (i = 0; i < jit_count; i++)
++        if ((const char *)addr >= jit_ranges[i].base && (const char *)addr < jit_ranges[i].base + jit_ranges[i].size) return TRUE;
++    return FALSE;
++}
++
++static void remove_jit_ranges( const void *base, size_t size )
++{
++    unsigned int i = 0;
++    const char *end = (const char *)base + size;
++    while (i < jit_count)
++    {
++        if (jit_ranges[i].base < end && jit_ranges[i].base + jit_ranges[i].size > (const char *)base)
++            jit_ranges[i] = jit_ranges[--jit_count];
++        else i++;
++    }
++}
++
++static void add_jit_range( void *base, size_t size )
++{
++    unsigned int i;
++    remove_jit_ranges( base, size );
++    for (i = 0; i < jit_count; i++)   /* merge with a neighbour */
++    {
++        if (jit_ranges[i].base + jit_ranges[i].size == (char *)base) { jit_ranges[i].size += size; return; }
++        if ((char *)base + size == jit_ranges[i].base) { jit_ranges[i].base = base; jit_ranges[i].size += size; return; }
++    }
++    if (jit_count < sizeof(jit_ranges) / sizeof(jit_ranges[0]))
++    {
++        jit_ranges[jit_count].base = base;
++        jit_ranges[jit_count].size = size;
++        jit_count++;
++    }
++    else ERR( "too many JIT ranges\n" );
++}
++
++/* read-write-execute memory on arm64 macOS: keep it read-write and flip single host pages to read-execute
++ * when they are executed and back when they are written (virtual_handle_fault); a page is never RWX */
++static int make_jit_range( char *base, size_t size )
++{
++    if (mprotect( base, size, PROT_READ | PROT_WRITE )) return -1;
++    add_jit_range( base, size );
++    TRACE( "W^X range %p-%p\n", base, base + size );
++    return 0;
++}
++#endif
++
+ void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
+ {
+     assert( !((UINT_PTR)start & host_page_mask) );
+     assert( !(size & host_page_mask) );
+ 
++#ifdef HB_JIT
++    remove_jit_ranges( start, size );
++    if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
++    {
++        void *ret = mmap( start, size, prot & ~PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
++        if (ret != MAP_FAILED) add_jit_range( ret, size );
++        return ret;
++    }
++#endif
+     return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
+ }
+ 
+@@ -1835,6 +1905,9 @@
+  */
+ static void delete_view( struct file_view *view ) /* [in] View */
+ {
++#ifdef HB_JIT
++    remove_jit_ranges( view->base, view->size );
++#endif
+     if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
+     set_page_vprot( view->base, view->size, 0 );
+     if (view->protect & VPROT_ARM64EC) clear_arm64ec_range( view->base, view->size );
+@@ -1972,6 +2045,16 @@
+  */
+ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+ {
++#ifdef HB_JIT
++    if ((unix_prot & PROT_EXEC) && (unix_prot & PROT_WRITE))
++    {
++        struct file_view *view = find_view( base, 0 );
++        if (view && (view->protect & SEC_IMAGE)) unix_prot &= ~PROT_WRITE;  /* image code: read-execute, writes flip the page */
++        else if (is_jit_addr( base )) return 0;                              /* already a W^X range, keep its current state */
++        else return make_jit_range( base, size );
++    }
++    else remove_jit_ranges( base, size );                                   /* an explicit protection ends the W^X dance */
++#endif
+     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
+     {
+         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
+@@ -2376,6 +2459,13 @@
+     if (map_addr + map_size >= (char *)view->base + view->size) host_size = map_size;
+     else host_size = ROUND_SIZE( 0, map_size, host_page_mask );
+ 
++#if defined(__APPLE__) && defined(__aarch64__)
++    /* Highball spike 2026-10-04: arm64 macOS refuses to execute pages that are backed by an
++     * unsigned file, and PE images are not Mach-O signed. Read image sections into anonymous
++     * memory instead (the write-copy case), which the allow-unsigned-executable-memory
++     * entitlement lets us make executable afterwards. Shared writable mappings keep using mmap. */
++    if (vprot & VPROT_WRITECOPY) removable = TRUE;
++#endif
+     /* only try mmap if media is not removable (or if we require write access),
+        and if alignment is correct */
+     if ((!removable || (flags & MAP_SHARED)) && host_addr == map_addr && host_size == map_size)
+@@ -4699,6 +4789,30 @@
+ 
+     mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
+     vprot = get_host_page_vprot( page );
++
++#ifdef HB_JIT
++    if (is_jit_addr( addr ) && (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT))
++    {
++        int prot = (err == EXCEPTION_WRITE_FAULT) ? PROT_READ | PROT_WRITE : PROT_READ | PROT_EXEC;
++        mprotect( page, host_page_size, prot );
++        mutex_unlock( &virtual_mutex );
++        return STATUS_SUCCESS;
++    }
++#endif
++#ifdef HB_JIT
++    /* a 16K host page holding both code and writable data (4K-aligned PE sections) cannot be RWX on
++     * arm64 macOS: flip it between read-write and read-execute on each kind of fault */
++    if (!is_jit_addr( addr ) && is_vprot_exec_write( vprot ) &&
++        (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT))
++    {
++        int prot = (err == EXCEPTION_WRITE_FAULT) ? PROT_READ | PROT_WRITE : PROT_READ | PROT_EXEC;
++        if (!mprotect( page, host_page_size, prot ))
++        {
++            mutex_unlock( &virtual_mutex );
++            return STATUS_SUCCESS;
++        }
++    }
++#endif
+ 
+ #ifdef __APPLE__
+     /* Rosetta on Apple Silicon misreports certain write faults as read faults. */

@@ -57,6 +57,21 @@ are unwelcome by their own policies.
 - Wine Mono and Gecko are unpacked into `share/wine/mono` and `share/wine/gecko` at the versions the tree names in `dlls/appwiz.cpl/addons.c`. Without them a bottle's first boot stops at Wine's "download Mono?" prompt, which no unattended run can answer.
 - The tree's CrossOver hack that names the Windows user "crossover" is reverted by the first patch in the series, so bottles keep `C:\users\<macOS user>` like on the Sikarugir engines.
 
+## The arm64 line
+
+Apple ends most of Rosetta 2 in macOS 28 (September 2027). The second workflow here,
+[`build-arm64.yml`](.github/workflows/build-arm64.yml), builds the engine Highball will need for
+that: upstream Wine ([`inputs-arm64.json`](inputs-arm64.json)) compiled natively for Apple silicon
+with ARM64X builtins, FEX for x86 and x86-64 programs (Hangover's DLLs under Wine's emulator names,
+with a Darwin build of FEX's Unix helper from [`fex/`](fex/)), and the three patches in
+[`patches-arm64/`](patches-arm64/). It runs only through Highball's signed Wine loader, the helper
+bundle inside Highball.app that carries Apple's cross-architecture entitlement; the loader in the
+tarball is for development. State on 2026-10-04, measured on an M4 running macOS 27.0: a prefix
+boots in 2.4 s with both halves populated, 32-bit and 64-bit x86 programs run within 20 percent of
+Rosetta on a compute loop, and there is no renderer yet, because DXMT needs the Mac driver's Metal
+glue that only CrossOver's tree has. The decision document and the measurements are in Highball's
+`private/notes/rosetta-transition-plan.md`. The Intel line stays the default for every macOS up to 27.
+
 ## Releases
 
 A dispatch with `publish_release=true` creates a GitHub release tagged after the artifact (`engine-wine-<version>-<date>-<note>`) with the tarball and its `.sha256`. Highball's engine manifest (`spike/engines/<id>.json` in the app repository) names the tarball's URL, size and checksum, and extracts its `engine/` subtree; the app never builds anything itself. Current: `engine-wine-11.0-20260904T153322Z-winemetal`, with Wine Mono and Gecko included, patches 0001 to 0003 applied (real user name, OpenGL-first wined3d, WINEDLLPATH_PREPEND) and winemetal.dll shipped as a built-in so DXMT's overlay loads in a fresh prefix.
