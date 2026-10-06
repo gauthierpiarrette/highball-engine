@@ -1,4 +1,4 @@
-From a4e40c6bf867708d43c1c1a8c6be7ec3e81af190 Mon Sep 17 00:00:00 2001
+From 335ebe1c46167d486215505fe4f5c5f4d2174584 Mon Sep 17 00:00:00 2001
 From: Alexander Theissen <alex@theissen.io>
 Date: Sun, 12 Jul 2026 15:57:56 +0200
 Subject: [PATCH] ntdll: HACK: Recognize ROSETTA_X87_PATH and attach x87sidecar
@@ -19,8 +19,8 @@ accelerating x87.
   wow64-only installations don't ship one. Unless WINEARCH=wow64
   short-circuits the lookup, loader_exec's first call hands the sidecar a
   loader that isn't there: the sidecar exec succeeds, so the process can
-  no longer fall back to the real loader, and the launch hangs until the
-  handshake times out. With or without the sidecar, the same bad return
+  no longer fall back to the real loader, and the launch hangs in the
+  handshake. With or without the sidecar, the same bad return
   makes build_initial_params fall back to start.exe /exec, which
   relaunches the main exe in a separate detached process with its own
   Dock icon. With the check, an unset WINEARCH behaves like WINEARCH=wow64.
@@ -30,15 +30,22 @@ accelerating x87.
   then sys_icache_invalidate()s the code ranges the sidecar patched
   (required post-init, when translate_insn is already hot). It is
   pid-guarded and a no-op in every process that is not the Rosetta tracee.
+  The ranges are used only from a reply with the expected id and size. The
+  send-once notification the kernel sends when the sidecar exits without
+  replying, a message with any other id, or a receive error lets the
+  process continue without the hook. The reply port is destroyed so that
+  a late reply has nowhere to go, and a warning that the process is
+  running without x87 acceleration is printed to stderr, where it shows
+  even with WINEDEBUG=-all.
 - coop_proto.h: the Mach wire protocol, kept byte-identical to the copy in
   the x87sidecar tree.
 
 Verified: an i386 fsin test run through wine shifts by the expected 1 ULP
 (3feaed548f090cee -> ...cef) only when the cooperative sidecar is attached.
 ---
- dlls/ntdll/unix/coop_proto.h |  62 +++++++++++
- dlls/ntdll/unix/loader.c     | 210 ++++++++++++++++++++++++++++++++++-
- 2 files changed, 269 insertions(+), 3 deletions(-)
+ dlls/ntdll/unix/coop_proto.h |  62 +++++++++
+ dlls/ntdll/unix/loader.c     | 250 ++++++++++++++++++++++++++++++++++-
+ 2 files changed, 309 insertions(+), 3 deletions(-)
  create mode 100644 dlls/ntdll/unix/coop_proto.h
 
 diff --git a/dlls/ntdll/unix/coop_proto.h b/dlls/ntdll/unix/coop_proto.h
@@ -110,7 +117,7 @@ index 00000000000..d75777e863d
 +
 +#endif  // X87SIDECAR_COOP_PROTO_H
 diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
-index 28d59fd4fb7..301d76e3179 100644
+index 494e05621ac..f6f7ac48378 100644
 --- a/dlls/ntdll/unix/loader.c
 +++ b/dlls/ntdll/unix/loader.c
 @@ -69,6 +69,9 @@
@@ -250,11 +257,26 @@ index 28d59fd4fb7..301d76e3179 100644
      return STATUS_INVALID_IMAGE_FORMAT;
  }
  
-@@ -2618,6 +2711,111 @@ static void check_command_line( int argc, char *argv[] )
+@@ -2605,6 +2698,151 @@ static void check_command_line( int argc, char *argv[] )
  }
  
  
 +#ifdef __APPLE__
++/* CW HACK: tell the user that the x87sidecar did not install its hook. This is
++ * printed unconditionally, so that it shows even with WINEDEBUG=-all. The
++ * sidecar prints a banner with the same "RUNNING WITHOUT X87 ACCELERATION" text
++ * when it gives up on its own side. */
++static void x87_coop_unhooked( const char *reason )
++{
++    fprintf( stderr,
++             "################################################################\n"
++             "WARNING: X87SIDECAR DID NOT FINISH (%s).\n"
++             "THIS PROCESS IS RUNNING WITHOUT X87 ACCELERATION.\n"
++             "32-BIT GAMES THAT USE X87 MATH WILL BE MUCH SLOWER.\n"
++             "################################################################\n",
++             reason );
++}
++
 +/***********************************************************************
 + *           x87_cooperative_handshake
 + *
@@ -267,7 +289,7 @@ index 28d59fd4fb7..301d76e3179 100644
 + * service up, hand over our task + main-thread control ports, and block until
 + * the sidecar has installed its x87 JIT hook and replies. The reply carries the
 + * code ranges the sidecar patched so we invalidate our OWN instruction cache for
-+ * them — a cross-process flush is not reliable once translate_insn is already
++ * them: a cross-process flush is not reliable once translate_insn is already
 + * hot. This replaces task_for_pid + ptrace, so the sidecar needs no
 + * com.apple.security.get-task-allow entitlement and the bundle stays notarizable.
 + *
@@ -289,6 +311,7 @@ index 28d59fd4fb7..301d76e3179 100644
 +        char slack[64];
 +    } rep;
 +    kern_return_t kr;
++    char reason[64] = "";
 +    char *dot;
 +    int i;
 +
@@ -300,12 +323,17 @@ index 28d59fd4fb7..301d76e3179 100644
 +    dot = strrchr( name, '.' );
 +    if (!dot || atoi( dot + 1 ) != (int)getpid()) return;
 +
-+    if (task_get_bootstrap_port( mach_task_self(), &bootstrap_port ) != KERN_SUCCESS) return;
++    if ((kr = task_get_bootstrap_port( mach_task_self(), &bootstrap_port )) != KERN_SUCCESS)
++    {
++        snprintf( reason, sizeof(reason), "NO BOOTSTRAP PORT, ERROR 0X%X", kr );
++        goto done;
++    }
 +    kr = bootstrap_look_up( bootstrap_port, name, &service );
 +    if (kr != KERN_SUCCESS)
 +    {
 +        ERR( "x87 coop: bootstrap_look_up(%s) failed 0x%x\n", name, kr );
-+        return;
++        snprintf( reason, sizeof(reason), "SIDECAR SERVICE NOT FOUND, ERROR 0X%X", kr );
++        goto done;
 +    }
 +
 +    /* Reply port we block on until the sidecar has finished its setup. */
@@ -331,29 +359,48 @@ index 28d59fd4fb7..301d76e3179 100644
 +    if (kr != KERN_SUCCESS)
 +    {
 +        ERR( "x87 coop: handshake send failed 0x%x\n", kr );
-+        return;
++        snprintf( reason, sizeof(reason), "HANDSHAKE SEND FAILED, ERROR 0X%X", kr );
++        goto done;
 +    }
 +    if (verbose) ERR( "x87 coop: handed over task+thread ports; blocking for reply\n" );
 +
 +    /* Block until the sidecar has done its install and replies. The receive
-+     * buffer needs room for the header AND the kernel-appended trailer. */
++     * buffer needs room for the header AND the kernel-appended trailer. If the
++     * sidecar exits without replying, the kernel sends a MACH_NOTIFY_SEND_ONCE
++     * notification to the reply port instead, which has a different id and
++     * size. */
 +    memset( &rep, 0, sizeof(rep) );
-+    kr = mach_msg( &rep.reply.header, MACH_RCV_MSG, 0, sizeof(rep), reply, 30000 /*ms*/,
-+                   MACH_PORT_NULL );
-+    if (verbose) ERR( "x87 coop: handshake reply kr=0x%x; continuing\n", kr );
++    kr = mach_msg( &rep.reply.header, MACH_RCV_MSG, 0, sizeof(rep), reply,
++                   MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL );
++    if (verbose) ERR( "x87 coop: handshake reply kr=0x%x id=0x%x size=%u\n", kr,
++                      rep.reply.header.msgh_id, rep.reply.header.msgh_size );
 +
-+    /* Invalidate our own i-cache for the code the sidecar patched. This runs on
-+     * the same thread that will execute translate_insn, and sys_icache_invalidate
-+     * issues a broadcast (inner-shareable) IC IVAU, which a cross-process flush
-+     * from the sidecar does not reliably achieve once translate_insn is hot. */
-+    if (kr == KERN_SUCCESS)
++    if (kr != KERN_SUCCESS)
++        snprintf( reason, sizeof(reason), "RECEIVE FAILED, ERROR 0X%X", kr );
++    else if (rep.reply.header.msgh_id == MACH_NOTIFY_SEND_ONCE)
++        snprintf( reason, sizeof(reason), "THE SIDECAR EXITED WITHOUT REPLYING" );
++    else if (rep.reply.header.msgh_id != X87_COOP_MSGH_ID + 1 ||
++             rep.reply.header.msgh_size != sizeof(rep.reply))
++        snprintf( reason, sizeof(reason), "UNEXPECTED REPLY, ID 0X%X SIZE %u",
++                  rep.reply.header.msgh_id, rep.reply.header.msgh_size );
++    else
 +    {
++        /* Invalidate our own i-cache for the code the sidecar patched. This runs
++         * on the same thread that will execute translate_insn, and
++         * sys_icache_invalidate issues a broadcast (inner-shareable) IC IVAU,
++         * which a cross-process flush from the sidecar does not reliably
++         * achieve once translate_insn is hot. */
 +        for (i = 0; i < 2; i++)
 +            if (rep.reply.icache_len[i] != 0)
 +                sys_icache_invalidate( (void *)(uintptr_t)rep.reply.icache_addr[i],
 +                                       (size_t)rep.reply.icache_len[i] );
 +    }
 +
++done:
++    /* Destroy the reply port, so that a late reply finds no receiver. */
++    if (reply != MACH_PORT_NULL) mach_port_mod_refs( mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, -1 );
++    if (service != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), service );
++    if (reason[0]) x87_coop_unhooked( reason );
 +    unsetenv( X87_COOP_ENV );
 +}
 +#endif
@@ -362,7 +409,7 @@ index 28d59fd4fb7..301d76e3179 100644
  /***********************************************************************
   *           __wine_main
   *
-@@ -2628,6 +2826,12 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
+@@ -2615,6 +2853,12 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
      main_argc = argc;
      main_argv = argv;
  
