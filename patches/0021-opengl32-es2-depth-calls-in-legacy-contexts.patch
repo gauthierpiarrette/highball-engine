@@ -1,0 +1,61 @@
+opengl32: glClearDepthf and glDepthRangef answer in legacy contexts.
+
+macOS gives a program that creates an OpenGL context without attributes a legacy 2.1 context,
+and lists GL_ARB_ES2_compatibility only in its 4.1 core contexts. opengl32 then withholds the
+extension's float depth calls, glClearDepthf and glDepthRangef, and returns no function. Programs
+written against OpenGL ES 2 load them anyway, since every Windows driver offers them in any
+context, and call the empty pointer.
+
+Measured on an M4 (macOS 27.0, 2026-10-06): Paperback: The Game (Steam 710700, Loom engine, SDL
+and OpenGL) crashes at address 0 a second after start, both its 32-bit and 64-bit builds, on every
+graphics mode. WINEDEBUG=warn+opengl shows "Extension GL_ARB_ES2_compatibility GL_VERSION_4_1
+required for glClearDepthf not supported" as the last line before the fault (highball-db#349).
+
+When the extension is missing, the two calls now go through glClearDepth and glDepthRange, which
+every context has. A context that has the extension is unchanged.
+
+--- a/dlls/opengl32/unix_wgl.c	2026-10-06 17:04:52
++++ b/dlls/opengl32/unix_wgl.c	2026-10-06 17:05:02
+@@ -959,6 +959,21 @@
+ {
+     const struct registry_entry *entry_a = a, *entry_b = b;
+     return strcmp( entry_a->name, entry_b->name );
++}
++
++/* GL_ARB_ES2_compatibility's float depth calls. macOS lists that extension only in 4.1 core
++ * contexts, but programs written against OpenGL ES 2 call these in a legacy (2.1) context too,
++ * which every Windows driver allows. Answer them through the double precision core calls. */
++static void compat_glClearDepthf( GLfloat d )
++{
++    const struct opengl_funcs *funcs = NtCurrentTeb()->glTable;
++    funcs->p_glClearDepth( d );
++}
++
++static void compat_glDepthRangef( GLfloat n, GLfloat f )
++{
++    const struct opengl_funcs *funcs = NtCurrentTeb()->glTable;
++    funcs->p_glDepthRange( n, f );
+ }
+ 
+ PROC wrap_wglGetProcAddress( TEB *teb, LPCSTR name )
+@@ -997,7 +1012,20 @@
+                 { "glVertexAttribDivisor", "glVertexAttribDivisorARB"},  /* needed by Caffeine */
+                 { "glCompressedTexImage2DARB", "glCompressedTexImage2D" }, /* needed by Grim Fandango Remastered */
+             };
++            static const struct { const char *name; const void *func; } emulated[] =
++            {
++                { "glClearDepthf", compat_glClearDepthf },  /* needed by Paperback: The Game (Loom) */
++                { "glDepthRangef", compat_glDepthRangef },
++            };
+ 
++            for (i = 0; i < ARRAY_SIZE(emulated); i++)
++            {
++                if (strcmp( name, emulated[i].name )) continue;
++                WARN( "Extension %s required for %s not supported, emulating it\n", found->extension, name );
++                *func_ptr = emulated[i].func;
++                return (void *)(UINT_PTR)(found - extension_registry);
++            }
++
+             for (i = 0; i < ARRAY_SIZE(alternatives); i++)
+             {
+                 if (strcmp( name, alternatives[i].name )) continue;
