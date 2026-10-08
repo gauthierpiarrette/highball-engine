@@ -1,0 +1,106 @@
+macOS: %gs:0x20 keeps what PE code last wrote, instead of Wine's Tib.FiberData, across the crossings.
+
+Patch 0009 gives the pthread QoS slot (%gs:0x20) to PE code while PE code runs and to the host while unix
+code runs. On every return to PE code it wrote teb->Tib.FiberData into the slot, which is right for
+kernelbase's fibers (0008 keeps that field and the slot in step at every switch) and wrong for a program
+that runs its own fiber system and keeps its current fiber in %gs:0x20 itself, Boost.Context style: the
+first syscall after a switch handed it Wine's value (NULL or a stale kernelbase fiber) and Microsoft
+Flight Simulator 2024 died in its own "FiberError" assertion at BOOT_INIT after 40 frames (M4, macOS 27.0,
+engine r18, 2026-10-08, gin/private/notes/msfs-2024-2026-10-08.md).
+
+Now the value PE code last left in the slot is saved into the thread data (pe_fiber, 0x350) at every entry
+to unix code (syscall dispatcher, unix-call dispatcher, user_mode_callback_return) and put back at every
+return (both dispatchers' return paths, call_user_mode_callback). It starts as Tib.FiberData at thread
+start. kernelbase's fibers are unchanged: they write both the field and the slot, and the slot is what
+survives. The host QoS value is handled as before.
+
+Why not the upstream gs-base swap (3a16aabbf5): tried on this branch first, it works for console and
+GUI programs on both bitnesses but D3DMetal's PE DLLs call the host framework directly from PE code
+(GPTK's unix_call_enter/exit pattern), which needs the host block in %gs during PE code, so Steam died in
+pthread_setname_np with a NULL thread block the moment D3DMetal came in. Record in the note above.
+
+Trial for the MSFS 2024 investigation, branch msfs-gsbase. Unverified when written.
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-10-08 23:29:55
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-10-08 23:33:45
+@@ -510,6 +510,7 @@
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
+     DWORD_PTR             host_qos;      /* 0340 macOS: the pthread QoS slot value, %gs:0x20, while PE code owns that slot */
+     DWORD_PTR             host_slot13;   /* 0348 macOS: the pthread TSD slot 13 (libc gmtime key), %gs:0x68, while PE code owns it as LastErrorValue */
++    DWORD_PTR             pe_fiber;      /* 0350 macOS: what PE code last left in %gs:0x20, saved on entry to unix code and put back on return */
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+@@ -517,6 +518,7 @@
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, frame_size ) == 0x328 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, host_qos ) == 0x340 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, host_slot13 ) == 0x348 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pe_fiber ) == 0x350 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
+@@ -1834,7 +1836,7 @@
+                    "movq %rax,0x348(%r13)\n\t"
+                    "movl 0x68(%r13),%eax\n\t"      /* teb->LastErrorValue, zero-extended */
+                    "movq %rax,%gs:0x68\n\t"
+-                   "movq 0x20(%r13),%rax\n\t"      /* teb->Tib.FiberData: PE code owns %gs:0x20 from here */
++                   "movq 0x350(%r13),%rax\n\t"     /* amd64_thread_data()->pe_fiber: PE code owns %gs:0x20 from here */
+                    "movq %rax,%gs:0x20\n\t"
+ #endif
+                    "xor %rbx,%rbx\n\t"
+@@ -1852,6 +1854,8 @@
+                                                          NTSTATUS status, TEB *teb );
+ __ASM_GLOBAL_FUNC( user_mode_callback_return,
+ #ifdef __APPLE__
++                   "movq %gs:0x20,%r10\n\t"       /* what PE code left in %gs:0x20 */
++                   "movq %r10,0x350(%rcx)\n\t" /* amd64_thread_data()->pe_fiber */
+                    "movq 0x340(%rcx),%r10\n\t" /* amd64_thread_data()->host_qos: unix code owns %gs:0x20 again */
+                    "movq %r10,%gs:0x20\n\t"
+ #endif
+@@ -3098,6 +3102,11 @@
+      * on entry (the dispatchers, user_mode_callback_return), PE code gets Tib.FiberData on
+      * return (__wine_syscall_dispatcher_return, call_user_mode_callback). Keep the host value. */
+     __asm__ volatile ("movq %%gs:%c1,%0" : "=r" (thread_data->host_qos) : "n" (FIELD_OFFSET(TEB, Tib.FiberData)));
++    /* A program with its own fiber system keeps its current fiber in %gs:0x20 itself (Boost.Context
++     * style, Microsoft Flight Simulator 2024), so the slot is PE-owned data: what PE code last wrote
++     * is saved on every entry to unix code and put back on every return, instead of Wine's own
++     * Tib.FiberData, which only kernelbase's fibers keep in step (and they write the slot too). */
++    thread_data->pe_fiber = (DWORD_PTR)teb->Tib.FiberData;
+     /* %gs:0x68 is where MSVC-built code reads LastErrorValue directly (Unity's Mono runtime reads it
+      * at 130 sites: File.Delete of a missing file threw "Unknown error (0x80f13910)", The Last
+      * Flame, 2026-09-20). On macOS that is pthread TSD slot 13, libc's gmtime key, so it is
+@@ -3260,6 +3269,8 @@
+                    "movl %r15d,0x68(%r13)\n\t"
+                    "movq 0x348(%r13),%r15\n\t"     /* amd64_thread_data()->host_slot13 */
+                    "movq %r15,%gs:0x68\n\t"        /* unix code sees libc's slot 13 again */
++                   "movq %gs:0x20,%r15\n\t"        /* what PE code left in %gs:0x20 */
++                   "movq %r15,0x350(%r13)\n\t"     /* amd64_thread_data()->pe_fiber */
+                    "movq 0x340(%r13),%r15\n\t"     /* amd64_thread_data()->host_qos */
+                    "movq %r15,%gs:0x20\n\t"        /* unix code sees the pthread QoS slot again */
+ #endif
+@@ -3377,7 +3388,7 @@
+                    "movq %rdx,0x348(%r15)\n\t"
+                    "movl 0x68(%r15),%edx\n\t"      /* teb->LastErrorValue: PE code owns %gs:0x68 again */
+                    "movq %rdx,%gs:0x68\n\t"
+-                   "movq 0x20(%r15),%r15\n\t"      /* teb->Tib.FiberData */
++                   "movq 0x350(%r15),%r15\n\t"     /* amd64_thread_data()->pe_fiber */
+                    "movq %r15,%gs:0x20\n\t"        /* PE code reads GetCurrentFiber() here; %r15 is restored below */
+ #endif
+ #ifdef __linux__
+@@ -3596,6 +3607,8 @@
+                    "movl %eax,0x68(%r13)\n\t"
+                    "movq 0x348(%r13),%rax\n\t"     /* amd64_thread_data()->host_slot13 */
+                    "movq %rax,%gs:0x68\n\t"        /* unix code sees libc's slot 13 again */
++                   "movq %gs:0x20,%rax\n\t"        /* what PE code left in %gs:0x20 */
++                   "movq %rax,0x350(%r13)\n\t"     /* amd64_thread_data()->pe_fiber */
+                    "movq 0x340(%r13),%rax\n\t"     /* amd64_thread_data()->host_qos */
+                    "movq %rax,%gs:0x20\n\t"        /* unix code sees the pthread QoS slot again */
+ #endif
+@@ -3669,7 +3682,7 @@
+                    "movq %rdx,0x348(%r13)\n\t"
+                    "movl 0x68(%r13),%edx\n\t"      /* teb->LastErrorValue: PE code owns %gs:0x68 again */
+                    "movq %rdx,%gs:0x68\n\t"
+-                   "movq 0x20(%r13),%rdx\n\t"      /* teb->Tib.FiberData: PE code owns %gs:0x20 again (%rdx is volatile for the PE caller) */
++                   "movq 0x350(%r13),%rdx\n\t"     /* amd64_thread_data()->pe_fiber: PE code owns %gs:0x20 again (%rdx is volatile for the PE caller) */
+                    "movq %rdx,%gs:0x20\n\t"
+ #endif
+                    "movq 0x58(%rcx),%r13\n\t"
