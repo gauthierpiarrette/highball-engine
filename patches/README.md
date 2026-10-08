@@ -31,6 +31,8 @@ Current series:
 
 - `0022-macos-pe-owned-fiber-slot.patch` (branch msfs-gsbase, trial): %gs:0x20 keeps what PE code last wrote across the crossings (saved at every entry to unix code, restored at every return) instead of Wine's Tib.FiberData, for programs that run their own fiber system and keep the current fiber there themselves (Microsoft Flight Simulator 2024 died in FiberError when 0009 handed it Wine's value after a syscall). kernelbase's fibers write the slot too, so nothing changes for them. The upstream gs-base swap was tried first on this branch and cannot coexist with D3DMetal, whose PE DLLs call the host framework directly from PE code. Unverified when written, 2026-10-09.
 
+- `0023-macos-pe-owned-stack-bounds.patch` (branch msfs-gsbase, trial): %gs:0x08 and %gs:0x10 (NT_TIB.StackBase/StackLimit) PE-owned across the crossings like 0x20 and 0x68, via teb->Instrumentation[1..4]; the PE ntdll reads the stack bounds from the slots (is_valid_frame), kernelbase's SwitchToFiber writes them, the unix guard-page move keeps the limit in step. Microsoft Flight Simulator 2024 writes its fiber's bounds there and Wine's unix errno read faulted through the host slot (2026-10-09). Unverified when written.
+
 Candidates, in order, from the 2026-09 investigation:
 
 1. Rockstar Games Launcher installer: the service start that the CrossOver tree completes and the

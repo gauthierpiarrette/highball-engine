@@ -1,0 +1,223 @@
+macOS: %gs:0x08 and %gs:0x10 (NT_TIB.StackBase, StackLimit) are PE-owned across the crossings, and the
+PE ntdll reads the stack bounds there.
+
+Windows keeps NT_TIB.StackBase and StackLimit at %gs:0x08 and %gs:0x10, and a program that runs its own
+fiber system writes them on every switch (Boost.Context style). On macOS those slots belong to the host
+thread block: the errno pointer and the MIG reply port. Microsoft Flight Simulator 2024 wrote its fiber's
+stack base there, and the first Wine unix routine that touched errno on that thread read through it
+(ntdll.so, movl (%rax) after __error(), rax = 0x15010000, M4, macOS 27.0, 2026-10-09,
+gin/private/notes/msfs-2024-2026-10-08.md section H); the sim's own handlers then reported "FiberError".
+
+Now the two slots take turns like %gs:0x20 (0009/0022) and %gs:0x68 (0011): on every entry to unix code
+PE's values go to teb->Instrumentation[1] and [2] and the host's errno pointer and reply port (kept in
+[3] and [4]) come back; on every return to PE code the reverse. They start as the TEB's StackBase and
+StackLimit (call_init_thunk), the unix guard-page move keeps [2] in step, and kernelbase's own
+SwitchToFiber writes the slots as it writes the fields (the same addresses where %gs is the TEB). The PE
+ntdll's exception dispatcher (is_valid_frame, the unwind end checks) reads the bounds from the slots,
+which is where Windows reads them, so a fiber stack a program announced there is accepted without the
+tsshim wide-bounds experiment.
+
+D3DMetal's host code called directly from PE code sees PE's values in those slots, as it did before this
+patch whenever such a program ran. Unverified when written. Trial, branch msfs-gsbase.
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-10-08 23:33:45
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-10-09 00:52:08
+@@ -1838,6 +1838,14 @@
+                    "movq %rax,%gs:0x68\n\t"
+                    "movq 0x350(%r13),%rax\n\t"     /* amd64_thread_data()->pe_fiber: PE code owns %gs:0x20 from here */
+                    "movq %rax,%gs:0x20\n\t"
++                   "movq %gs:0x08,%rax\n\t"        /* host errno pointer aside */
++                   "movq %rax,0x16d0(%r13)\n\t"
++                   "movq 0x16c0(%r13),%rax\n\t"     /* pe_stack_base: PE code owns %gs:0x08 again */
++                   "movq %rax,%gs:0x08\n\t"
++                   "movq %gs:0x10,%rax\n\t"        /* host MIG reply port aside */
++                   "movq %rax,0x16d8(%r13)\n\t"
++                   "movq 0x16c8(%r13),%rax\n\t"     /* pe_stack_limit: PE code owns %gs:0x10 again */
++                   "movq %rax,%gs:0x10\n\t"
+ #endif
+                    "xor %rbx,%rbx\n\t"
+                    "xor %r12,%r12\n\t"
+@@ -1858,6 +1866,14 @@
+                    "movq %r10,0x350(%rcx)\n\t" /* amd64_thread_data()->pe_fiber */
+                    "movq 0x340(%rcx),%r10\n\t" /* amd64_thread_data()->host_qos: unix code owns %gs:0x20 again */
+                    "movq %r10,%gs:0x20\n\t"
++                   "movq %gs:0x08,%r10\n\t"        /* what PE code left in %gs:0x08 (NT_TIB.StackBase) */
++                   "movq %r10,0x16c0(%rcx)\n\t"     /* teb->Instrumentation[1]: pe_stack_base */
++                   "movq 0x16d0(%rcx),%r10\n\t"     /* teb->Instrumentation[3]: host errno pointer back */
++                   "movq %r10,%gs:0x08\n\t"
++                   "movq %gs:0x10,%r10\n\t"        /* what PE code left in %gs:0x10 (NT_TIB.StackLimit) */
++                   "movq %r10,0x16c8(%rcx)\n\t"     /* teb->Instrumentation[2]: pe_stack_limit */
++                   "movq 0x16d8(%rcx),%r10\n\t"     /* teb->Instrumentation[4]: host MIG reply port back */
++                   "movq %r10,%gs:0x10\n\t"
+ #endif
+                    "movq 0x378(%rcx),%r10\n\t" /* thread_data->syscall_frame */
+                    "movq 0xa0(%r10),%r11\n\t"  /* frame->prev_frame */
+@@ -3107,6 +3123,14 @@
+      * is saved on every entry to unix code and put back on every return, instead of Wine's own
+      * Tib.FiberData, which only kernelbase's fibers keep in step (and they write the slot too). */
+     thread_data->pe_fiber = (DWORD_PTR)teb->Tib.FiberData;
++    /* The same for NT_TIB.StackBase and StackLimit at %gs:0x08 and %gs:0x10, which a program with its
++     * own fiber system keeps there (and Windows' exception dispatcher reads there): on the host those
++     * slots are the errno pointer and the MIG reply port. PE's values live in teb->Instrumentation[1..2],
++     * the host's in [3..4] (CrossOver already uses [0]); they take turns at the same crossings. */
++    teb->Instrumentation[1] = teb->Tib.StackBase;
++    teb->Instrumentation[2] = teb->Tib.StackLimit;
++    __asm__ volatile ("movq %%gs:0x08,%0" : "=r" (teb->Instrumentation[3]));
++    __asm__ volatile ("movq %%gs:0x10,%0" : "=r" (teb->Instrumentation[4]));
+     /* %gs:0x68 is where MSVC-built code reads LastErrorValue directly (Unity's Mono runtime reads it
+      * at 130 sites: File.Delete of a missing file threw "Unknown error (0x80f13910)", The Last
+      * Flame, 2026-09-20). On macOS that is pthread TSD slot 13, libc's gmtime key, so it is
+@@ -3273,6 +3297,14 @@
+                    "movq %r15,0x350(%r13)\n\t"     /* amd64_thread_data()->pe_fiber */
+                    "movq 0x340(%r13),%r15\n\t"     /* amd64_thread_data()->host_qos */
+                    "movq %r15,%gs:0x20\n\t"        /* unix code sees the pthread QoS slot again */
++                   "movq %gs:0x08,%r15\n\t"        /* what PE code left in %gs:0x08 (NT_TIB.StackBase) */
++                   "movq %r15,0x16c0(%r13)\n\t"     /* teb->Instrumentation[1]: pe_stack_base */
++                   "movq 0x16d0(%r13),%r15\n\t"     /* teb->Instrumentation[3]: host errno pointer back */
++                   "movq %r15,%gs:0x08\n\t"
++                   "movq %gs:0x10,%r15\n\t"        /* what PE code left in %gs:0x10 (NT_TIB.StackLimit) */
++                   "movq %r15,0x16c8(%r13)\n\t"     /* teb->Instrumentation[2]: pe_stack_limit */
++                   "movq 0x16d8(%r13),%r15\n\t"     /* teb->Instrumentation[4]: host MIG reply port back */
++                   "movq %r15,%gs:0x10\n\t"
+ #endif
+                    /* Legends of Runeterra hooks the first system call return instruction, and
+                     * depends on us returning to it. Adjust the return address accordingly. */
+@@ -3388,6 +3420,14 @@
+                    "movq %rdx,0x348(%r15)\n\t"
+                    "movl 0x68(%r15),%edx\n\t"      /* teb->LastErrorValue: PE code owns %gs:0x68 again */
+                    "movq %rdx,%gs:0x68\n\t"
++                   "movq %gs:0x08,%rdx\n\t"        /* host errno pointer aside */
++                   "movq %rdx,0x16d0(%r15)\n\t"
++                   "movq 0x16c0(%r15),%rdx\n\t"     /* pe_stack_base: PE code owns %gs:0x08 again */
++                   "movq %rdx,%gs:0x08\n\t"
++                   "movq %gs:0x10,%rdx\n\t"        /* host MIG reply port aside */
++                   "movq %rdx,0x16d8(%r15)\n\t"
++                   "movq 0x16c8(%r15),%rdx\n\t"     /* pe_stack_limit: PE code owns %gs:0x10 again */
++                   "movq %rdx,%gs:0x10\n\t"
+                    "movq 0x350(%r15),%r15\n\t"     /* amd64_thread_data()->pe_fiber */
+                    "movq %r15,%gs:0x20\n\t"        /* PE code reads GetCurrentFiber() here; %r15 is restored below */
+ #endif
+@@ -3611,6 +3651,14 @@
+                    "movq %rax,0x350(%r13)\n\t"     /* amd64_thread_data()->pe_fiber */
+                    "movq 0x340(%r13),%rax\n\t"     /* amd64_thread_data()->host_qos */
+                    "movq %rax,%gs:0x20\n\t"        /* unix code sees the pthread QoS slot again */
++                   "movq %gs:0x08,%rax\n\t"        /* what PE code left in %gs:0x08 (NT_TIB.StackBase) */
++                   "movq %rax,0x16c0(%r13)\n\t"     /* teb->Instrumentation[1]: pe_stack_base */
++                   "movq 0x16d0(%r13),%rax\n\t"     /* teb->Instrumentation[3]: host errno pointer back */
++                   "movq %rax,%gs:0x08\n\t"
++                   "movq %gs:0x10,%rax\n\t"        /* what PE code left in %gs:0x10 (NT_TIB.StackLimit) */
++                   "movq %rax,0x16c8(%r13)\n\t"     /* teb->Instrumentation[2]: pe_stack_limit */
++                   "movq 0x16d8(%r13),%rax\n\t"     /* teb->Instrumentation[4]: host MIG reply port back */
++                   "movq %rax,%gs:0x10\n\t"
+ #endif
+                    "stmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
+                    "movdqa %xmm6,0x1c0(%rcx)\n\t"
+@@ -3684,6 +3732,14 @@
+                    "movq %rdx,%gs:0x68\n\t"
+                    "movq 0x350(%r13),%rdx\n\t"     /* amd64_thread_data()->pe_fiber: PE code owns %gs:0x20 again (%rdx is volatile for the PE caller) */
+                    "movq %rdx,%gs:0x20\n\t"
++                   "movq %gs:0x08,%rdx\n\t"        /* host errno pointer aside */
++                   "movq %rdx,0x16d0(%r13)\n\t"
++                   "movq 0x16c0(%r13),%rdx\n\t"     /* pe_stack_base: PE code owns %gs:0x08 again */
++                   "movq %rdx,%gs:0x08\n\t"
++                   "movq %gs:0x10,%rdx\n\t"        /* host MIG reply port aside */
++                   "movq %rdx,0x16d8(%r13)\n\t"
++                   "movq 0x16c8(%r13),%rdx\n\t"     /* pe_stack_limit: PE code owns %gs:0x10 again */
++                   "movq %rdx,%gs:0x10\n\t"
+ #endif
+                    "movq 0x58(%rcx),%r13\n\t"
+                    "movq 0x28(%rcx),%rdi\n\t"
+--- a/dlls/ntdll/unix/virtual.c	2026-10-08 23:33:45
++++ b/dlls/ntdll/unix/virtual.c	2026-10-09 00:52:08
+@@ -4534,7 +4534,13 @@
+         WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
+         wow_teb->Tib.StackLimit = PtrToUlong( page );
+     }
+-    else NtCurrentTeb()->Tib.StackLimit = page;
++    else
++    {
++        NtCurrentTeb()->Tib.StackLimit = page;
++#if defined(__APPLE__) && defined(__x86_64__)
++        NtCurrentTeb()->Instrumentation[2] = page;  /* PE's %gs:0x10 at the next return to PE code */
++#endif
++    }
+     return ret;
+ }
+ 
+--- a/dlls/kernelbase/thread.c	2026-10-08 23:33:45
++++ b/dlls/kernelbase/thread.c	2026-10-09 00:52:08
+@@ -1291,6 +1291,10 @@
+     NtCurrentTeb()->Tib.ExceptionList = new_fiber->except;
+     NtCurrentTeb()->Tib.StackBase     = new_fiber->stack_base;
+     NtCurrentTeb()->Tib.StackLimit    = new_fiber->stack_limit;
++#ifdef __x86_64__
++    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (new_fiber->stack_base), "n" (FIELD_OFFSET(TEB, Tib.StackBase)));
++    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (new_fiber->stack_limit), "n" (FIELD_OFFSET(TEB, Tib.StackLimit)));
++#endif
+     NtCurrentTeb()->DeallocationStack = new_fiber->stack_allocation;
+     NtCurrentTeb()->FlsSlots          = new_fiber->fls_slots;
+     NtCurrentTeb()->ActivationContextStackPointer = new_fiber->actctx.stack_ptr;
+--- a/dlls/ntdll/ntdll_misc.h	2026-10-08 23:33:45
++++ b/dlls/ntdll/ntdll_misc.h	2026-10-09 00:52:08
+@@ -61,11 +61,22 @@
+ extern LONG WINAPI call_unhandled_exception_filter( PEXCEPTION_POINTERS eptr );
+ extern void WINAPI process_breakpoint(void);
+ 
++/* NT_TIB.StackBase and StackLimit as the program sees them: at %gs:0x08 and %gs:0x10, which is the TEB
++ * where %gs is the TEB and the PE-owned mirror of the fields on macOS, where a program running its own
++ * fiber system writes them (see the unix side's crossings). */
++#ifdef __x86_64__
++static inline void *tib_stack_base(void) { void *p; __asm__( "movq %%gs:0x08,%0" : "=r" (p) ); return p; }
++static inline void *tib_stack_limit(void) { void *p; __asm__( "movq %%gs:0x10,%0" : "=r" (p) ); return p; }
++#else
++static inline void *tib_stack_base(void) { return NtCurrentTeb()->Tib.StackBase; }
++static inline void *tib_stack_limit(void) { return NtCurrentTeb()->Tib.StackLimit; }
++#endif
++
+ static inline BOOL is_valid_frame( ULONG_PTR frame )
+ {
+     if (frame & (sizeof(void*) - 1)) return FALSE;
+-    return ((void *)frame >= NtCurrentTeb()->Tib.StackLimit &&
+-            (void *)frame <= NtCurrentTeb()->Tib.StackBase);
++    return ((void *)frame >= tib_stack_limit() &&
++            (void *)frame <= tib_stack_base());
+ }
+ 
+ extern void WINAPI LdrInitializeThunk(CONTEXT*,ULONG_PTR,ULONG_PTR,ULONG_PTR);
+--- a/dlls/ntdll/signal_x86_64.c	2026-10-08 23:33:45
++++ b/dlls/ntdll/signal_x86_64.c	2026-10-09 00:52:08
+@@ -260,7 +260,7 @@
+         if (!is_valid_frame( dispatch.EstablisherFrame ))
+         {
+             ERR( "invalid frame %p (%p-%p)\n", (void *)dispatch.EstablisherFrame,
+-                 NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
++                 tib_stack_limit(), tib_stack_base() );
+             rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
+             break;
+         }
+@@ -329,7 +329,7 @@
+             teb_frame = teb_frame->Prev;
+         }
+ 
+-        if (context.Rsp == (ULONG64)NtCurrentTeb()->Tib.StackBase) break;
++        if (context.Rsp == (ULONG64)tib_stack_base()) break;
+     }
+     return STATUS_UNHANDLED_EXCEPTION;
+ }
+@@ -737,7 +737,7 @@
+         if (!is_valid_frame( dispatch.EstablisherFrame ))
+         {
+             ERR( "invalid frame %p (%p-%p)\n", (void *)dispatch.EstablisherFrame,
+-                 NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
++                 tib_stack_limit(), tib_stack_base() );
+             rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
+             break;
+         }
+@@ -892,7 +892,7 @@
+             break;
+         if (!context.Rip) break;
+         if (!frame || !is_valid_frame( frame )) break;
+-        if (context.Rsp == (ULONG_PTR)NtCurrentTeb()->Tib.StackBase) break;
++        if (context.Rsp == (ULONG_PTR)tib_stack_base()) break;
+         if (i >= skip) buffer[num_entries++] = (void *)context.Rip;
+     }
+     return num_entries;
