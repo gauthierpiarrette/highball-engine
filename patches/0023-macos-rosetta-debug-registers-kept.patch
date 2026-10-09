@@ -16,6 +16,9 @@ The server now keeps the last values written, per thread, when the process is tr
 the ntdll hack then never triggers. A breakpoint still never fires under Rosetta, which this
 patch does not change or claim to.
 
+For the diagnosis, ntdll traces the values written and read back under +seh (NtSetContextThread and
+NtGetContextThread, 64-bit).
+
 Trial on branch msfs-gsbase, unverified when written. Upstream: server/mach.c is CodeWeavers'
 Mach debugger support, not WineHQ's; not for upstream.
 
@@ -106,3 +109,27 @@ Mach debugger support, not WineHQ's; not for upstream.
          return;
      }
  
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-10-09 14:33:12
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-10-09 14:33:12
+@@ -1237,6 +1237,11 @@
+             return STATUS_BUFFER_OVERFLOW;
+     }
+     else flags &= ~CONTEXT_XSTATE;
++
++    if (flags & CONTEXT_DEBUG_REGISTERS)
++        TRACE_(seh)( "thread %p set debug registers dr0=%lx dr1=%lx dr2=%lx dr3=%lx dr6=%lx dr7=%lx\n", handle,
++                     (unsigned long)context->Dr0, (unsigned long)context->Dr1, (unsigned long)context->Dr2,
++                     (unsigned long)context->Dr3, (unsigned long)context->Dr6, (unsigned long)context->Dr7 );
+ 
+     /* debug registers require a server call */
+     if (self && (flags & CONTEXT_DEBUG_REGISTERS))
+@@ -1442,6 +1447,9 @@
+     /* update the cached version of the debug registers */
+     if (needed_flags & CONTEXT_DEBUG_REGISTERS)
+     {
++        TRACE_(seh)( "thread %p got debug registers dr0=%lx dr1=%lx dr2=%lx dr3=%lx dr6=%lx dr7=%lx\n", handle,
++                     (unsigned long)context->Dr0, (unsigned long)context->Dr1, (unsigned long)context->Dr2,
++                     (unsigned long)context->Dr3, (unsigned long)context->Dr6, (unsigned long)context->Dr7 );
+         amd64_thread_data()->dr0 = context->Dr0;
+         amd64_thread_data()->dr1 = context->Dr1;
+         amd64_thread_data()->dr2 = context->Dr2;
