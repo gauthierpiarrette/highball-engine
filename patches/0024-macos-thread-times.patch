@@ -1,0 +1,29 @@
+--- a/dlls/ntdll/unix/thread.c	2026-10-09 16:23:35
++++ b/dlls/ntdll/unix/thread.c	2026-10-09 16:23:35
+@@ -2004,6 +2004,26 @@
+     }
+     procstat_close(pstat);
+     return ret;
++#elif defined(__APPLE__)
++    /* unix_tid is the Mach thread port name from get_unix_tid(); it is only
++     * meaningful inside the same task. */
++    thread_basic_info_data_t info;
++    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
++
++    if (unix_pid != getpid())
++    {
++        static int once;
++        if (!once++) FIXME("cross-process thread times not supported on this platform\n");
++        return FALSE;
++    }
++    if (thread_info( (thread_act_t)unix_tid, THREAD_BASIC_INFO, (thread_info_t)&info, &count ) != KERN_SUCCESS)
++    {
++        WARN("thread_info failed for thread port %#x\n", unix_tid);
++        return FALSE;
++    }
++    kernel_time->QuadPart = (ULONGLONG)info.system_time.seconds * 10000000 + (ULONGLONG)info.system_time.microseconds * 10;
++    user_time->QuadPart   = (ULONGLONG)info.user_time.seconds * 10000000 + (ULONGLONG)info.user_time.microseconds * 10;
++    return TRUE;
+ #else
+     static int once;
+     if (!once++) FIXME("not implemented on this platform\n");
