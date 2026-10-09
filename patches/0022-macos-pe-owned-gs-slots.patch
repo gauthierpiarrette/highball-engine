@@ -15,7 +15,13 @@ Now %gs:0x20 takes turns like %gs:0x68 (0011): what PE code last left there goes
 Tib.FiberData on entry to unix code and the host's QoS value (host_qos at 0x340) comes back; the reverse on
 every return to PE code. %gs:0x08 and %gs:0x10 keep the host's errno pointer and MIG reply port on both
 sides (host_errno at 0x350, host_mig at 0x358) until PE code writes one of them: from then on that slot is
-PE-owned the same way through Tib.StackBase and Tib.StackLimit (pe_slot_flags at 0x360 remembers which).
+PE-owned the same way through Tib.StackBase and Tib.StackLimit (pe_slot_flags at 0x360 remembers which),
+and when PE code writes the host's value back (its own context switch saved what it found in the slot at
+its first switch, so this is its return to the thread's own stack) the TEB field returns to the thread's
+own bounds, kept in ntdll_thread_data pe_main_base and pe_main_limit (0x3d8, 0x3e0; the unix guard-page
+move keeps the limit in step while the thread runs its own stack). Without that the TEB kept the last
+fiber's bounds and the sim's __chkstk probed a fiber's limit page from the thread stack, an access
+violation on a frame "outside the stack", dead at 3 s (r18s4, 2026-10-09).
 PE mode cannot simply hold the TEB fields: D3DMetal's PE DLLs call host code directly on the PE stack, and
 the form of this patch that did so killed steamwebhelper.exe on the first failing syscall (libsystem_kernel
 wrote errno through %gs:0x08 = 0x110000, the thread's stack base, r18s3, 2026-10-09). The TEB fields are
@@ -38,7 +44,7 @@ call_init_thunk keeps the host's values and clears the flags, the unix guard-pag
 Tib.StackLimit as before, kernelbase's SwitchToFiber writes the slots as it writes the fields, and the PE
 ntdll keeps reading the bounds from the TEB fields, which every crossing refreshes from the slots. A
 program that writes its fiber's bounds into the slots makes D3DMetal's direct host calls on that thread
-see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
+see them, as it did before this patch. Trial, branch msfs-gsbase. Fifth form.
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
 @@ -510,6 +510,9 @@
@@ -61,7 +67,7 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
-@@ -905,8 +911,83 @@
+@@ -905,8 +911,96 @@
                     "popfq\n\t"
                     __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                     "ret" )
@@ -72,7 +78,9 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
 + * runs. %gs:0x08 and %gs:0x10 are the host's errno pointer and MIG reply port on both sides until PE code
 + * writes one of them (a program running its own fiber system keeps NT_TIB.StackBase and StackLimit there,
 + * Boost.Context style): from then on that slot is PE-owned too, what PE left there goes into the TEB
-+ * field on entry to unix code and comes back on return (pe_slot_flags remembers which). PE mode cannot
++ * field on entry to unix code and comes back on return (pe_slot_flags remembers which), and when PE code
++ * writes the host's value back (its main context saved what it found there at its first switch) the
++ * TEB field returns to the thread's own bounds (pe_main_base, pe_main_limit). PE mode cannot
 + * simply hold the TEB fields: D3DMetal's PE DLLs call host code directly on the PE stack and the first
 + * failing syscall writes errno through %gs:0x08. The TEB fields are the PE-side store, host_qos,
 + * host_errno and host_mig the host-side one. The dispatchers swap on the kernel stack on entry and on the
@@ -82,7 +90,8 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
 + * call_init_thunk captured the host's values (host_errno is never zero). */
 +static inline void pe_slots_to_host( TEB *teb )
 +{
-+    struct amd64_thread_data *data = (struct amd64_thread_data *)((struct ntdll_thread_data *)&teb->GdiTebBatch)->cpu_data;
++    struct ntdll_thread_data *tdata = (struct ntdll_thread_data *)&teb->GdiTebBatch;
++    struct amd64_thread_data *data = (struct amd64_thread_data *)tdata->cpu_data;
 +    void *v;
 +
 +    if (!data->host_errno) return;
@@ -99,12 +108,22 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
 +        data->pe_slot_flags |= 1;
 +        __asm__ volatile( "movq %0,%%gs:0x08" :: "r" (data->host_errno) );
 +    }
++    else if (data->pe_slot_flags & 1)  /* PE code put the host value back: its main context, the thread's own stack */
++    {
++        data->pe_slot_flags &= ~1;
++        teb->Tib.StackBase = tdata->pe_main_base;
++    }
 +    __asm__ volatile( "movq %%gs:0x10,%0" : "=r" (v) );
 +    if (v != (void *)data->host_mig)
 +    {
 +        teb->Tib.StackLimit = v;
 +        data->pe_slot_flags |= 2;
 +        __asm__ volatile( "movq %0,%%gs:0x10" :: "r" (data->host_mig) );
++    }
++    else if (data->pe_slot_flags & 2)
++    {
++        data->pe_slot_flags &= ~2;
++        teb->Tib.StackLimit = tdata->pe_main_limit;
 +    }
 +}
  
@@ -145,7 +164,7 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
  /***********************************************************************
   *           init_handler
   */
-@@ -920,6 +1001,7 @@
+@@ -920,6 +1014,7 @@
          arch_prctl( ARCH_SET_FS, ((struct amd64_thread_data *)thread_data->cpu_data)->pthread_teb );
      }
  #elif defined __APPLE__
@@ -153,7 +172,7 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
      /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
       * instead of the user selector (cs64_sel: 0x2b, USER64_CS).
       * Fix up sigcontext so later code can compare it to cs64_sel.
-@@ -943,6 +1025,12 @@
+@@ -943,6 +1038,12 @@
          !is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
          !is_inside_syscall( RSP_sig(sigcontext) ))
          __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
@@ -166,7 +185,7 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
  #endif
      if (is_16bit( sigcontext )) return;
  #ifdef DS_sig
-@@ -1834,8 +1922,33 @@
+@@ -1834,8 +1935,33 @@
                     "movq %rax,0x348(%r13)\n\t"
                     "movl 0x68(%r13),%eax\n\t"      /* teb->LastErrorValue, zero-extended */
                     "movq %rax,%gs:0x68\n\t"
@@ -202,7 +221,7 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
  #endif
                     "xor %rbx,%rbx\n\t"
                     "xor %r12,%r12\n\t"
-@@ -1851,10 +1964,8 @@
+@@ -1851,10 +1977,8 @@
  extern void DECLSPEC_NORETURN user_mode_callback_return( void *ret_ptr, ULONG ret_len,
                                                           NTSTATUS status, TEB *teb );
  __ASM_GLOBAL_FUNC( user_mode_callback_return,
@@ -215,7 +234,7 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
                     "movq 0x378(%rcx),%r10\n\t" /* thread_data->syscall_frame */
                     "movq 0xa0(%r10),%r11\n\t"  /* frame->prev_frame */
                     "movq %r11,0x378(%rcx)\n\t" /* syscall_frame = prev_frame */
-@@ -3098,6 +3209,16 @@
+@@ -3098,6 +3222,18 @@
       * on entry (the dispatchers, user_mode_callback_return), PE code gets Tib.FiberData on
       * return (__wine_syscall_dispatcher_return, call_user_mode_callback). Keep the host value. */
      __asm__ volatile ("movq %%gs:%c1,%0" : "=r" (thread_data->host_qos) : "n" (FIELD_OFFSET(TEB, Tib.FiberData)));
@@ -229,10 +248,12 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
 +    __asm__ volatile ("movq %%gs:%c1,%0" : "=r" (thread_data->host_errno) : "n" (FIELD_OFFSET(TEB, Tib.StackBase)));
 +    __asm__ volatile ("movq %%gs:%c1,%0" : "=r" (thread_data->host_mig) : "n" (FIELD_OFFSET(TEB, Tib.StackLimit)));
 +    thread_data->pe_slot_flags = 0;  /* PE mode keeps the host's errno pointer and reply port until PE code writes a bound */
++    ((struct ntdll_thread_data *)&teb->GdiTebBatch)->pe_main_base = teb->Tib.StackBase;
++    ((struct ntdll_thread_data *)&teb->GdiTebBatch)->pe_main_limit = teb->Tib.StackLimit;
      /* %gs:0x68 is where MSVC-built code reads LastErrorValue directly (Unity's Mono runtime reads it
       * at 130 sites: File.Delete of a missing file threw "Unknown error (0x80f13910)", The Last
       * Flame, 2026-09-20). On macOS that is pthread TSD slot 13, libc's gmtime key, so it is
-@@ -3260,8 +3381,6 @@
+@@ -3260,8 +3396,6 @@
                     "movl %r15d,0x68(%r13)\n\t"
                     "movq 0x348(%r13),%r15\n\t"     /* amd64_thread_data()->host_slot13 */
                     "movq %r15,%gs:0x68\n\t"        /* unix code sees libc's slot 13 again */
@@ -241,7 +262,7 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
  #endif
                     /* Legends of Runeterra hooks the first system call return instruction, and
                      * depends on us returning to it. Adjust the return address accordingly. */
-@@ -3331,6 +3450,34 @@
+@@ -3331,6 +3465,46 @@
                     "syscall\n\t"
                     "leaq -0x98(%rbp),%rcx\n"
                     "2:\n\t"
@@ -260,23 +281,35 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
 +                   "movq %rax,%gs:0x20\n"
 +                   "1:\tmovq %gs:0x08,%rax\n\t"
 +                   "cmpq 0x350(%r13),%rax\n\t"     /* amd64_thread_data()->host_errno */
-+                   "je 1f\n\t"
++                   "je 2f\n\t"
 +                   "movq %rax,0x08(%r13)\n\t"      /* teb->Tib.StackBase: what PE code left in %gs:0x08 */
 +                   "orq $1,0x360(%r13)\n\t"          /* amd64_thread_data()->pe_slot_flags */
 +                   "movq 0x350(%r13),%rax\n\t"
-+                   "movq %rax,%gs:0x08\n"
++                   "movq %rax,%gs:0x08\n\t"
++                   "jmp 1f\n"
++                   "2:\ttestq $1,0x360(%r13)\n\t"   /* the host value, put back by PE code: its main context */
++                   "jz 1f\n\t"
++                   "andq $-2,0x360(%r13)\n\t"
++                   "movq 0x3d8(%r13),%rax\n\t"     /* ntdll_thread_data()->pe_main_base: the thread's own stack again */
++                   "movq %rax,0x08(%r13)\n"
 +                   "1:\tmovq %gs:0x10,%rax\n\t"
 +                   "cmpq 0x358(%r13),%rax\n\t"     /* amd64_thread_data()->host_mig */
-+                   "je 1f\n\t"
++                   "je 2f\n\t"
 +                   "movq %rax,0x10(%r13)\n\t"      /* teb->Tib.StackLimit: what PE code left in %gs:0x10 */
 +                   "orq $2,0x360(%r13)\n\t"
 +                   "movq 0x358(%r13),%rax\n\t"
-+                   "movq %rax,%gs:0x10\n"
++                   "movq %rax,%gs:0x10\n\t"
++                   "jmp 1f\n"
++                   "2:\ttestq $2,0x360(%r13)\n\t"
++                   "jz 1f\n\t"
++                   "andq $-3,0x360(%r13)\n\t"
++                   "movq 0x3e0(%r13),%rax\n\t"     /* ntdll_thread_data()->pe_main_limit */
++                   "movq %rax,0x10(%r13)\n"
 +                   "1:\n\t"
  #endif
                     "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
                     "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
-@@ -3377,8 +3524,33 @@
+@@ -3377,8 +3551,33 @@
                     "movq %rdx,0x348(%r15)\n\t"
                     "movl 0x68(%r15),%edx\n\t"      /* teb->LastErrorValue: PE code owns %gs:0x68 again */
                     "movq %rdx,%gs:0x68\n\t"
@@ -312,7 +345,7 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
  #endif
  #ifdef __linux__
                     "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
-@@ -3596,8 +3768,6 @@
+@@ -3596,8 +3795,6 @@
                     "movl %eax,0x68(%r13)\n\t"
                     "movq 0x348(%r13),%rax\n\t"     /* amd64_thread_data()->host_slot13 */
                     "movq %rax,%gs:0x68\n\t"        /* unix code sees libc's slot 13 again */
@@ -321,11 +354,10 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
  #endif
                     "stmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
                     "movdqa %xmm6,0x1c0(%rcx)\n\t"
-@@ -3636,6 +3806,34 @@
-                    "mov $158,%eax\n\t"             /* SYS_arch_prctl */
+@@ -3637,6 +3834,46 @@
                     "syscall\n\t"
                     "2:\n\t"
-+#endif
+ #endif
 +#ifdef __APPLE__
 +                   /* unix code owns %gs:0x20, %gs:0x08 and %gs:0x10 again (the pthread QoS slot, the errno pointer,
 +                    * the MIG reply port), what PE code left there goes into the TEB (Tib.FiberData, StackBase,
@@ -340,23 +372,36 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
 +                   "movq %rax,%gs:0x20\n"
 +                   "1:\tmovq %gs:0x08,%rax\n\t"
 +                   "cmpq 0x350(%r13),%rax\n\t"     /* amd64_thread_data()->host_errno */
-+                   "je 1f\n\t"
++                   "je 2f\n\t"
 +                   "movq %rax,0x08(%r13)\n\t"      /* teb->Tib.StackBase: what PE code left in %gs:0x08 */
 +                   "orq $1,0x360(%r13)\n\t"          /* amd64_thread_data()->pe_slot_flags */
 +                   "movq 0x350(%r13),%rax\n\t"
-+                   "movq %rax,%gs:0x08\n"
++                   "movq %rax,%gs:0x08\n\t"
++                   "jmp 1f\n"
++                   "2:\ttestq $1,0x360(%r13)\n\t"   /* the host value, put back by PE code: its main context */
++                   "jz 1f\n\t"
++                   "andq $-2,0x360(%r13)\n\t"
++                   "movq 0x3d8(%r13),%rax\n\t"     /* ntdll_thread_data()->pe_main_base: the thread's own stack again */
++                   "movq %rax,0x08(%r13)\n"
 +                   "1:\tmovq %gs:0x10,%rax\n\t"
 +                   "cmpq 0x358(%r13),%rax\n\t"     /* amd64_thread_data()->host_mig */
-+                   "je 1f\n\t"
++                   "je 2f\n\t"
 +                   "movq %rax,0x10(%r13)\n\t"      /* teb->Tib.StackLimit: what PE code left in %gs:0x10 */
 +                   "orq $2,0x360(%r13)\n\t"
 +                   "movq 0x358(%r13),%rax\n\t"
-+                   "movq %rax,%gs:0x10\n"
++                   "movq %rax,%gs:0x10\n\t"
++                   "jmp 1f\n"
++                   "2:\ttestq $2,0x360(%r13)\n\t"
++                   "jz 1f\n\t"
++                   "andq $-3,0x360(%r13)\n\t"
++                   "movq 0x3e0(%r13),%rax\n\t"     /* ntdll_thread_data()->pe_main_limit */
++                   "movq %rax,0x10(%r13)\n"
 +                   "1:\n\t"
- #endif
++#endif
                     "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
                     "movq %r8,%rdi\n\t"             /* args */
-@@ -3669,8 +3867,33 @@
+                    "callq *(%r10,%rdx,8)\n\t"
+@@ -3669,8 +3906,33 @@
                     "movq %rdx,0x348(%r13)\n\t"
                     "movl 0x68(%r13),%edx\n\t"      /* teb->LastErrorValue: PE code owns %gs:0x68 again */
                     "movq %rdx,%gs:0x68\n\t"
@@ -392,6 +437,45 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fourth form.
  #endif
                     "movq 0x58(%rcx),%r13\n\t"
                     "movq 0x28(%rcx),%rdi\n\t"
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -116,6 +116,8 @@
+     PRTL_THREAD_START_ROUTINE start;         /* thread entry point */
+     void                     *param;         /* thread entry point parameter */
+     void                     *jmp_buf;       /* setjmp buffer for exception handling */
++    void                     *pe_main_base;  /* 03d8 macOS: the thread's own Tib.StackBase while PE code runs a fiber of its own (see the %gs slot swaps) */
++    void                     *pe_main_limit; /* 03e0 macOS: the thread's own Tib.StackLimit, kept in step by the guard-page move */
+ };
+ 
+ C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
+@@ -123,6 +125,8 @@
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, syscall_table ) == 0x370 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, syscall_frame ) == 0x378 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, syscall_trace ) == 0x380 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, pe_main_base ) == 0x3d8 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, pe_main_limit ) == 0x3e0 );
+ #else
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, syscall_table ) == 0x214 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, syscall_frame ) == 0x218 );
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4534,7 +4534,15 @@
+         WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
+         wow_teb->Tib.StackLimit = PtrToUlong( page );
+     }
+-    else NtCurrentTeb()->Tib.StackLimit = page;
++    else
++    {
++        NtCurrentTeb()->Tib.StackLimit = page;
++#if defined(__APPLE__) && defined(__x86_64__)
++        /* the thread's own limit unless PE code runs a fiber of its own just now (amd64_thread_data
++         * pe_slot_flags bit 2, cpu_data[14]); see the %gs slot swaps in signal_x86_64.c */
++        if (!(((DWORD_PTR *)ntdll_get_thread_data()->cpu_data)[14] & 2)) ntdll_get_thread_data()->pe_main_limit = page;
++#endif
++    }
+     return ret;
+ }
+ 
 --- a/dlls/kernelbase/thread.c
 +++ b/dlls/kernelbase/thread.c
 @@ -1291,6 +1291,10 @@
