@@ -1,0 +1,108 @@
+macOS: under Rosetta, keep the debug registers a thread writes and hand them back on read.
+
+Rosetta has no hardware debug registers. The server refused every write of Dr0..Dr7
+(STATUS_UNSUCCESSFUL) and answered every read with zeros, and ntdll's CW HACK 22131 turned the
+refusal into STATUS_SUCCESS without recording anything. A program therefore saw its debug
+registers vanish between a write and the next read, which Windows and Linux Wine never do: on
+both, SetThreadContext followed by GetThreadContext returns what was written, whether or not a
+breakpoint ever fires. Measured with drprobe.exe on an M4 (macOS 27.0, engine r18s6, 2026-10-09,
+gin/private/notes/msfs-2024-evidence/tools/drprobe.c): on its own thread the probe wrote
+Dr0=target, Dr7=1, got STATUS_SUCCESS and read back zeros; a suspended thread read back the
+values while stopped and zeros once it had run. Microsoft Flight Simulator 2024 writes its debug
+registers ten times during its boot (gin/private/notes/msfs-2024-2026-10-08.md, section P).
+
+The server now keeps the last values written, per thread, when the process is translated
+(struct thread rosetta_dr), and returns them on read, for the own thread and for a stopped one;
+the ntdll hack then never triggers. A breakpoint still never fires under Rosetta, which this
+patch does not change or claim to.
+
+Trial on branch msfs-gsbase, unverified when written. Upstream: server/mach.c is CodeWeavers'
+Mach debugger support, not WineHQ's; not for upstream.
+
+--- a/server/thread.h	2026-10-09 14:30:05
++++ b/server/thread.h	2026-10-09 14:30:05
+@@ -89,6 +89,7 @@
+     int                    disable_boost; /* disable thread priority boost */
+     int                    suspend;       /* suspend count */
+     int                    dbg_hidden;    /* hidden from debugger */
++    unsigned __int64       rosetta_dr[8]; /* debug registers kept for a translated process (Rosetta has none) */
+     int                    bypass_proc_suspend; /* will still run if the process is suspended */
+     obj_handle_t           desktop;       /* desktop handle */
+     int                    desktop_users; /* number of objects using the thread desktop */
+--- a/server/thread.c	2026-10-09 14:30:05
++++ b/server/thread.c	2026-10-09 14:30:05
+@@ -424,6 +424,7 @@
+     thread->disable_boost   = 0;
+     thread->suspend         = 0;
+     thread->dbg_hidden      = 0;
++    memset( thread->rosetta_dr, 0, sizeof(thread->rosetta_dr) );
+     thread->bypass_proc_suspend = 0;
+     thread->desktop_users   = 0;
+     thread->token           = NULL;
+--- a/server/mach.c	2026-10-09 14:30:05
++++ b/server/mach.c	2026-10-09 14:30:05
+@@ -191,8 +191,28 @@
+ 
+     if (is_rosetta())
+     {
+-        /* getting debug registers of a translated process is not supported cross-process, return all zeroes */
++        /* Rosetta has no hardware debug registers. Hand back the values the thread last wrote
++         * (kept by set_thread_context below), so that a program reads what it set, as on Windows
++         * and on Linux; a breakpoint still never fires. */
+         memset( &context->debug, 0, sizeof(context->debug) );
++        if (context->machine == IMAGE_FILE_MACHINE_I386)
++        {
++            context->debug.i386_regs.dr0 = thread->rosetta_dr[0];
++            context->debug.i386_regs.dr1 = thread->rosetta_dr[1];
++            context->debug.i386_regs.dr2 = thread->rosetta_dr[2];
++            context->debug.i386_regs.dr3 = thread->rosetta_dr[3];
++            context->debug.i386_regs.dr6 = thread->rosetta_dr[6];
++            context->debug.i386_regs.dr7 = thread->rosetta_dr[7];
++        }
++        else
++        {
++            context->debug.x86_64_regs.dr0 = thread->rosetta_dr[0];
++            context->debug.x86_64_regs.dr1 = thread->rosetta_dr[1];
++            context->debug.x86_64_regs.dr2 = thread->rosetta_dr[2];
++            context->debug.x86_64_regs.dr3 = thread->rosetta_dr[3];
++            context->debug.x86_64_regs.dr6 = thread->rosetta_dr[6];
++            context->debug.x86_64_regs.dr7 = thread->rosetta_dr[7];
++        }
+         context->flags |= SERVER_CTX_DEBUG_REGISTERS;
+         return;
+     }
+@@ -277,10 +297,30 @@
+ 
+     if (is_rosetta())
+     {
+-        /* Setting debug registers of a translated process is not supported cross-process
+-         * (and even in-process, setting debug registers never has the desired effect).
+-         */
+-        set_error( STATUS_UNSUCCESSFUL );
++        /* Rosetta has no hardware debug registers (setting them never has an effect, in-process or
++         * cross-process). Keep the values per thread so that a read gives them back, as on Windows. */
++        switch (context->machine)
++        {
++        case IMAGE_FILE_MACHINE_I386:
++            thread->rosetta_dr[0] = context->debug.i386_regs.dr0;
++            thread->rosetta_dr[1] = context->debug.i386_regs.dr1;
++            thread->rosetta_dr[2] = context->debug.i386_regs.dr2;
++            thread->rosetta_dr[3] = context->debug.i386_regs.dr3;
++            thread->rosetta_dr[6] = context->debug.i386_regs.dr6;
++            thread->rosetta_dr[7] = context->debug.i386_regs.dr7;
++            break;
++        case IMAGE_FILE_MACHINE_AMD64:
++            thread->rosetta_dr[0] = context->debug.x86_64_regs.dr0;
++            thread->rosetta_dr[1] = context->debug.x86_64_regs.dr1;
++            thread->rosetta_dr[2] = context->debug.x86_64_regs.dr2;
++            thread->rosetta_dr[3] = context->debug.x86_64_regs.dr3;
++            thread->rosetta_dr[6] = context->debug.x86_64_regs.dr6;
++            thread->rosetta_dr[7] = context->debug.x86_64_regs.dr7;
++            break;
++        default:
++            set_error( STATUS_INVALID_PARAMETER );
++            break;
++        }
+         return;
+     }
+ 
