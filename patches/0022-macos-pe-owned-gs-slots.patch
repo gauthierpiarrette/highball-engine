@@ -11,10 +11,12 @@ macOS 27.0, engine r18, 2026-10-08), while the sim's stack base written into %gs
 errno pointer by the first unix routine that touched errno (ntdll.so, movl (%rax) after __error(),
 rax = 0x15010000, 2026-10-09, gin/private/notes/msfs-2024-2026-10-08.md sections C, G and H).
 
-Now the three slots take turns like %gs:0x68 (0011): what PE code last left there is saved on entry to
-unix code (amd64_thread_data pe_fiber at 0x350, teb->Instrumentation[1] and [2]; CrossOver uses [0]) and
-the host's values come back (host_qos at 0x340, Instrumentation[3] and [4]); the reverse on every return
-to PE code. Two rules make this hold at every instruction: the entry swap runs on the kernel stack and
+Now the three slots take turns like %gs:0x68 (0011): what PE code last left there goes into the TEB's own
+Tib.FiberData, StackBase and StackLimit on entry to unix code and the host's values come back (host_qos at
+0x340, host_errno at 0x350, host_mig at 0x358 in amd64_thread_data); the reverse on every return to PE
+code. The TEB fields are the natural store: Wine's unix side and kernelbase's fibers already read and
+write them, and ntoskrnl keeps its KTHREAD in teb->Instrumentation[1], which the first form of this
+patch overwrote (winedevice.exe read [StackBase+0x18] and died at every boot, r18ps and r18s2). Two rules make this hold at every instruction: the entry swap runs on the kernel stack and
 the return swap on the user stack, so "%rsp inside the syscall region" and "the slots are the host's"
 always agree, and every swap is compare-based, each slot moved only while it still holds the other
 side's value, so a swap can run twice without stashing the wrong value. Signal handlers follow the same
@@ -26,32 +28,33 @@ syscall and the dispatcher already did it (the first trial saved the host's valu
 a second trial's signal handlers read errno through PE's stack base: the 32-bit Steam died in
 wait_suspend, "nested exception on signal stack", r18ps, 2026-10-09).
 
-The slots start as the TEB's FiberData, StackBase and StackLimit (call_init_thunk), the unix guard-page
-move keeps Instrumentation[2] in step, kernelbase's SwitchToFiber writes the slots as it writes the
-fields, and the PE ntdll's exception dispatcher (is_valid_frame, the unwind end checks) reads the bounds
+call_init_thunk keeps the host's values, the unix guard-page move writes Tib.StackLimit as before,
+kernelbase's SwitchToFiber writes the slots as it writes the fields, and the PE ntdll's exception dispatcher (is_valid_frame, the unwind end checks) reads the bounds
 from the slots, which is where Windows reads them, so a fiber stack a program announced there is
 accepted. D3DMetal's host code called directly from PE code sees PE's values in those slots, as it did
-before this patch whenever such a program ran. Trial, branch msfs-gsbase. Replaces the first two trials
-(0022 fiber slot, 0023 stack bounds).
+before this patch whenever such a program ran. Trial, branch msfs-gsbase. Third form (the first two trials
+0022 fiber slot and 0023 stack bounds, then the Instrumentation-based form of this patch).
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -510,6 +510,7 @@
+@@ -510,6 +510,8 @@
      DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
      DWORD_PTR             host_qos;      /* 0340 macOS: the pthread QoS slot value, %gs:0x20, while PE code owns that slot */
      DWORD_PTR             host_slot13;   /* 0348 macOS: the pthread TSD slot 13 (libc gmtime key), %gs:0x68, while PE code owns it as LastErrorValue */
-+    DWORD_PTR             pe_fiber;      /* 0350 macOS: what PE code last left in %gs:0x20, saved on entry to unix code and put back on return */
++    DWORD_PTR             host_errno;    /* 0350 macOS: the host errno pointer, %gs:0x08, while PE code owns that slot as NT_TIB.StackBase */
++    DWORD_PTR             host_mig;      /* 0358 macOS: the host MIG reply port, %gs:0x10, while PE code owns that slot as NT_TIB.StackLimit */
  };
  
  C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
-@@ -517,6 +518,7 @@
+@@ -517,6 +519,8 @@
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, frame_size ) == 0x328 );
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, host_qos ) == 0x340 );
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, host_slot13 ) == 0x348 );
-+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pe_fiber ) == 0x350 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, host_errno ) == 0x350 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, host_mig ) == 0x358 );
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
-@@ -905,6 +907,69 @@
+@@ -905,6 +909,70 @@
                     "popfq\n\t"
                     __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                     "ret" )
@@ -60,35 +63,36 @@ before this patch whenever such a program ran. Trial, branch msfs-gsbase. Replac
 +#ifdef __APPLE__
 +/* %gs:0x20, %gs:0x08 and %gs:0x10 are PE-owned while PE code runs (Tib.FiberData, StackBase and
 + * StackLimit, which a program running its own fiber system writes itself) and the host's while unix
-+ * code runs (the pthread QoS slot, the errno pointer, the MIG reply port). The dispatchers swap them
-+ * on the kernel stack on entry and on the user stack on return, so "%rsp inside the syscall region"
-+ * and "the slots are the host's" always go together, and a signal handler does the same here. Each
-+ * slot is swapped only while it still holds the other side's value, so repeating a swap stashes
-+ * nothing wrong, and nothing is done before call_init_thunk captured the host's values
-+ * (Instrumentation[3], the errno pointer, is never zero afterwards). */
++ * code runs (the pthread QoS slot, the errno pointer, the MIG reply port). The TEB fields are the
++ * PE-side store (what PE code last left in a slot goes there on entry to unix code and comes back on
++ * return), host_qos, host_errno and host_mig the host-side store. The dispatchers swap on the kernel
++ * stack on entry and on the user stack on return, so "%rsp inside the syscall region" and "the slots
++ * are the host's" always go together, and a signal handler does the same here. Each slot is swapped
++ * only while it still holds the other side's value, so repeating a swap stashes nothing wrong, and
++ * nothing is done before call_init_thunk captured the host's values (host_errno is never zero). */
 +static inline void pe_slots_to_host( TEB *teb )
 +{
 +    struct amd64_thread_data *data = (struct amd64_thread_data *)((struct ntdll_thread_data *)&teb->GdiTebBatch)->cpu_data;
 +    void *v;
 +
-+    if (!teb->Instrumentation[3]) return;
++    if (!data->host_errno) return;
 +    __asm__ volatile( "movq %%gs:0x20,%0" : "=r" (v) );
 +    if (v != (void *)data->host_qos)
 +    {
-+        data->pe_fiber = (DWORD_PTR)v;
++        teb->Tib.FiberData = v;
 +        __asm__ volatile( "movq %0,%%gs:0x20" :: "r" (data->host_qos) );
 +    }
 +    __asm__ volatile( "movq %%gs:0x08,%0" : "=r" (v) );
-+    if (v != teb->Instrumentation[3])
++    if (v != (void *)data->host_errno)
 +    {
-+        teb->Instrumentation[1] = v;
-+        __asm__ volatile( "movq %0,%%gs:0x08" :: "r" (teb->Instrumentation[3]) );
++        teb->Tib.StackBase = v;
++        __asm__ volatile( "movq %0,%%gs:0x08" :: "r" (data->host_errno) );
 +    }
 +    __asm__ volatile( "movq %%gs:0x10,%0" : "=r" (v) );
-+    if (v != teb->Instrumentation[4])
++    if (v != (void *)data->host_mig)
 +    {
-+        teb->Instrumentation[2] = v;
-+        __asm__ volatile( "movq %0,%%gs:0x10" :: "r" (teb->Instrumentation[4]) );
++        teb->Tib.StackLimit = v;
++        __asm__ volatile( "movq %0,%%gs:0x10" :: "r" (data->host_mig) );
 +    }
 +}
 +
@@ -97,31 +101,31 @@ before this patch whenever such a program ran. Trial, branch msfs-gsbase. Replac
 +    struct amd64_thread_data *data = (struct amd64_thread_data *)((struct ntdll_thread_data *)&teb->GdiTebBatch)->cpu_data;
 +    void *v;
 +
-+    if (!teb->Instrumentation[3]) return;
++    if (!data->host_errno) return;
 +    __asm__ volatile( "movq %%gs:0x20,%0" : "=r" (v) );
-+    if (v != (void *)data->pe_fiber)
++    if (v != teb->Tib.FiberData)
 +    {
 +        data->host_qos = (DWORD_PTR)v;
-+        __asm__ volatile( "movq %0,%%gs:0x20" :: "r" (data->pe_fiber) );
++        __asm__ volatile( "movq %0,%%gs:0x20" :: "r" (teb->Tib.FiberData) );
 +    }
 +    __asm__ volatile( "movq %%gs:0x08,%0" : "=r" (v) );
-+    if (v != teb->Instrumentation[1])
++    if (v != teb->Tib.StackBase)
 +    {
-+        teb->Instrumentation[3] = v;
-+        __asm__ volatile( "movq %0,%%gs:0x08" :: "r" (teb->Instrumentation[1]) );
++        data->host_errno = (DWORD_PTR)v;
++        __asm__ volatile( "movq %0,%%gs:0x08" :: "r" (teb->Tib.StackBase) );
 +    }
 +    __asm__ volatile( "movq %%gs:0x10,%0" : "=r" (v) );
-+    if (v != teb->Instrumentation[2])
++    if (v != teb->Tib.StackLimit)
 +    {
-+        teb->Instrumentation[4] = v;
-+        __asm__ volatile( "movq %0,%%gs:0x10" :: "r" (teb->Instrumentation[2]) );
++        data->host_mig = (DWORD_PTR)v;
++        __asm__ volatile( "movq %0,%%gs:0x10" :: "r" (teb->Tib.StackLimit) );
 +    }
 +}
 +#endif
  
  
  /***********************************************************************
-@@ -920,6 +985,7 @@
+@@ -920,6 +988,7 @@
          arch_prctl( ARCH_SET_FS, ((struct amd64_thread_data *)thread_data->cpu_data)->pthread_teb );
      }
  #elif defined __APPLE__
@@ -129,7 +133,7 @@ before this patch whenever such a program ran. Trial, branch msfs-gsbase. Replac
      /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
       * instead of the user selector (cs64_sel: 0x2b, USER64_CS).
       * Fix up sigcontext so later code can compare it to cs64_sel.
-@@ -943,6 +1009,12 @@
+@@ -943,6 +1012,12 @@
          !is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
          !is_inside_syscall( RSP_sig(sigcontext) ))
          __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
@@ -142,38 +146,38 @@ before this patch whenever such a program ran. Trial, branch msfs-gsbase. Replac
  #endif
      if (is_16bit( sigcontext )) return;
  #ifdef DS_sig
-@@ -1834,8 +1906,28 @@
+@@ -1834,8 +1909,28 @@
                     "movq %rax,0x348(%r13)\n\t"
                     "movl 0x68(%r13),%eax\n\t"      /* teb->LastErrorValue, zero-extended */
                     "movq %rax,%gs:0x68\n\t"
 -                   "movq 0x20(%r13),%rax\n\t"      /* teb->Tib.FiberData: PE code owns %gs:0x20 from here */
 -                   "movq %rax,%gs:0x20\n\t"
-+                   /* PE code owns %gs:0x20, %gs:0x08 and %gs:0x10 again (its fiber pointer and stack bounds), the
-+                    * host's values go aside; each slot only if it still holds the host's value, a signal handler
-+                    * that returned here may have done it already (see pe_slots_to_pe) */
++                   /* PE code owns %gs:0x20, %gs:0x08 and %gs:0x10 again (Tib.FiberData, StackBase, StackLimit from
++                    * the TEB), the host's values go aside; each slot only if it still holds the host's value, a
++                    * signal handler that returned here may have done it already (see pe_slots_to_pe) */
 +                   "movq %gs:0x20,%rax\n\t"
-+                   "cmpq 0x350(%r13),%rax\n\t"     /* amd64_thread_data()->pe_fiber */
++                   "cmpq 0x20(%r13),%rax\n\t"      /* teb->Tib.FiberData */
 +                   "je 1f\n\t"
 +                   "movq %rax,0x340(%r13)\n\t"     /* amd64_thread_data()->host_qos aside */
-+                   "movq 0x350(%r13),%rax\n\t"
++                   "movq 0x20(%r13),%rax\n\t"
 +                   "movq %rax,%gs:0x20\n"
 +                   "1:\tmovq %gs:0x08,%rax\n\t"
-+                   "cmpq 0x16c0(%r13),%rax\n\t"    /* teb->Instrumentation[1]: pe_stack_base */
++                   "cmpq 0x08(%r13),%rax\n\t"      /* teb->Tib.StackBase */
 +                   "je 1f\n\t"
-+                   "movq %rax,0x16d0(%r13)\n\t"    /* teb->Instrumentation[3]: host errno pointer aside */
-+                   "movq 0x16c0(%r13),%rax\n\t"
++                   "movq %rax,0x350(%r13)\n\t"     /* amd64_thread_data()->host_errno aside */
++                   "movq 0x08(%r13),%rax\n\t"
 +                   "movq %rax,%gs:0x08\n"
 +                   "1:\tmovq %gs:0x10,%rax\n\t"
-+                   "cmpq 0x16c8(%r13),%rax\n\t"    /* teb->Instrumentation[2]: pe_stack_limit */
++                   "cmpq 0x10(%r13),%rax\n\t"      /* teb->Tib.StackLimit */
 +                   "je 1f\n\t"
-+                   "movq %rax,0x16d8(%r13)\n\t"    /* teb->Instrumentation[4]: host MIG reply port aside */
-+                   "movq 0x16c8(%r13),%rax\n\t"
++                   "movq %rax,0x358(%r13)\n\t"     /* amd64_thread_data()->host_mig aside */
++                   "movq 0x10(%r13),%rax\n\t"
 +                   "movq %rax,%gs:0x10\n"
 +                   "1:\n\t"
  #endif
                     "xor %rbx,%rbx\n\t"
                     "xor %r12,%r12\n\t"
-@@ -1851,10 +1943,8 @@
+@@ -1851,10 +1946,8 @@
  extern void DECLSPEC_NORETURN user_mode_callback_return( void *ret_ptr, ULONG ret_len,
                                                           NTSTATUS status, TEB *teb );
  __ASM_GLOBAL_FUNC( user_mode_callback_return,
@@ -186,27 +190,22 @@ before this patch whenever such a program ran. Trial, branch msfs-gsbase. Replac
                     "movq 0x378(%rcx),%r10\n\t" /* thread_data->syscall_frame */
                     "movq 0xa0(%r10),%r11\n\t"  /* frame->prev_frame */
                     "movq %r11,0x378(%rcx)\n\t" /* syscall_frame = prev_frame */
-@@ -3098,6 +3188,19 @@
+@@ -3098,6 +3191,14 @@
       * on entry (the dispatchers, user_mode_callback_return), PE code gets Tib.FiberData on
       * return (__wine_syscall_dispatcher_return, call_user_mode_callback). Keep the host value. */
      __asm__ volatile ("movq %%gs:%c1,%0" : "=r" (thread_data->host_qos) : "n" (FIELD_OFFSET(TEB, Tib.FiberData)));
 +    /* A program with its own fiber system keeps its current fiber in %gs:0x20 itself (Boost.Context
-+     * style, Microsoft Flight Simulator 2024), so the slot is PE-owned data: what PE code last wrote
-+     * is saved on every entry to unix code and put back on every return, instead of Wine's own
-+     * Tib.FiberData, which only kernelbase's fibers keep in step (and they write the slot too). */
-+    thread_data->pe_fiber = (DWORD_PTR)teb->Tib.FiberData;
-+    /* The same for NT_TIB.StackBase and StackLimit at %gs:0x08 and %gs:0x10, which a program with its
-+     * own fiber system keeps there (and Windows' exception dispatcher reads there): on the host those
-+     * slots are the errno pointer and the MIG reply port. PE's values live in teb->Instrumentation[1..2],
-+     * the host's in [3..4] (CrossOver already uses [0]); they take turns at the same crossings. */
-+    teb->Instrumentation[1] = teb->Tib.StackBase;
-+    teb->Instrumentation[2] = teb->Tib.StackLimit;
-+    __asm__ volatile ("movq %%gs:0x08,%0" : "=r" (teb->Instrumentation[3]));
-+    __asm__ volatile ("movq %%gs:0x10,%0" : "=r" (teb->Instrumentation[4]));
++     * style, Microsoft Flight Simulator 2024) and its fiber's stack bounds in %gs:0x08 and %gs:0x10
++     * (NT_TIB.StackBase, StackLimit, where Windows' exception dispatcher reads them), so the three
++     * slots are PE-owned data: what PE code last left there goes into the TEB fields on every entry to
++     * unix code and comes back on every return (kernelbase's fibers write both too). On the host
++     * %gs:0x08 and %gs:0x10 are the errno pointer and the MIG reply port. Keep the host values. */
++    __asm__ volatile ("movq %%gs:%c1,%0" : "=r" (thread_data->host_errno) : "n" (FIELD_OFFSET(TEB, Tib.StackBase)));
++    __asm__ volatile ("movq %%gs:%c1,%0" : "=r" (thread_data->host_mig) : "n" (FIELD_OFFSET(TEB, Tib.StackLimit)));
      /* %gs:0x68 is where MSVC-built code reads LastErrorValue directly (Unity's Mono runtime reads it
       * at 130 sites: File.Delete of a missing file threw "Unknown error (0x80f13910)", The Last
       * Flame, 2026-09-20). On macOS that is pthread TSD slot 13, libc's gmtime key, so it is
-@@ -3260,8 +3363,6 @@
+@@ -3260,8 +3361,6 @@
                     "movl %r15d,0x68(%r13)\n\t"
                     "movq 0x348(%r13),%r15\n\t"     /* amd64_thread_data()->host_slot13 */
                     "movq %r15,%gs:0x68\n\t"        /* unix code sees libc's slot 13 again */
@@ -215,70 +214,71 @@ before this patch whenever such a program ran. Trial, branch msfs-gsbase. Replac
  #endif
                     /* Legends of Runeterra hooks the first system call return instruction, and
                      * depends on us returning to it. Adjust the return address accordingly. */
-@@ -3331,6 +3432,31 @@
+@@ -3331,6 +3430,32 @@
                     "syscall\n\t"
                     "leaq -0x98(%rbp),%rcx\n"
                     "2:\n\t"
 +#endif
 +#ifdef __APPLE__
 +                   /* unix code owns %gs:0x20, %gs:0x08 and %gs:0x10 again (the pthread QoS slot, the errno pointer,
-+                    * the MIG reply port), what PE code left there goes aside; done on the kernel stack so that a
-+                    * signal landing here finds %rsp and the slots in step, and each slot only if it still holds
-+                    * PE's value, a signal handler may have done it already (see pe_slots_to_host) */
++                    * the MIG reply port), what PE code left there goes into the TEB (Tib.FiberData, StackBase,
++                    * StackLimit); done on the kernel stack so that a signal landing here finds %rsp and the slots
++                    * in step, and each slot only if it still holds PE's value, a signal handler may have done it
++                    * already (see pe_slots_to_host) */
 +                   "movq %gs:0x20,%rax\n\t"
 +                   "cmpq 0x340(%r13),%rax\n\t"     /* amd64_thread_data()->host_qos */
 +                   "je 1f\n\t"
-+                   "movq %rax,0x350(%r13)\n\t"     /* amd64_thread_data()->pe_fiber: what PE code left in %gs:0x20 */
++                   "movq %rax,0x20(%r13)\n\t"      /* teb->Tib.FiberData: what PE code left in %gs:0x20 */
 +                   "movq 0x340(%r13),%rax\n\t"
 +                   "movq %rax,%gs:0x20\n"
 +                   "1:\tmovq %gs:0x08,%rax\n\t"
-+                   "cmpq 0x16d0(%r13),%rax\n\t"    /* teb->Instrumentation[3]: host errno pointer */
++                   "cmpq 0x350(%r13),%rax\n\t"     /* amd64_thread_data()->host_errno */
 +                   "je 1f\n\t"
-+                   "movq %rax,0x16c0(%r13)\n\t"    /* teb->Instrumentation[1]: pe_stack_base, what PE code left in %gs:0x08 */
-+                   "movq 0x16d0(%r13),%rax\n\t"
++                   "movq %rax,0x08(%r13)\n\t"      /* teb->Tib.StackBase: what PE code left in %gs:0x08 */
++                   "movq 0x350(%r13),%rax\n\t"
 +                   "movq %rax,%gs:0x08\n"
 +                   "1:\tmovq %gs:0x10,%rax\n\t"
-+                   "cmpq 0x16d8(%r13),%rax\n\t"    /* teb->Instrumentation[4]: host MIG reply port */
++                   "cmpq 0x358(%r13),%rax\n\t"     /* amd64_thread_data()->host_mig */
 +                   "je 1f\n\t"
-+                   "movq %rax,0x16c8(%r13)\n\t"    /* teb->Instrumentation[2]: pe_stack_limit, what PE code left in %gs:0x10 */
-+                   "movq 0x16d8(%r13),%rax\n\t"
++                   "movq %rax,0x10(%r13)\n\t"      /* teb->Tib.StackLimit: what PE code left in %gs:0x10 */
++                   "movq 0x358(%r13),%rax\n\t"
 +                   "movq %rax,%gs:0x10\n"
 +                   "1:\n\t"
  #endif
                     "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
                     "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
-@@ -3377,8 +3503,28 @@
+@@ -3377,8 +3502,28 @@
                     "movq %rdx,0x348(%r15)\n\t"
                     "movl 0x68(%r15),%edx\n\t"      /* teb->LastErrorValue: PE code owns %gs:0x68 again */
                     "movq %rdx,%gs:0x68\n\t"
 -                   "movq 0x20(%r15),%r15\n\t"      /* teb->Tib.FiberData */
 -                   "movq %r15,%gs:0x20\n\t"        /* PE code reads GetCurrentFiber() here; %r15 is restored below */
-+                   /* PE code owns %gs:0x20, %gs:0x08 and %gs:0x10 again (its fiber pointer and stack bounds), the
-+                    * host's values go aside; each slot only if it still holds the host's value, a signal handler
-+                    * that returned here may have done it already (see pe_slots_to_pe) */
++                   /* PE code owns %gs:0x20, %gs:0x08 and %gs:0x10 again (Tib.FiberData, StackBase, StackLimit from
++                    * the TEB), the host's values go aside; each slot only if it still holds the host's value, a
++                    * signal handler that returned here may have done it already (see pe_slots_to_pe) */
 +                   "movq %gs:0x20,%rdx\n\t"
-+                   "cmpq 0x350(%r15),%rdx\n\t"     /* amd64_thread_data()->pe_fiber */
++                   "cmpq 0x20(%r15),%rdx\n\t"      /* teb->Tib.FiberData */
 +                   "je 1f\n\t"
 +                   "movq %rdx,0x340(%r15)\n\t"     /* amd64_thread_data()->host_qos aside */
-+                   "movq 0x350(%r15),%rdx\n\t"
++                   "movq 0x20(%r15),%rdx\n\t"
 +                   "movq %rdx,%gs:0x20\n"
 +                   "1:\tmovq %gs:0x08,%rdx\n\t"
-+                   "cmpq 0x16c0(%r15),%rdx\n\t"    /* teb->Instrumentation[1]: pe_stack_base */
++                   "cmpq 0x08(%r15),%rdx\n\t"      /* teb->Tib.StackBase */
 +                   "je 1f\n\t"
-+                   "movq %rdx,0x16d0(%r15)\n\t"    /* teb->Instrumentation[3]: host errno pointer aside */
-+                   "movq 0x16c0(%r15),%rdx\n\t"
++                   "movq %rdx,0x350(%r15)\n\t"     /* amd64_thread_data()->host_errno aside */
++                   "movq 0x08(%r15),%rdx\n\t"
 +                   "movq %rdx,%gs:0x08\n"
 +                   "1:\tmovq %gs:0x10,%rdx\n\t"
-+                   "cmpq 0x16c8(%r15),%rdx\n\t"    /* teb->Instrumentation[2]: pe_stack_limit */
++                   "cmpq 0x10(%r15),%rdx\n\t"      /* teb->Tib.StackLimit */
 +                   "je 1f\n\t"
-+                   "movq %rdx,0x16d8(%r15)\n\t"    /* teb->Instrumentation[4]: host MIG reply port aside */
-+                   "movq 0x16c8(%r15),%rdx\n\t"
++                   "movq %rdx,0x358(%r15)\n\t"     /* amd64_thread_data()->host_mig aside */
++                   "movq 0x10(%r15),%rdx\n\t"
 +                   "movq %rdx,%gs:0x10\n"
 +                   "1:\n\t"
  #endif
  #ifdef __linux__
                     "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
-@@ -3596,8 +3742,6 @@
+@@ -3596,8 +3741,6 @@
                     "movl %eax,0x68(%r13)\n\t"
                     "movq 0x348(%r13),%rax\n\t"     /* amd64_thread_data()->host_slot13 */
                     "movq %rax,%gs:0x68\n\t"        /* unix code sees libc's slot 13 again */
@@ -287,32 +287,33 @@ before this patch whenever such a program ran. Trial, branch msfs-gsbase. Replac
  #endif
                     "stmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
                     "movdqa %xmm6,0x1c0(%rcx)\n\t"
-@@ -3637,6 +3781,31 @@
+@@ -3637,6 +3780,32 @@
                     "syscall\n\t"
                     "2:\n\t"
  #endif
 +#ifdef __APPLE__
 +                   /* unix code owns %gs:0x20, %gs:0x08 and %gs:0x10 again (the pthread QoS slot, the errno pointer,
-+                    * the MIG reply port), what PE code left there goes aside; done on the kernel stack so that a
-+                    * signal landing here finds %rsp and the slots in step, and each slot only if it still holds
-+                    * PE's value, a signal handler may have done it already (see pe_slots_to_host) */
++                    * the MIG reply port), what PE code left there goes into the TEB (Tib.FiberData, StackBase,
++                    * StackLimit); done on the kernel stack so that a signal landing here finds %rsp and the slots
++                    * in step, and each slot only if it still holds PE's value, a signal handler may have done it
++                    * already (see pe_slots_to_host) */
 +                   "movq %gs:0x20,%rax\n\t"
 +                   "cmpq 0x340(%r13),%rax\n\t"     /* amd64_thread_data()->host_qos */
 +                   "je 1f\n\t"
-+                   "movq %rax,0x350(%r13)\n\t"     /* amd64_thread_data()->pe_fiber: what PE code left in %gs:0x20 */
++                   "movq %rax,0x20(%r13)\n\t"      /* teb->Tib.FiberData: what PE code left in %gs:0x20 */
 +                   "movq 0x340(%r13),%rax\n\t"
 +                   "movq %rax,%gs:0x20\n"
 +                   "1:\tmovq %gs:0x08,%rax\n\t"
-+                   "cmpq 0x16d0(%r13),%rax\n\t"    /* teb->Instrumentation[3]: host errno pointer */
++                   "cmpq 0x350(%r13),%rax\n\t"     /* amd64_thread_data()->host_errno */
 +                   "je 1f\n\t"
-+                   "movq %rax,0x16c0(%r13)\n\t"    /* teb->Instrumentation[1]: pe_stack_base, what PE code left in %gs:0x08 */
-+                   "movq 0x16d0(%r13),%rax\n\t"
++                   "movq %rax,0x08(%r13)\n\t"      /* teb->Tib.StackBase: what PE code left in %gs:0x08 */
++                   "movq 0x350(%r13),%rax\n\t"
 +                   "movq %rax,%gs:0x08\n"
 +                   "1:\tmovq %gs:0x10,%rax\n\t"
-+                   "cmpq 0x16d8(%r13),%rax\n\t"    /* teb->Instrumentation[4]: host MIG reply port */
++                   "cmpq 0x358(%r13),%rax\n\t"     /* amd64_thread_data()->host_mig */
 +                   "je 1f\n\t"
-+                   "movq %rax,0x16c8(%r13)\n\t"    /* teb->Instrumentation[2]: pe_stack_limit, what PE code left in %gs:0x10 */
-+                   "movq 0x16d8(%r13),%rax\n\t"
++                   "movq %rax,0x10(%r13)\n\t"      /* teb->Tib.StackLimit: what PE code left in %gs:0x10 */
++                   "movq 0x358(%r13),%rax\n\t"
 +                   "movq %rax,%gs:0x10\n"
 +                   "1:\n\t"
 +#endif
@@ -325,48 +326,31 @@ before this patch whenever such a program ran. Trial, branch msfs-gsbase. Replac
                     "movq %rdx,%gs:0x68\n\t"
 -                   "movq 0x20(%r13),%rdx\n\t"      /* teb->Tib.FiberData: PE code owns %gs:0x20 again (%rdx is volatile for the PE caller) */
 -                   "movq %rdx,%gs:0x20\n\t"
-+                   /* PE code owns %gs:0x20, %gs:0x08 and %gs:0x10 again (its fiber pointer and stack bounds), the
-+                    * host's values go aside; each slot only if it still holds the host's value, a signal handler
-+                    * that returned here may have done it already (see pe_slots_to_pe) */
++                   /* PE code owns %gs:0x20, %gs:0x08 and %gs:0x10 again (Tib.FiberData, StackBase, StackLimit from
++                    * the TEB), the host's values go aside; each slot only if it still holds the host's value, a
++                    * signal handler that returned here may have done it already (see pe_slots_to_pe) */
 +                   "movq %gs:0x20,%rdx\n\t"
-+                   "cmpq 0x350(%r13),%rdx\n\t"     /* amd64_thread_data()->pe_fiber */
++                   "cmpq 0x20(%r13),%rdx\n\t"      /* teb->Tib.FiberData */
 +                   "je 1f\n\t"
 +                   "movq %rdx,0x340(%r13)\n\t"     /* amd64_thread_data()->host_qos aside */
-+                   "movq 0x350(%r13),%rdx\n\t"
++                   "movq 0x20(%r13),%rdx\n\t"
 +                   "movq %rdx,%gs:0x20\n"
 +                   "1:\tmovq %gs:0x08,%rdx\n\t"
-+                   "cmpq 0x16c0(%r13),%rdx\n\t"    /* teb->Instrumentation[1]: pe_stack_base */
++                   "cmpq 0x08(%r13),%rdx\n\t"      /* teb->Tib.StackBase */
 +                   "je 1f\n\t"
-+                   "movq %rdx,0x16d0(%r13)\n\t"    /* teb->Instrumentation[3]: host errno pointer aside */
-+                   "movq 0x16c0(%r13),%rdx\n\t"
++                   "movq %rdx,0x350(%r13)\n\t"     /* amd64_thread_data()->host_errno aside */
++                   "movq 0x08(%r13),%rdx\n\t"
 +                   "movq %rdx,%gs:0x08\n"
 +                   "1:\tmovq %gs:0x10,%rdx\n\t"
-+                   "cmpq 0x16c8(%r13),%rdx\n\t"    /* teb->Instrumentation[2]: pe_stack_limit */
++                   "cmpq 0x10(%r13),%rdx\n\t"      /* teb->Tib.StackLimit */
 +                   "je 1f\n\t"
-+                   "movq %rdx,0x16d8(%r13)\n\t"    /* teb->Instrumentation[4]: host MIG reply port aside */
-+                   "movq 0x16c8(%r13),%rdx\n\t"
++                   "movq %rdx,0x358(%r13)\n\t"     /* amd64_thread_data()->host_mig aside */
++                   "movq 0x10(%r13),%rdx\n\t"
 +                   "movq %rdx,%gs:0x10\n"
 +                   "1:\n\t"
  #endif
                     "movq 0x58(%rcx),%r13\n\t"
                     "movq 0x28(%rcx),%rdi\n\t"
---- a/dlls/ntdll/unix/virtual.c
-+++ b/dlls/ntdll/unix/virtual.c
-@@ -4534,7 +4534,13 @@
-         WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
-         wow_teb->Tib.StackLimit = PtrToUlong( page );
-     }
--    else NtCurrentTeb()->Tib.StackLimit = page;
-+    else
-+    {
-+        NtCurrentTeb()->Tib.StackLimit = page;
-+#if defined(__APPLE__) && defined(__x86_64__)
-+        NtCurrentTeb()->Instrumentation[2] = page;  /* PE's %gs:0x10 at the next return to PE code */
-+#endif
-+    }
-     return ret;
- }
- 
 --- a/dlls/kernelbase/thread.c
 +++ b/dlls/kernelbase/thread.c
 @@ -1291,6 +1291,10 @@
