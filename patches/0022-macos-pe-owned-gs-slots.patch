@@ -44,7 +44,9 @@ call_init_thunk keeps the host's values and clears the flags, the unix guard-pag
 Tib.StackLimit as before, kernelbase's SwitchToFiber writes the slots as it writes the fields, and the PE
 ntdll keeps reading the bounds from the TEB fields, which every crossing refreshes from the slots. A
 program that writes its fiber's bounds into the slots makes D3DMetal's direct host calls on that thread
-see them, as it did before this patch. Trial, branch msfs-gsbase. Fifth form.
+see them, as it did before this patch. Trial, branch msfs-gsbase. Fifth form, plus a trace channel hbstack (WINEDEBUG=+hbstack) on the
+unix guard-page growth and on guard faults outside the thread stack, to see whether a fiber running off
+its own stack is grown silently into its neighbour.
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
 @@ -510,6 +510,9 @@
@@ -459,7 +461,25 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fifth form.
  C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, syscall_frame ) == 0x218 );
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
-@@ -4534,7 +4534,15 @@
+@@ -93,6 +93,7 @@
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(virtual);
++WINE_DECLARE_DEBUG_CHANNEL(hbstack);  /* gin-msfs: guard-page growth and guard faults outside the thread stack */
+ WINE_DECLARE_DEBUG_CHANNEL(module);
+ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
+ 
+@@ -4515,6 +4516,9 @@
+ {
+     NTSTATUS ret = 0;
+ 
++    TRACE_(hbstack)( "guard page %p hit, thread stack %p-%p limit %p guaranteed %lx%s\n", page, stack_info->start,
++                     stack_info->end, stack_info->limit, (unsigned long)stack_info->guaranteed,
++                     page >= stack_info->start + host_page_size + stack_info->guaranteed ? ", growing" : ", stack overflow" );
+     set_page_vprot_bits( page, host_page_size, VPROT_COMMITTED, VPROT_GUARD );
+     mprotect_range( page, host_page_size, 0, 0 );
+     if (page >= stack_info->start + host_page_size + stack_info->guaranteed)
+@@ -4534,7 +4538,15 @@
          WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
          wow_teb->Tib.StackLimit = PtrToUlong( page );
      }
@@ -476,6 +496,15 @@ see them, as it did before this patch. Trial, branch msfs-gsbase. Fifth form.
      return ret;
  }
  
+@@ -4588,6 +4600,8 @@
+         struct thread_stack_info stack_info;
+         if (!is_inside_thread_stack( page, &stack_info ))
+         {
++            TRACE_(hbstack)( "guard page %p outside the thread stack %p-%p, STATUS_GUARD_PAGE_VIOLATION\n", page,
++                             stack_info.start, stack_info.end );
+             set_page_vprot_bits( page, host_page_size, 0, VPROT_GUARD );
+             mprotect_range( page, host_page_size, 0, 0 );
+             ret = STATUS_GUARD_PAGE_VIOLATION;
 --- a/dlls/kernelbase/thread.c
 +++ b/dlls/kernelbase/thread.c
 @@ -1291,6 +1291,10 @@
