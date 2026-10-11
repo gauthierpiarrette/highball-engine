@@ -1,0 +1,61 @@
+# The x86-64 fidelity tests (tests/x64-fidelity) on real Windows: the reference the arm64 engine
+# (Wine ARM64EC + FEX) is compared with. Built once with the pinned llvm-mingw, then the same .exe files
+# run on x86-64 Windows Server 2022 and 2025 and, as a third data point, under Windows 11 ARM64's own x64
+# emulation. Each test prints PASS/FAIL/INFO lines; failures do not fail the job (a check that fails on
+# real Windows is a wrong check, not a finding), the outputs are the artifact.
+name: x64-fidelity-reference
+on:
+  push:
+    branches: [x64-fidelity]
+    paths: ['tests/x64-fidelity/**', '.github/workflows/x64-fidelity.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: llvm-mingw
+        run: |
+          set -eu
+          curl -sSL --retry 3 -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz
+          echo "bb7bb7654b33d5aa8712acb837c963b2e0c56352560c76105270a3268c665c21  llvm-mingw.tar.xz" | sha256sum -c -
+          mkdir llvm-mingw && tar -xJf llvm-mingw.tar.xz -C llvm-mingw --strip-components 1
+      - name: build
+        run: tests/x64-fidelity/build.sh "$PWD/llvm-mingw/bin" out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x64-fidelity-exe
+          path: out/*.exe
+          retention-days: 30
+  run:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: x64-fidelity-exe
+          path: exe
+      - name: run
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path results | Out-Null
+          Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, NumberOfLogicalProcessors | Format-List | Out-File results/cpu.txt
+          foreach ($t in 'cpuidtest','x87test','ctxtest','fibertest','memtest','tsctest') {
+            $out = "results/$t.txt"
+            $p = Start-Process -FilePath "exe/$t.exe" -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError "results/$t.err"
+            if (-not $p.WaitForExit(300000)) { $p.Kill(); "TIMEOUT" | Out-File -Append $out }
+            "exit $($p.ExitCode)" | Out-File -Append $out
+            Get-Content $out | Select-String -Pattern '^(FAIL|SUMMARY)' | ForEach-Object { $_.Line }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x64-fidelity-${{ matrix.os }}
+          path: results/
+          retention-days: 30
