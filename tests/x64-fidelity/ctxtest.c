@@ -492,13 +492,12 @@ static void group_exc(void)
 
     make_pattern(&g_before, 4, fl, 0x3f80, 0x0b7f);
     g_before.gpr[0] = 0x8000000000000000ull; g_before.gpr[2] = ~0ull; g_before.gpr[1] = ~0ull;  /* INT64_MIN / -1 */
-    if (run(stub_idivovf, stub_idivovf_end, MODE_PLAIN))
-    {
-        fid_info("exc.idivovf.rec", "code %#lx address %p (stub %p)", g_seen.rec.ExceptionCode, g_seen.rec.ExceptionAddress, stub_idivovf);
-        check_context("exc.idivovf", &g_seen.ctx, &g_before, stub_idivovf, g_before.gpr[4], ALL_BUT_RSP, g_seen.has_ymmh,
-                      (const uint8_t (*)[16])g_seen.ymmh);
-    }
-    else fid_check(0, "exc.idivovf.raised", "no exception");
+    /* Windows reports a quotient overflow (divisor not zero) as STATUS_INTEGER_OVERFLOW */
+    exc_case("exc.idivovf", stub_idivovf, stub_idivovf_end, MODE_PLAIN, EXCEPTION_INT_OVERFLOW, stub_idivovf, 0, 0, 0, stub_idivovf, 0, 4, fl);
+
+    make_pattern(&g_before, 15, fl, 0x3f80, 0x0b7f);
+    g_before.gpr[0] = 0; g_before.gpr[2] = 5; g_before.gpr[1] = 3;      /* (5 << 64) / 3 does not fit */
+    exc_case("exc.divovf", stub_div0, stub_div0_end, MODE_PLAIN, EXCEPTION_INT_OVERFLOW, stub_div0, 0, 0, 0, stub_div0, 0, 15, fl);
 
     make_pattern(&g_before, 5, fl, 0x3f80, 0x0b7f);
     g_before.gpr[6] = (uintptr_t)page + 0x1008;            /* rsi: reserved, not committed */
@@ -831,6 +830,7 @@ static void group_capture(void)
 
 /* ---------------------------------------------------------------- other thread */
 
+/* *buf is always a malloc'd block: InitializeContext aligns the CONTEXT inside it itself */
 static CONTEXT *alloc_context(DWORD flags, void **buf)
 {
     DWORD len = 0;
@@ -846,8 +846,8 @@ static CONTEXT *alloc_context(DWORD flags, void **buf)
         }
         free(*buf);
     }
-    *buf = _aligned_malloc(sizeof(CONTEXT), 16);
-    ctx = *buf;
+    *buf = malloc(sizeof(CONTEXT) + 15);
+    ctx = (CONTEXT *)(((uintptr_t)*buf + 15) & ~(uintptr_t)15);
     memset(ctx, 0, sizeof(*ctx));
     ctx->ContextFlags = flags;
     return ctx;
@@ -855,7 +855,7 @@ static CONTEXT *alloc_context(DWORD flags, void **buf)
 
 static void free_context(void *buf, CONTEXT *ctx)
 {
-    if ((void *)ctx == buf) _aligned_free(buf); else free(buf);
+    free(buf);
 }
 
 static void group_thread(void)

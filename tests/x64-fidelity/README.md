@@ -1,6 +1,6 @@
 # x86-64 fidelity tests
 
-Six standalone Windows x64 programs that check what an x86-64 program can observe about the CPU and the
+Seven standalone Windows x64 programs that check what an x86-64 program can observe about the CPU and the
 Windows exception and memory model. They are the regression tests for the arm64 engine line (Wine ARM64EC +
 FEX), and run unchanged on real x86-64 Windows, which is the reference: a check that fails on real Windows is
 a wrong check, not a finding.
@@ -12,6 +12,7 @@ a wrong check, not a finding.
 | `x87test` | FXAM on every class, full and abridged tag words, TOP, FNSAVE/FRSTOR/FNSTENV/FLDENV, precision and rounding control, masked exception flags and stack faults, FPREM/FPREM1 quotient bits, FCOM/FUCOM/FCOMI, FIST range, MMX aliasing, MXCSR (round trip, sticky flags, DAZ, FTZ, RC) |
 | `fibertest` | nonvolatile registers (rbx rbp rsi rdi r12-r15, xmm6-15), stack canaries, FLS and GetCurrentFiber across fiber switches, a fiber migrating between threads, exceptions between switches; MXCSR/x87 control word per fiber recorded |
 | `memtest` | VirtualQuery/VirtualProtect/VirtualFree at 4 KB granularity, every protection, PAGE_GUARD, page-split accesses, generated and self-modifying code (documented flush path, RWX without a flush, inline, WriteProcessMemory, another thread), write watch, stack growth |
+| `kattest` | known-answer tests for CRC32 (SSE4.2), AES-NI, PCLMULQDQ, SHA-NI (full SHA-1 and SHA-256 blocks), VAES and VPCLMULQDQ against portable C, for every one of them CPUID advertises |
 | `tsctest` | fenced RDTSC monotonic, happens-before across threads and while migrating, RDTSCP, CPUID's TSC frequency against the measured rate |
 
 Output: one line per check, `PASS <id>`, `FAIL <id>: <detail>` or `INFO <id>: <value>`, then

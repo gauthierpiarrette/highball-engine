@@ -68,7 +68,7 @@ static void group_fxam(void)
         { "unnormal",     0x3fff, 0x4000000000000000ull, 0 },
         { "pseudo_nan",   0x7fff, 0x4000000000000000ull, 0 },
         { "pseudo_inf",   0x7fff, 0x0000000000000000ull, 0 },
-        { "pseudo_denormal", 0x0000, 0x8000000000000001ull, C3 | C2, 1 },
+        { "pseudo_denormal", 0x0000, 0x8000000000000001ull, C3 | C2 },
     };
     unsigned i;
     for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
@@ -83,7 +83,8 @@ static void group_fxam(void)
     {
         uint16_t sw = fxam_empty(mk(0xbfff, 0x8000000000000000ull)) & CC;
         fid_check((sw & (C3 | C2 | C0)) == (C3 | C0), "fxam.empty", "C3C2C0 %d%d%d want 101", !!(sw & C3), !!(sw & C2), !!(sw & C0));
-        fid_info("fxam.empty.c1", "C1 %d for an empty register holding a stale negative value", !!(sw & C1));
+        /* the SDM sets C1 to the sign of ST(0) whatever its class; Windows on AMD and Intel agree */
+        fid_check(sw & C1, "fxam.empty.c1", "C1 clear for an empty register holding a stale negative value");
     }
 }
 
@@ -386,8 +387,13 @@ static void group_mmx(void)
     static DECLSPEC_ALIGN(16) uint8_t fx[512];
     __asm__ volatile("fninit\n\tmovq %3, %%mm0\n\tfnstenv %0\n\tfxsave64 %1\n\temms\n\tfnstenv %2\n\tfninit\n\tfldcw %4"
                      : "=m"(e1), "=m"(fx), "=m"(e2) : "m"(pat), "m"(FCW_DEFAULT) : "memory");
-    fid_check(((e1.fsw >> 11) & 7) == 0 && e1.ftw == 0, "mmx.tags", "after movq mm0: TOP %u tag %#x (want 0, 0x0000)",
-              (e1.fsw >> 11) & 7, e1.ftw);
+    {
+        /* every register non-empty: no 11 pair in the full tag word (the pairs classify the contents) */
+        unsigned i, empty = 0;
+        for (i = 0; i < 8; i++) if (((e1.ftw >> (2 * i)) & 3) == 3) empty++;
+        fid_check(((e1.fsw >> 11) & 7) == 0 && !empty, "mmx.tags", "after movq mm0: TOP %u tag %#x (%u registers empty)",
+                  (e1.fsw >> 11) & 7, e1.ftw, empty);
+    }
     fid_check(!memcmp(fx + 32, &pat, 8) && fx[40] == 0xff && fx[41] == 0xff, "mmx.alias", "ST0 bytes %02x%02x:%016llx (want ffff:%016llx)",
               fx[41], fx[40], (unsigned long long)*(uint64_t *)(fx + 32), (unsigned long long)pat);
     fid_check(fx[4] == 0xff, "mmx.abridged", "abridged tag %#x want 0xff", fx[4]);
@@ -409,6 +415,9 @@ static void group_pointers(void)
                      : "=m"(e), "=m"(fx) : "m"(d), "m"(FCW_DEFAULT) : "memory");
     fid_info("pointers.fnstenv", "FIP %#x (marker %#x) FOP %#x FDP %#x (&d %#x)", e.fip, (unsigned)(uintptr_t)fip_marker,
              e.fop, e.fdp, (unsigned)(uintptr_t)&d);
+    /* FNSTENV stores the last non-control instruction's address, opcode (DC 05 -> 0x405) and operand */
+    fid_check(e.fip == (uint32_t)(uintptr_t)fip_marker && (e.fop & 0x7ff) == 0x405 && e.fdp == (uint32_t)(uintptr_t)&d,
+              "pointers.fnstenv.values", "FIP %#x FOP %#x FDP %#x", e.fip, e.fop, e.fdp);
     fid_info("pointers.fxsave", "FOP %#x FIP %#llx FDP %#llx", *(uint16_t *)(fx + 6), (unsigned long long)*(uint64_t *)(fx + 8),
              (unsigned long long)*(uint64_t *)(fx + 16));
 }
@@ -424,8 +433,7 @@ static void group_mxcsr(void)
     static DECLSPEC_ALIGN(16) uint8_t fx[512];
     uint32_t mask;
     unsigned i;
-    volatile float one = 1.0f, three = 3.0f, den = 1e-40f, zero = 0.0f, tiny = 1e-30f;
-    float r;
+    const float den = 1e-40f, zero = 0.0f, tiny = 1e-30f;
 
     __asm__ volatile("fxsave64 %0" : "=m"(fx));
     mask = *(uint32_t *)(fx + 28);
@@ -441,31 +449,29 @@ static void group_mxcsr(void)
         sprintf(id, "mxcsr.roundtrip.%x", vals[i]);
         fid_check(got == vals[i], id, "ldmxcsr %#x then stmxcsr %#x", vals[i], got);
     }
-    /* sticky precision flag */
-    setcsr(0x1f80);
-    r = one / three;
+    /* sticky precision flag: the arithmetic is in asm so nothing moves it around stmxcsr */
     {
-        uint32_t after_inexact = getcsr();
-        r = r + 0.0f;
-        r = one + one;
-        fid_check((after_inexact & 0x20) && (getcsr() & 0x20), "mxcsr.sticky_pe", "PE after 1/3 %#x, after an exact op %#x",
-                  after_inexact, getcsr());
+        uint32_t c1, c2, start = 0x1f80;
+        float a = 1.0f, b = 3.0f, two = 2.0f;
+        __asm__ volatile("ldmxcsr %4\n\tdivss %3, %0\n\tstmxcsr %1\n\taddss %3, %3\n\tmulss %5, %3\n\tstmxcsr %2\n\tldmxcsr %4"
+                         : "+x"(a), "=m"(c1), "=m"(c2), "+x"(b) : "m"(start), "x"(two));
+        fid_check((c1 & 0x20) && (c2 & 0x20), "mxcsr.sticky_pe", "PE after 1/3 %#x, after exact ops %#x", c1, c2);
     }
-    setcsr(0x1f80);
     /* DAZ: a denormal input reads as zero */
-    setcsr(0x1fc0);
-    r = den + zero;
-    setcsr(0x1f80);
-    fid_check(r == 0.0f, "mxcsr.daz", "1e-40 + 0 with DAZ = %g (want 0)", r);
-    r = den + zero;
-    fid_check(r != 0.0f, "mxcsr.nodaz", "1e-40 + 0 without DAZ = %g", r);
-    /* FTZ: an underflowing result is flushed to zero and UE PE are set */
-    setcsr(0x9f80);
-    r = tiny * tiny;
     {
-        uint32_t csr = getcsr();
-        setcsr(0x1f80);
-        fid_check(r == 0.0f, "mxcsr.ftz", "1e-30*1e-30 with FTZ = %g", r);
+        uint32_t daz = 0x1fc0, nodaz = 0x1f80;
+        float x = den, y = den, z = zero;
+        __asm__ volatile("ldmxcsr %2\n\taddss %3, %0\n\tldmxcsr %4" : "+x"(x), "+x"(z) : "m"(daz), "x"(zero), "m"(nodaz));
+        fid_check(x == 0.0f, "mxcsr.daz", "1e-40 + 0 with DAZ = %g (want 0)", x);
+        __asm__ volatile("ldmxcsr %1\n\taddss %2, %0" : "+x"(y) : "m"(nodaz), "x"(zero));
+        fid_check(y != 0.0f, "mxcsr.nodaz", "1e-40 + 0 without DAZ = %g", y);
+    }
+    /* FTZ: an underflowing result is flushed to zero and UE PE are set */
+    {
+        uint32_t ftz = 0x9f80, def = 0x1f80, csr;
+        float x = tiny;
+        __asm__ volatile("ldmxcsr %2\n\tmulss %3, %0\n\tstmxcsr %1\n\tldmxcsr %4" : "+x"(x), "=m"(csr) : "m"(ftz), "x"(tiny), "m"(def));
+        fid_check(x == 0.0f, "mxcsr.ftz", "1e-30*1e-30 with FTZ = %g", x);
         fid_check((csr & 0x30) == 0x30, "mxcsr.ftz.flags", "MXCSR after a flushed underflow %#x (want UE|PE)", csr);
     }
     /* RC on conversions */
@@ -486,7 +492,6 @@ static void group_mxcsr(void)
             }
     }
     setcsr(0x1f80);
-    (void)r;
 }
 
 int main(int argc, char **argv)

@@ -289,6 +289,7 @@ static void group_xsave(int avx, uint64_t xcr0, unsigned max_basic, unsigned max
     /* XSAVE with RFBM = SSE only: x87 part of the legacy region untouched, XSTATE_BV = RFBM & XINUSE */
     make_fp(&in, 2, avx, 2);
     memset(area, 0xcc, sizeof(area));
+    memset(area + 512, 0, 64);      /* XSAVE writes only XSTATE_BV; XRSTOR #GPs on a bad XCOMP_BV/reserved header */
     fp_roundtrip(&in, area, &out, 0);
     {
         int x87_untouched = area[0] == 0xcc && area[1] == 0xcc && area[2] == 0xcc && area[32] == 0xcc;
@@ -460,7 +461,7 @@ int main(int argc, char **argv)
     cpuid_t c0 = cpuidex(0, 0), c1, e0;
     unsigned max_basic = c0.eax, max_ext, i, sub;
     uint64_t xcr0 = 0, supported = 0;
-    int osxsave, avx_usable;
+    int osxsave, avx_usable, probe_all = argc > 1 && !strcmp(argv[1], "probe-all");
     char vendor[13];
 
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -525,9 +526,14 @@ int main(int argc, char **argv)
         int adv = bit_of(f->leaf, f->sub, f->reg, f->bit, max_basic, max_ext);
         int ran;
         char id[64];
+        sprintf(id, "feature.%s", f->name);
+        if (!adv && !probe_all)
+        {
+            fid_info(id, "not advertised");   /* Windows on ARM fast-fails some unadvertised instructions */
+            continue;
+        }
         memset(buf, 0, sizeof(buf));
         ran = run_probe(f->probe, buf) == 0;
-        sprintf(id, "feature.%s", f->name);
         if (adv)
         {
             fid_check(ran, id, "advertised but raised %#lx", g_probe_code);

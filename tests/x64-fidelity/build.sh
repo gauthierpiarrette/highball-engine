@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the six x86-64 fidelity tests: build.sh <llvm-mingw bin dir> <output dir>
+# Builds the x86-64 fidelity tests: build.sh <llvm-mingw bin dir> <output dir>
 # Same compiler everywhere (llvm-mingw 20260922, clang 23.1.2) so the Windows reference runs and the engine
 # runs use the same code.
 set -eu
@@ -13,4 +13,5 @@ $CC -o "$OUT/x87test.exe"   "$HERE/x87test.c"
 $CC -o "$OUT/fibertest.exe" "$HERE/fibertest.c" "$HERE/fiber_asm.S"
 $CC -o "$OUT/memtest.exe"   "$HERE/memtest.c"   "$HERE/mem_asm.S"
 $CC -o "$OUT/tsctest.exe"   "$HERE/tsctest.c"
+$CC -o "$OUT/kattest.exe"   "$HERE/kattest.c"
 ls -l "$OUT"

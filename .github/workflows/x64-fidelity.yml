@@ -46,7 +46,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path results | Out-Null
           Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, NumberOfLogicalProcessors | Format-List | Out-File results/cpu.txt
-          foreach ($t in 'cpuidtest','x87test','ctxtest','fibertest','memtest','tsctest') {
+          foreach ($t in 'cpuidtest','kattest','x87test','ctxtest','fibertest','memtest','tsctest') {
             $out = "results/$t.txt"
             $p = Start-Process -FilePath "exe/$t.exe" -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError "results/$t.err"
             if (-not $p.WaitForExit(300000)) { $p.Kill(); "TIMEOUT" | Out-File -Append $out }
