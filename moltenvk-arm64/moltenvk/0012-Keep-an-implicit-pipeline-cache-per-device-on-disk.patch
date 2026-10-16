@@ -35,7 +35,16 @@ of the other stage (the fragment module's for the vertex and tessellation stages
 fragment stage), since with the two key fixes a flight still refused about 2,000 pipelines; whatever the key
 misses, sharing across partners exposes it, and per-pairing sharing keeps the whole second-start win, a game
 pairing the same shaders at every run. Measured on the M4 on 2026-10-15.
+
+r2: the archive-size validation in MVKPipeline.mm names the padding each serialized struct is expected to
+carry, and the fields this patch adds fill one padding byte in four of them (CompilerMSL::Options 7 to 6 for
+texture_2D_as_2D_array, SPIRVToMSLConversionOptions 29 to 28 for hbPartnerHash, MSLShaderInterfaceVariable 3 to 2
+for hbBaseType, SPIRVToMSLConversionConfiguration 109 to 108), which printed "[MVK-BUILD-ERROR] ... Missing -1
+bytes" at every device creation (2026-10-16).
+
 ---
+ 8 files changed, 203 insertions(+), 10 deletions(-)
+
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 index 545b8c3..22f78ba 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
@@ -244,7 +253,7 @@ index e385e9b..62ae193 100644
  	bool _isExternallySynchronized = false;
  	bool _isMergeInternallySynchronized = false;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 7a25708..0e85c65 100644
+index 7a25708..446d560 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 @@ -1498,6 +1498,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
@@ -339,7 +348,28 @@ index 7a25708..0e85c65 100644
  	}
  
  	template<class Archive>
-@@ -3210,3 +3220,18 @@ void mvkValidateCeralArchiveDefinitions() {
+@@ -3193,20 +3203,35 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
+ 
+ void mvkValidateCeralArchiveDefinitions() {
+ 	[[maybe_unused]] size_t missingBytes = 0;
+-	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(7);
++	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(6);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>();
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLResourceBinding>();
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVWorkgroupSizeDimension>(3);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(29);			// Contains string
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(3);
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(28);			// Contains string
++	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
+-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(109);	// Contains collection
++	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(108);	// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(40);		// Contains collection
+ 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
  	missingBytes += mvkValidateCerealArchiveSize<MVKCompressor<std::string>>(20);				// Contains collection
  	assert(missingBytes == 0 && "Cereal Archive definitions incomplete. See previous logged errors.");
  }
@@ -502,4 +532,4 @@ index bffc072..7e8741d 100644
  		/**
  		 * Returns whether the specified interface variable match this one.
 -- 
-2.39.5
+2.47.0

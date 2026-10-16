@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Thu, 16 Oct 2026 10:30:00 +0200
+Subject: [PATCH] Guard room after update-after-bind descriptor pools
+
+A descriptor pool's GPU buffer holds what the app asked for, while the shaders declare the descriptor arrays at
+the set layout's maximum: vkd3d-proton's bindless heaps for Microsoft Flight Simulator 2024 are a 2,375,680-byte
+pool against arrays of 1,000,003 entries of 8 bytes in the MSL. A draw that reads a descriptor index past the
+pool's end (the game does, at the end of its loading screens) reads an unmapped page on Metal, which is a GPU
+page fault the device recovers from, and on a PC lands in mapped heap memory and goes unnoticed. Metal's API
+validation named the short argument buffers at the moment of the fault, and guard room after every
+update-after-bind pool made the fault go away: a full run with 0 faults against 1 to 30 at every start without
+(2026-10-16). The room is 8 MiB plus 64 KiB after every such pool, a descriptor index up to the layout's maximum whatever the
+pool's size: a guard scaled with the pool's size (64 KiB for the small sampler heaps) left one fault at the
+menu after the start screen, and the flat guard a whole flight without one. The game creates about 75 such
+pools over a flight, most of them short-lived. HB_MVK_POOL_GUARD=0 turns the guard off.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
+index 3cdc623..28034ce 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
+@@ -1987,6 +1987,13 @@ static uint32_t calcGroupSizeWithPadding(uint32_t size, uint32_t groups, uint32_
+ 	void* hostOnlyGPUBuffer;
+ 	// Pad ourselves to reduce the amount of space wasted in driver padding
+ 	gpuSize = alignDescriptorOffset(gpuSize, hostOnly ? gpuAlign : gpuSize < 16384 ? 256 : 16384);
++	// Highball pool-guard: an update-after-bind pool is a bindless heap a D3D12 game indexes with its own numbers, and a
++	// stray index past the pool's end must land in this buffer, not in an unmapped page (see the patch's message).
++	static const bool hbPoolGuard = getenv("HB_MVK_POOL_GUARD") == nullptr || getenv("HB_MVK_POOL_GUARD")[0] != '0';
++	if (hbPoolGuard && gpuSize && !hostOnly && mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT)) {
++		fprintf(stderr, "[hb-pool-guard] descriptor pool of %u bytes (%u sets) gets guard room\n", gpuSize, pCreateInfo->maxSets);
++		gpuSize += (8u << 20) + (64u << 10);	// a descriptor index up to the layout maximum, whatever the pool's size
++	}
+ 
+ 	MVKDescriptorPool* ret = Constructor::Create(
+ 		std::tuple {
+-- 
+2.47.0

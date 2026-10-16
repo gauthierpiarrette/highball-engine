@@ -72,5 +72,18 @@ them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover
   WoW64 (427,248 to 3,036,629); with it all pass in both. Found while Microsoft Flight Simulator 2024
   crashed in a game thread during loading.
 
+- `0019` SMC quarantine. An SMC write fault on a page erased every block compiled from that page and
+  the next execution recompiled them all; Microsoft Flight Simulator 2024 writes data that shares
+  pages with hot code, and per-thread counters (M4, 2026-10-16) showed the instruction bytes unchanged
+  at almost every re-protection (idle 1,012 unchanged against 3 changed, loading 5,136 against 0),
+  90 to 98 percent of compiles being recompiles, and the flight's present-time spikes matching the
+  JIT bursts. The fault side now sets the page's blocks aside in a fixed table (nothing allocates in
+  the fault handler: two allocating diagnostic builds froze the game through Wine's FLS critical
+  section) with a copy of the page and a mask of the decoded instruction bytes; the next compile on
+  the page protects it and compares the masked bytes: unchanged puts the blocks back, changed frees
+  them. Blocks spanning other pages are erased as before. One flight each on the M4: 27.4 fps parked
+  with p99 57 ms against 25.7 and 118 ms, 15 spikes against 50; later flights inside the run-to-run
+  variance (GPU hangs set the spikes). Six counters join FEX_PROFILESTATS' per-thread statistics.
+
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.

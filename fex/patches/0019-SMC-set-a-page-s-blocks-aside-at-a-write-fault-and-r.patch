@@ -1,0 +1,522 @@
+From 3eab5fd752b1fa73a48357f1ed7bdf251074e533 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Fri, 16 Oct 2026 14:18:39 +0200
+Subject: [PATCH] SMC: set a page's blocks aside at a write fault and restore
+ them when its instruction bytes are unchanged
+
+An SMC write fault on a page erased every block compiled from that page (InvalidationTracker ->
+InvalidateRange, the whole page) and the next execution recompiled them all. Microsoft Flight
+Simulator 2024 writes data that shares pages with hot code all the time, so the page alternated
+compile and protect, write and fault and erase, execute and miss and recompile: per-thread
+counters on the M4 (2026-10-16) showed the instruction bytes unchanged at almost every
+re-protection (idle: 1,012 unchanged against 3 changed; loading: 5,136 against 0; 90 to 98 percent
+of the compiles were recompiles), and the present-time spikes of a flight matched the seconds of
+JIT bursts (spike seconds averaged 976 ms of JIT against 551, 651 SMC events against 228).
+
+Now the fault side sets the page's blocks aside in a fixed table in the GuestToHostMap: their links
+in are cut and they leave BlockList and CodePages (unreachable, as if erased), but the entries are
+kept with a copy of the page and a mask of the instruction bytes they were decoded from (each block
+records its instruction byte ranges at compile time). Nothing allocates on the fault side: the
+handler holds the thread-creation and code-invalidation mutexes, and two diagnostic builds that
+allocated there froze the game in a lock cycle through Wine's FLS critical section. Blocks that
+span other pages are erased as before (a page copy vouches for one page). When a thread next needs
+code on the page (CompileBlock after a lookup miss), the page is protected again first, then the
+masked bytes are compared with the copy: unchanged puts the blocks back and returns the wanted one
+without compiling; changed frees them. A page set aside again before a restoration drops the old
+record; explicit invalidations (frees, unmaps, protection changes) drop every set-aside block that
+touches their range, and cache clears drop the table.
+
+Measured on the M4, one flight each so within the run-to-run variance: the first flight parked at
+27.4 fps with p99 frame time 57 ms against 25.7 fps and 118 ms without, roll 24.4 against 24.1,
+15 present spikes over 120 ms against 50; two later flights sat inside the variance, where GPU
+hangs set the spike count. Six counters appended to the per-thread statistics of FEX_PROFILESTATS=1
+(ThreadStats grows to 160 bytes): recompiles, entries on the faulting pages, entries erased, pages
+restored, pages changed, slot evictions.
+---
+ FEXCore/Source/Interface/Context/Context.h    |   1 +
+ FEXCore/Source/Interface/Core/CodeCache.cpp   |   2 +-
+ FEXCore/Source/Interface/Core/Core.cpp        |  80 ++++++-
+ FEXCore/Source/Interface/Core/LookupCache.cpp |   5 +
+ FEXCore/Source/Interface/Core/LookupCache.h   | 219 +++++++++++++++++-
+ FEXCore/include/FEXCore/Core/Context.h        |   2 +
+ FEXCore/include/FEXCore/Utils/SHMStats.h      |   8 +
+ Source/Windows/Common/InvalidationTracker.cpp |   7 +-
+ 8 files changed, 317 insertions(+), 7 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 37bd5c0..78091c2 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -226,6 +226,7 @@ public:
+   void OnCodeBufferAllocated(const std::shared_ptr<CPU::CodeBuffer>&) override;
+   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
+   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
++  void SMCQuarantinePage(FEXCore::Core::InternalThreadState* Thread, uint64_t Page) override;
+   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {
+     return CodeInvalidationMutex;
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index 87a110c..0e4edda 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -808,7 +808,7 @@ bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCod
+       LOGMAN_THROW_A_FMT(Block.HostCode < Code.CodeBuffer.size_bytes(), "Host offset {:#x} out of range ({:#x})", Block.HostCode,
+                          Code.CodeBuffer.size_bytes());
+       auto HostCode = &Code.CodeBuffer[Block.HostCode];
+-      LookupCache.AddBlockMapping(Guest + BinarySection.FileStartVA, std::move(Block.CodePages), HostCode, WriteLock);
++      LookupCache.AddBlockMapping(Guest + BinarySection.FileStartVA, std::move(Block.CodePages), HostCode, {}, WriteLock);
+     }
+ 
+     // Guest code pages
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 4470789..d3be541 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1012,6 +1012,30 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     return HostCode;
+   }
+ 
++  // SMC quarantine: code on this page was set aside at a write fault and the page gets code again now. Protect
++  // it first (a write from now on faults and waits for this compilation, which holds the invalidation lock),
++  // then compare the bytes the blocks were decoded from: unchanged puts them back, changed frees them.
++  {
++    const uint64_t Page = GuestRIP & FEXCore::Utils::FEX_PAGE_MASK;
++    if (Thread->LookupCache->HasQuarantine(Page)) {
++      if (Thread->LookupCache->PageHasNoCode(Page)) {
++        SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
++      }
++      bool Restored = false;
++      uintptr_t Host = Thread->LookupCache->RestoreQuarantine(Page, GuestRIP, Restored);
++      if (Thread->ThreadStats) {
++        auto& Field = Restored ? Thread->ThreadStats->AccumulatedSMCPagesRestored : Thread->ThreadStats->AccumulatedSMCPagesChanged;
++        std::atomic_ref<uint64_t>(Field).fetch_add(1, std::memory_order_relaxed);
++      }
++      if (Host) {
++        return Host;
++      }
++      if (!Restored && Thread->ThreadStats) {
++        std::atomic_ref<uint64_t>(Thread->ThreadStats->AccumulatedRecompileCount).fetch_add(1, std::memory_order_relaxed);
++      }
++    }
++  }
++
+   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+ 
+   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+@@ -1165,9 +1189,27 @@ RecompileForSMC:
+     }
+   }
+ 
++  // SMC quarantine: the instruction bytes this compilation decoded (consecutive instructions merged into ranges)
++  fextl::vector<std::pair<uint64_t, uint64_t>> CodeRanges;
++  if (NeedsAddGuestCodeRanges) {
++    for (const auto& B : Thread->FrontendDecoder->GetDecodedBlockInfo()->Blocks) {
++      for (uint64_t i = 0; i < B.NumInstructions; i++) {
++        const auto& I = B.DecodedInstructions[i];
++        if (!I.InstSize) {
++          continue;
++        }
++        if (!CodeRanges.empty() && CodeRanges.back().first + CodeRanges.back().second == I.PC) {
++          CodeRanges.back().second += I.InstSize;
++        } else {
++          CodeRanges.emplace_back(I.PC, I.InstSize);
++        }
++      }
++    }
++  }
++
+   // Insert to lookup cache
+   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
+-    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
++    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr, CodeRanges);
+   }
+ 
+   // Clear any relocations that might have been generated
+@@ -1203,6 +1245,42 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
+   return (uintptr_t)CodePtr;
+ }
+ 
++// SMC quarantine: the fault side, every code buffer's map (as InvalidateCodeBuffersCodeRange), with the counts
++void ContextImpl::SMCQuarantinePage(FEXCore::Core::InternalThreadState* Thread, uint64_t Page) {
++  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++  std::scoped_lock lk {CodeBufferListLock};
++  auto it = CodeBufferList.begin();
++  while (it != CodeBufferList.end()) {
++    if (auto Strong = it->lock()) {
++      auto& Map = *Strong->LookupCache;
++      const uint64_t Ev = Map.QuarantineEvictions, Er = Map.QuarantineErased;
++      uint64_t OnPage = 0;
++      {
++        auto rlk = Map.AcquireReadLock();
++        auto pit = Map.CodePages.find(Page >> 12);
++        if (pit != Map.CodePages.end()) {
++          OnPage = pit->second.size();
++        }
++      }
++      Map.QuarantinePage(Page);
++      if (Thread->ThreadStats) {
++        if (OnPage) {
++          std::atomic_ref<uint64_t>(Thread->ThreadStats->AccumulatedSMCBlocksOnPage).fetch_add(OnPage, std::memory_order_relaxed);
++        }
++        if (Map.QuarantineEvictions != Ev) {
++          std::atomic_ref<uint64_t>(Thread->ThreadStats->AccumulatedSMCEvictions).fetch_add(Map.QuarantineEvictions - Ev, std::memory_order_relaxed);
++        }
++        if (Map.QuarantineErased != Er) {
++          std::atomic_ref<uint64_t>(Thread->ThreadStats->AccumulatedSMCBlocksErased).fetch_add(Map.QuarantineErased - Er, std::memory_order_relaxed);
++        }
++      }
++      it++;
++    } else {
++      it = CodeBufferList.erase(it);
++    }
++  }
++}
++
+ void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
+   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
+ 
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.cpp b/FEXCore/Source/Interface/Core/LookupCache.cpp
+index 0b23030..1feb26d 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.cpp
++++ b/FEXCore/Source/Interface/Core/LookupCache.cpp
+@@ -16,6 +16,7 @@ $end_info$
+ namespace FEXCore {
+ GuestToHostMap::GuestToHostMap()
+   : BlockLinks_mbr {"FEXMem_BlockLinks"} {
++  InitQuarantine();	// SMC quarantine: the slot table is allocated here, never on the fault side
+   BlockLinks_pma = fextl::make_unique<std::pmr::polymorphic_allocator<std::byte>>(&BlockLinks_mbr);
+   // Setup our PMR map.
+   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
+@@ -106,6 +107,10 @@ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
+   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
+   // All code is gone, clear the block list
+   BlockList.clear();
++  for (auto& S : QSlots) {	// SMC quarantine
++    S.Page = 0;
++    S.Blocks.clear();
++  }
+ }
+ 
+ } // namespace FEXCore
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index 391d485..cf86680 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -85,6 +85,7 @@ struct GuestToHostMap {
+   struct BlockEntry {
+     uint64_t HostCode;
+     fextl::vector<uint64_t> CodePages;
++    fextl::vector<std::pair<uint64_t, uint64_t>> Ranges;	// SMC quarantine: the instruction bytes the block was decoded from, [first, first + second)
+   };
+ 
+   fextl::robin_map<uint64_t, BlockEntry> BlockList;
+@@ -94,14 +95,14 @@ struct GuestToHostMap {
+   GuestToHostMap();
+ 
+   // Adds to Guest -> Host code mapping
+-  const BlockEntry& AddBlockMapping(uint64_t Address, std::span<const uint64_t> CodePages, void* HostCode, const LookupCacheWriteLockToken&) {
++  const BlockEntry& AddBlockMapping(uint64_t Address, std::span<const uint64_t> CodePages, void* HostCode, fextl::vector<std::pair<uint64_t, uint64_t>> Ranges, const LookupCacheWriteLockToken&) {
+     // This may replace an existing mapping
+     // NOTE: Generally no previous entry should exist, however there is one exception:
+     //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
+     //       may already contain the block address. Since is comparatively rare, we'll just leak
+     //       one of the two blocks in this case.
+     return BlockList
+-      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, fextl::vector<uint64_t>(CodePages.begin(), CodePages.end())})
++      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, fextl::vector<uint64_t>(CodePages.begin(), CodePages.end()), std::move(Ranges)})
+       .first->second;
+   }
+ 
+@@ -137,6 +138,202 @@ struct GuestToHostMap {
+       }
+     }
+     CodePages.erase(lower, upper);
++
++    // SMC quarantine: an explicit invalidation frees the set-aside blocks of these pages, and every set-aside
++    // block that touches the range through any of its pages
++    const uint64_t RStart = Start & FEXCore::Utils::FEX_PAGE_MASK;
++    const uint64_t REnd = Start + Length;
++    for (auto& S : QSlots) {
++      if (!S.Page) {
++        continue;
++      }
++      bool Drop = S.Page >= RStart && S.Page < REnd;
++      for (const auto& B : S.Blocks) {
++        if (Drop) {
++          break;
++        }
++        for (auto cp : B.Entry.CodePages) {
++          if (cp >= RStart && cp < REnd) {
++            Drop = true;
++            break;
++          }
++        }
++      }
++      if (Drop) {
++        S.Page = 0;
++        S.Blocks.clear();
++      }
++    }
++  }
++
++  // SMC quarantine. At an SMC write fault the blocks compiled from the page are set aside here instead of erased,
++  // with a copy of the page's bytes and a mask of the instruction bytes they were decoded from; when the page
++  // next gets code (CompileBlock), the masked bytes are compared and the blocks go back or are freed. The table
++  // is fixed and filled without allocating: the fault handler holds the thread-creation and code-invalidation
++  // mutexes, and allocating there deadlocked a game through Wine's FLS critical section. Blocks confined to the
++  // page are set aside; blocks spanning other pages are erased as before (a page copy vouches for one page).
++  struct QuarantinedBlock {
++    uint64_t Address;
++    BlockEntry Entry;
++  };
++  struct QSlot {
++    uint64_t Page {0};	// 0: free
++    fextl::vector<uint8_t> Bytes;	// FEX_PAGE_SIZE, allocated at construction
++    fextl::vector<uint8_t> Mask;	// FEX_PAGE_SIZE
++    fextl::vector<QuarantinedBlock> Blocks;	// capacity QUARANTINE_BLOCKS, never grown on the fault side
++  };
++  static constexpr size_t QUARANTINE_SLOTS = 8192;
++  static constexpr size_t QUARANTINE_BLOCKS = 192;
++  static constexpr size_t QUARANTINE_PROBES = 16;
++  fextl::vector<QSlot> QSlots;
++  uint64_t QuarantineEvictions {0};	// read by the fault side for the statistics
++  uint64_t QuarantineErased {0};
++
++  void InitQuarantine() {
++    QSlots.resize(QUARANTINE_SLOTS);
++    for (auto& S : QSlots) {
++      S.Bytes.resize(FEXCore::Utils::FEX_PAGE_SIZE);
++      S.Mask.resize(FEXCore::Utils::FEX_PAGE_SIZE);
++      S.Blocks.reserve(QUARANTINE_BLOCKS);
++    }
++  }
++
++  QSlot* FindQuarantine(uint64_t Page) {
++    if (QSlots.empty()) {
++      return nullptr;
++    }
++    size_t h = (Page >> 12) * 0x9E3779B97F4A7C15ull;
++    for (size_t i = 0; i < QUARANTINE_PROBES; i++) {
++      auto& S = QSlots[(h + i) % QUARANTINE_SLOTS];
++      if (S.Page == Page) {
++        return &S;
++      }
++    }
++    return nullptr;
++  }
++
++  QSlot* FreeQuarantineSlot(uint64_t Page) {
++    if (QSlots.empty()) {
++      return nullptr;
++    }
++    size_t h = (Page >> 12) * 0x9E3779B97F4A7C15ull;
++    for (size_t i = 0; i < QUARANTINE_PROBES; i++) {
++      auto& S = QSlots[(h + i) % QUARANTINE_SLOTS];
++      if (S.Page == 0) {
++        return &S;
++      }
++    }
++    // No free slot: evict the one at the first probe (its blocks were set aside for a page not run since; they
++    // are freed here as an erase would have freed them at the fault)
++    auto& S = QSlots[h % QUARANTINE_SLOTS];
++    S.Page = 0;
++    S.Blocks.clear();
++    QuarantineEvictions++;
++    return &S;
++  }
++
++  // The fault side (CodeInvalidationMutex held by the caller, as for InvalidateRange): blocks confined to Page
++  // are set aside, the others erased. Either way they leave BlockList and CodePages and their links in are cut.
++  void QuarantinePage(uint64_t Page) {
++    auto lk = AcquireWriteLock();
++    if (auto Old = FindQuarantine(Page)) {	// a record left from an earlier fault was never restored: start over
++      Old->Page = 0;
++      Old->Blocks.clear();
++    }
++    auto it = CodePages.find(Page >> 12);
++    if (it == CodePages.end()) {
++      return;
++    }
++    QSlot* S = FreeQuarantineSlot(Page);
++    bool Filled = false;
++    for (auto Address : it->second) {
++      auto bit = BlockList.find(Address);
++      if (bit == BlockList.end()) {
++        continue;
++      }
++      bool Confined = S && !bit->second.Ranges.empty() && S->Blocks.size() < QUARANTINE_BLOCKS;
++      if (Confined) {
++        for (auto cp : bit->second.CodePages) {
++          if ((cp >> 12) != (Page >> 12)) {
++            Confined = false;
++          }
++        }
++        for (const auto& R : bit->second.Ranges) {
++          if (R.first < Page || R.first + R.second > Page + FEXCore::Utils::FEX_PAGE_SIZE) {
++            Confined = false;
++          }
++        }
++      }
++      // Sever any links to this block
++      auto lower = BlockLinks->lower_bound({Address, nullptr});
++      auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
++      for (auto l = lower; l != upper; l = BlockLinks->erase(l)) {
++        l->second(l->first.HostLink);
++      }
++      if (Confined) {
++        if (!Filled) {
++          memcpy(S->Bytes.data(), reinterpret_cast<const void*>(Page), FEXCore::Utils::FEX_PAGE_SIZE);
++          memset(S->Mask.data(), 0, FEXCore::Utils::FEX_PAGE_SIZE);
++          Filled = true;
++        }
++        for (const auto& R : bit->second.Ranges) {
++          for (uint64_t a = R.first; a < R.first + R.second; a++) {
++            S->Mask[a - Page] = 1;
++          }
++        }
++        S->Blocks.push_back({Address, std::move(bit->second)});
++      } else {
++        QuarantineErased++;
++      }
++      BlockList.erase(bit);
++    }
++    CodePages.erase(it);
++    if (Filled) {
++      S->Page = Page;
++    }
++  }
++
++  bool HasQuarantine(uint64_t Page, const LookupCacheReadLockToken&) {
++    return FindQuarantine(Page) != nullptr;
++  }
++
++  bool PageHasNoCode(uint64_t Page, const LookupCacheReadLockToken&) {
++    auto it = CodePages.find(Page >> 12);
++    return it == CodePages.end() || it->second.empty();
++  }
++
++  // The restore side, with the page protected again by the caller: unchanged instruction bytes put the blocks
++  // back and return GuestRIP's host code if it is one of them; changed bytes free them.
++  uintptr_t RestoreQuarantine(uint64_t Page, uint64_t GuestRIP, bool& Restored) {
++    auto lk = AcquireWriteLock();
++    Restored = false;
++    QSlot* S = FindQuarantine(Page);
++    if (!S) {
++      return 0;
++    }
++    const uint8_t* Now = reinterpret_cast<const uint8_t*>(Page);
++    bool Same = true;
++    for (size_t i = 0; i < FEXCore::Utils::FEX_PAGE_SIZE; i++) {
++      if (S->Mask[i] && Now[i] != S->Bytes[i]) {
++        Same = false;
++        break;
++      }
++    }
++    uintptr_t Host = 0;
++    if (Same) {
++      auto& CodePage = CodePages[Page >> 12];
++      for (auto& B : S->Blocks) {
++        if (B.Address == GuestRIP) {
++          Host = B.Entry.HostCode;
++        }
++        CodePage.push_back(B.Address);
++        BlockList.insert_or_assign(B.Address, std::move(B.Entry));
++      }
++      Restored = true;
++    }
++    S->Page = 0;
++    S->Blocks.clear();
++    return Host;
+   }
+ 
+   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
+@@ -282,6 +479,19 @@ public:
+ 
+   GuestToHostMap* Shared = nullptr;
+ 
++  // SMC quarantine: the compiling thread's side (see GuestToHostMap::RestoreQuarantine)
++  bool HasQuarantine(uint64_t Page) {
++    auto lk = Shared->AcquireReadLock();
++    return Shared->HasQuarantine(Page, lk);
++  }
++  bool PageHasNoCode(uint64_t Page) {
++    auto lk = Shared->AcquireReadLock();
++    return Shared->PageHasNoCode(Page, lk);
++  }
++  uintptr_t RestoreQuarantine(uint64_t Page, uint64_t GuestRIP, bool& Restored) {
++    return Shared->RestoreQuarantine(Page, GuestRIP, Restored);
++  }
++
+   // Appends a list of Block {Address} to CodePages [Start, Start + Length)
+   // Returns true if new pages are marked as containing code
+   bool AddBlockExecutableRange(FEXCore::Core::InternalThreadState* Thread, auto& Addresses, uint64_t Start, uint64_t Length) {
+@@ -294,13 +504,14 @@ public:
+   }
+ 
+   // Adds to Guest -> Host code mapping
+-  void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, std::span<const uint64_t> CodePages, void* HostCode) {
++  void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, std::span<const uint64_t> CodePages, void* HostCode,
++                       fextl::vector<std::pair<uint64_t, uint64_t>> Ranges = {}) {
+     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
+       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
+     auto lk = Shared->AcquireWriteLock();
+     LockTime.reset();
+ 
+-    const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, lk);
++    const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, std::move(Ranges), lk);
+ 
+     // There is no need to update L1 or L2, they will get updated on first lookup
+     // However, adding to L1 here increases performance
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 3413c57..91f542a 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -154,6 +154,8 @@ public:
+ 
+   FEX_DEFAULT_VISIBILITY virtual void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) = 0;
+   FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
++  // SMC quarantine: in place of InvalidateCodeBuffersCodeRange for the page of an SMC write fault
++  FEX_DEFAULT_VISIBILITY virtual void SMCQuarantinePage(FEXCore::Core::InternalThreadState* Thread, uint64_t Page) = 0;
+   FEX_DEFAULT_VISIBILITY virtual void
+   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
+   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;
+diff --git a/FEXCore/include/FEXCore/Utils/SHMStats.h b/FEXCore/include/FEXCore/Utils/SHMStats.h
+index c5844fe..ec00680 100644
+--- a/FEXCore/include/FEXCore/Utils/SHMStats.h
++++ b/FEXCore/include/FEXCore/Utils/SHMStats.h
+@@ -75,6 +75,14 @@ struct ThreadStats {
+   uint64_t AccumulatedDiskCacheMissCount;
+   uint64_t AccumulatedDiskCacheLookupTime;
+   uint64_t Padding;
++
++  // SMC quarantine (appended, read by size)
++  uint64_t AccumulatedRecompileCount;	// compiles whose RIP had a block before (set aside and freed, or erased)
++  uint64_t AccumulatedSMCBlocksOnPage;	// block entries on the faulting pages at SMC faults
++  uint64_t AccumulatedSMCBlocksErased;	// of which erased (spanning other pages or beyond a slot's capacity)
++  uint64_t AccumulatedSMCPagesRestored;	// re-protections whose set-aside blocks went back (bytes unchanged)
++  uint64_t AccumulatedSMCPagesChanged;	// re-protections whose set-aside blocks were freed (bytes changed)
++  uint64_t AccumulatedSMCEvictions;	// slots taken from a page not run since its fault
+ };
+ 
+ // Ensure 16-byte alignment to take advantage of ARM single-copy atomicity.
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 155403d..3236394 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -230,7 +230,12 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+     {
+       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+ 
+-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
++      // SMC quarantine: the page's blocks are set aside (or erased when they span other pages), and every
++      // thread's cached entries for the page go, as before
++      CTX.SMCQuarantinePage(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK);
++      for (auto T : Threads) {
++        CTX.InvalidateThreadCachedCodeRange(T.second, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
++      }
+ 
+       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
+       ULONG TmpProt;
+-- 
+2.54.0 (Apple Git-157)
+

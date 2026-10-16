@@ -115,31 +115,34 @@ index a4b9d36..5411887 100644
  
  NTSYSAPI void ntdll_set_exception_jmp_buf( jmp_buf jmp );
  
-@@ -276,6 +281,29 @@ NTSYSAPI int ntdll_wcsnicmp( const WCHAR *str1, const WCHAR *str2, int n );
+@@ -276,6 +281,32 @@ NTSYSAPI int ntdll_wcsnicmp( const WCHAR *str1, const WCHAR *str2, int n );
  #define wcstol(str,e,b)    ntdll_wcstol(str,e,b)
  #define wcstoul(str,e,b)   ntdll_wcstoul(str,e,b)
  
 +/* Opens a host library by the leaf name configure found (SONAME_*). A packaged macOS Wine ships the ones it needs in
-+ * its lib directory, where a process that started without its parent's DYLD variables (the children of a Windows
-+ * program) does not find them by that name: there the name is also looked for two directories above the calling Unix
-+ * module, lib/wine/<arch>-unix/x.so -> lib/<name>. */
++ * its lib directory, two directories above the calling Unix module (lib/wine/<arch>-unix/x.so -> lib/<name>): that
++ * copy comes first, since a leaf name would search DYLD_FALLBACK_LIBRARY_PATH, where a framework the engine carries
++ * (GStreamer's) has a libMoltenVK.dylib of its own, and a child of a Windows program has no DYLD variables at all. */
 +static inline void *dlopen_host_lib( const char *name, int flags )
 +{
-+    void *handle = dlopen( name, flags );
 +#ifdef __APPLE__
 +    Dl_info info;
 +    char *path, *p;
++    void *handle = NULL;
 +
-+    if (handle || strchr( name, '/' ) || !dladdr( (void *)dlopen_host_lib, &info ) || !info.dli_fname) return handle;
-+    if (!(path = malloc( strlen( info.dli_fname ) + strlen( name ) + 8 ))) return NULL;
-+    strcpy( path, info.dli_fname );
-+    if ((p = strrchr( path, '/' ))) *p = 0;
-+    strcat( path, "/../../" );
-+    strcat( path, name );
-+    handle = dlopen( path, flags );
-+    free( path );
++    if (!strchr( name, '/' ) && dladdr( (void *)dlopen_host_lib, &info ) && info.dli_fname
++        && (path = malloc( strlen( info.dli_fname ) + strlen( name ) + 8 )))
++    {
++        strcpy( path, info.dli_fname );
++        if ((p = strrchr( path, '/' ))) *p = 0;
++        strcat( path, "/../../" );
++        strcat( path, name );
++        handle = dlopen( path, flags );
++        free( path );
++    }
++    if (handle) return handle;
 +#endif
-+    return handle;
++    return dlopen( name, flags );
 +}
 +
  #else /* WINE_UNIX_LIB */

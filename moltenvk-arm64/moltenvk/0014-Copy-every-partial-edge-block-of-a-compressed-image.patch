@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Thu, 16 Oct 2026 11:30:00 +0200
+Subject: [PATCH] Copy every partial edge block of a compressed image to an uncompressed one
+
+MVKCmdCopyImage divides the extent of a compressed source by its block size when the destination is not
+compressed, with a floor division, so a source whose extent is not a multiple of the block size loses its last
+column or row of blocks: a 5x5 BC7 region reached a 1x1 destination instead of 2x2. A partial edge block still
+occupies a whole destination texel, so the division rounds up. Found and proven with a standalone Vulkan probe
+on 2026-10-13 (BC7 sources of 1x1, 2x2, 3x3, 5x5, 7x9 into RGBA32_UINT: 5 of 8 cases wrong before, 8 of 8
+right after; power-of-two sizes were right both ways). Microsoft Flight Simulator 2024 compresses its terrain and
+imagery tiles on the GPU through block-texel views of this kind, and its tiles carry borders that make their
+sizes odd.
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
+index ab318c5..d66dc4b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
+@@ -190,8 +190,9 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+             VkExtent3D dstExtent = vkIC.extent;
+             if (isSrcCompressed && !isDstCompressed) {
+                 VkExtent2D srcBlockExtent = pixFmts->getBlockTexelSize(srcMTLPixFmt);
+-                dstExtent.width /= srcBlockExtent.width;
+-                dstExtent.height /= srcBlockExtent.height;
++                // Partial edge blocks still occupy a complete destination texel.
++                dstExtent.width = mvkCeilingDivide(dstExtent.width, srcBlockExtent.width);
++                dstExtent.height = mvkCeilingDivide(dstExtent.height, srcBlockExtent.height);
+             } else if (!isSrcCompressed && isDstCompressed) {
+                 VkExtent2D dstBlockExtent = pixFmts->getBlockTexelSize(dstMTLPixFmt);
+                 dstExtent.width *= dstBlockExtent.width;
+-- 
+2.47.0
