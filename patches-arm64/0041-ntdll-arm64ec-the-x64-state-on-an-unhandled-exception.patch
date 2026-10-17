@@ -1,0 +1,45 @@
+ntdll: the x64 register state in the log when an ARM64EC process dies of an unhandled exception.
+
+When no handler takes an exception raised in emulated x64 code, Wine's Unix side prints one line ("Unhandled
+exception code c0000005 flags 0 addr 0x1447f3c7d", or "Exception frame is not in stack limits => unable to
+dispatch exception") and terminates the process. The line names the instruction, nothing else: not the address
+the instruction touched, not where the stack pointer stood, not what the registers held. The debugger Wine starts
+instead (winedbg --auto) attaches to a 25 GB, 125-thread process too slowly to say anything before the process is
+gone, and a WINEDEBUG=+seh trace, which does print the state at every exception, costs Microsoft Flight
+Simulator 2024 two to three times its loading time (it single-steps its own code 57,000 to 225,000 times per boot).
+
+The second-chance NtRaiseException is the last point where the exception still carries an x64 context (the
+ARM64EC wrapper converts it to an ARM64 one for the Unix side). On the second chance, when the context is an x64
+one, print the exception code, flags, address and the first two parameters, then rip, rsp, rbp, eflags and the
+general registers, with the TEB's stack bounds and a note when rsp lies outside them (a thread running on a
+coroutine stack whose switch did not update the TIB, which is why the frame was refused). Nothing is printed on a
+first chance, so handled exceptions cost nothing. The loading crash of MSFS 2024 on the arm64 line (about one
+boot in sixteen, varied sites, three of them a thread resuming with a wrong RSP) is what this is for.
+
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -893,6 +893,24 @@
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
++    /* Highball: on the second chance the process is about to die of this exception unless a debugger takes it; the
++     * Unix side prints one line without the state. Print the x64 state here, where it still is an x64 context, so a
++     * crash log says where the thread stood (the TEB stack bounds tell a coroutine stack from a thread's). */
++    if (!first_chance && (context->ContextFlags & CONTEXT_AMD64) == CONTEXT_AMD64)
++    {
++        NT_TIB *tib = &NtCurrentTeb()->Tib;
++
++        ERR( "unhandled x64 exception %08lx flags %lx addr %p info0=%016I64x info1=%016I64x\n",
++             rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress,
++             (ULONG64)rec->ExceptionInformation[0], (ULONG64)rec->ExceptionInformation[1] );
++        ERR( " rip=%016I64x rsp=%016I64x rbp=%016I64x eflags=%08lx stack=%p-%p%s\n",
++             context->Rip, context->Rsp, context->Rbp, context->EFlags, tib->StackLimit, tib->StackBase,
++             (context->Rsp < (ULONG64)tib->StackLimit || context->Rsp > (ULONG64)tib->StackBase) ? " (rsp outside the TEB stack)" : "" );
++        ERR( " rax=%016I64x rbx=%016I64x rcx=%016I64x rdx=%016I64x\n", context->Rax, context->Rbx, context->Rcx, context->Rdx );
++        ERR( " rsi=%016I64x rdi=%016I64x  r8=%016I64x  r9=%016I64x\n", context->Rsi, context->Rdi, context->R8, context->R9 );
++        ERR( " r10=%016I64x r11=%016I64x r12=%016I64x r13=%016I64x\n", context->R10, context->R11, context->R12, context->R13 );
++        ERR( " r14=%016I64x r15=%016I64x mxcsr=%08lx\n", context->R14, context->R15, context->MxCsr );
++    }
+     context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     /* a debugger reads and sets the thread's debug registers at the event through the context the server keeps for
+      * it, which only brings back what it carries; one captured by native code (RtlRaiseException) has none yet */

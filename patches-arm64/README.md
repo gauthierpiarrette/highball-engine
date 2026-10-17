@@ -189,3 +189,8 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
   lock held; Shutdown drains them. `tests/mfmediaengine/mfdeadlock.c` reproduces the deadlock (DEADLOCK on the engine
   as shipped, OK with the patch). The code is platform-independent and belongs in `patches/` for the Intel line's next
   Wine 11 revision too.
+- `0041-ntdll-arm64ec-the-x64-state-on-an-unhandled-exception.patch`: when an unhandled exception from emulated x64
+  code is about to end the process (the second-chance NtRaiseException, the last point with an x64 context), the log
+  gets the exception's code, address and parameters, rip, rsp, rbp, eflags and the general registers, with the TEB
+  stack bounds and a note when rsp is outside them. Wine's own line names only the instruction; winedbg --auto is too
+  slow on a 25 GB process; +seh costs MSFS 2024 two to three times its loading time. First chances print nothing.
