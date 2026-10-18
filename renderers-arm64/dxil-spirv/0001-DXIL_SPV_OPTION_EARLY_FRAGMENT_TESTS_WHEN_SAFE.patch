@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 18 Oct 2026 13:45:00 +0200
+Subject: [PATCH] DXIL_SPV_OPTION_EARLY_FRAGMENT_TESTS_WHEN_SAFE
+
+The descriptor-QA rule for pixel shaders without instrumentation: EarlyFragmentTests
+when the shader has no side effects, no discard and does not write depth, stencil
+or the sample mask, where early and late tests give the same result. The caller
+enables it only for pipelines without alpha-to-coverage.
+---
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index 2e4a105..a04f506 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -6940,7 +6940,10 @@ bool Converter::Impl::emit_execution_modes_pixel()
+ 	auto flags = get_shader_flags(entry_point_meta);
+ 	bool early_depth_stencil = (flags & DXIL::ShaderFlagEarlyDepthStencil) != 0;
+ 
+-	if (options.descriptor_qa_enabled || options.instruction_instrumentation.enabled)
++	// early_fragment_tests_when_safe: the same rule without instrumentation, for pipelines where early and late
++	// tests cannot be told apart (the caller excludes alpha-to-coverage).
++	if (options.descriptor_qa_enabled || options.instruction_instrumentation.enabled ||
++	    options.early_fragment_tests_when_safe)
+ 	{
+ 		// If we have descriptor QA enabled, we will have side effects when running fragment shaders.
+ 		// This forces late-Z which can trigger some horrible performance issues.
+@@ -9603,6 +9606,11 @@ void Converter::Impl::set_option(const OptionBase &cap)
+ 		break;
+ 	}
+ 
++	case Option::EarlyFragmentTestsWhenSafe:
++		options.early_fragment_tests_when_safe =
++		    static_cast<const OptionEarlyFragmentTestsWhenSafe &>(cap).enable;
++		break;
++
+ 	default:
+ 		break;
+ 	}
+diff --git a/dxil_converter.hpp b/dxil_converter.hpp
+index 1a64868..9997159 100644
+--- a/dxil_converter.hpp
++++ b/dxil_converter.hpp
+@@ -273,6 +273,7 @@ enum class Option : uint32_t
+ 	ViewInstancing = 49,
+ 	MixedDotProduct = 50,
+ 	ComputeShaderDerivativesQuad = 51,
++	EarlyFragmentTestsWhenSafe = 52,
+ 	Count
+ };
+ 
+@@ -874,6 +875,16 @@ struct OptionComputeShaderDerivativesQuad : OptionBase
+ 	bool supports_quad = false;
+ };
+ 
++struct OptionEarlyFragmentTestsWhenSafe : OptionBase
++{
++	OptionEarlyFragmentTestsWhenSafe()
++		: OptionBase(Option::EarlyFragmentTestsWhenSafe)
++	{
++	}
++
++	bool enable = false;
++};
++
+ struct DescriptorTableEntry
+ {
+ 	ResourceClass type;
+diff --git a/dxil_spirv_c.cpp b/dxil_spirv_c.cpp
+index 111fb93..b71018d 100644
+--- a/dxil_spirv_c.cpp
++++ b/dxil_spirv_c.cpp
+@@ -1482,6 +1482,16 @@ dxil_spv_result dxil_spv_converter_add_option(dxil_spv_converter converter, cons
+ 		break;
+ 	}
+ 
++	case DXIL_SPV_OPTION_EARLY_FRAGMENT_TESTS_WHEN_SAFE:
++	{
++		OptionEarlyFragmentTestsWhenSafe helper;
++		auto *eft = reinterpret_cast<const dxil_spv_option_early_fragment_tests_when_safe *>(option);
++		helper.enable = eft->enable == DXIL_SPV_TRUE;
++
++		converter->options.emplace_back(duplicate(helper));
++		break;
++	}
++
+ 	default:
+ 		return DXIL_SPV_ERROR_UNSUPPORTED_FEATURE;
+ 	}
+diff --git a/dxil_spirv_c.h b/dxil_spirv_c.h
+index e5fa278..8804420 100644
+--- a/dxil_spirv_c.h
++++ b/dxil_spirv_c.h
+@@ -484,6 +484,7 @@ typedef enum dxil_spv_option
+ 	DXIL_SPV_OPTION_VIEW_INSTANCING = 49,
+ 	DXIL_SPV_OPTION_MIXED_FLOAT_DOT_PRODUCT = 50,
+ 	DXIL_SPV_OPTION_COMPUTE_SHADER_DERIVATIVES_QUAD = 51,
++	DXIL_SPV_OPTION_EARLY_FRAGMENT_TESTS_WHEN_SAFE = 52,
+ 	DXIL_SPV_OPTION_INT_MAX = 0x7fffffff
+ } dxil_spv_option;
+ 
+@@ -869,6 +870,15 @@ typedef struct dxil_spv_option_compute_shader_derivatives_quad
+ 	dxil_spv_bool supports_quad;
+ } dxil_spv_option_compute_shader_derivatives_quad;
+ 
++/* EarlyFragmentTests on a pixel shader with no side effects, no discard and no depth, stencil or coverage output,
++ * where early and late tests give the same result. The caller enables it only for pipelines without
++ * alpha-to-coverage, the one pipeline state that tells them apart for such a shader. */
++typedef struct dxil_spv_option_early_fragment_tests_when_safe
++{
++	dxil_spv_option_base base;
++	dxil_spv_bool enable;
++} dxil_spv_option_early_fragment_tests_when_safe;
++
+ /* Gets the ABI version used to build this library. Used to detect API/ABI mismatches. */
+ DXIL_SPV_PUBLIC_API void dxil_spv_get_version(unsigned *major, unsigned *minor, unsigned *patch);
+ 
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index caa83de..9f8a789 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -743,6 +743,7 @@ struct Converter::Impl
+ 		bool supports_float16_denorm_preserve = false;
+ 		bool supports_float64_denorm_preserve = false;
+ 		bool strict_helper_lane_waveops = true;
++		bool early_fragment_tests_when_safe = false;
+ 		bool nv_subgroup_partition_enabled = false;
+ 		// Assumed by default in earlier code, so avoid surprises if dxil-spirv
+ 		// is updated on its own.
