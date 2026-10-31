@@ -126,10 +126,10 @@ index b06ea92..8461482 100644
      {
          const THREAD_NAME_INFORMATION *info = data;
 diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
-index 2fe3ef2..f29d64c 100644
+index 2fe3ef2..bbcd4b2 100644
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
-@@ -274,6 +274,46 @@ static inline BOOL use_aslr(void)
+@@ -274,6 +274,45 @@ static inline BOOL use_aslr(void)
   * Code inside PE images stays read-execute; a mixed 16K page flips the same way. */
  #define HB_JIT 1
  #include <pthread.h>
@@ -165,8 +165,7 @@ index 2fe3ef2..f29d64c 100644
 +        view->protect |= VPROT_HB_MAPJIT_DONE;
 +        return 0;
 +    }
-+    WARN( "MAP_JIT remap of %p-%p gave %p
-+", base, (char *)base + size, ptr );
++    WARN( "MAP_JIT remap of %p-%p gave %p\n", base, (char *)base + size, ptr );
 +    if (ptr != MAP_FAILED) munmap( ptr, size );
 +    view->protect &= ~VPROT_HB_MAPJIT;
 +    if (mmap( base, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 ) == MAP_FAILED)
@@ -176,7 +175,7 @@ index 2fe3ef2..f29d64c 100644
  struct jit_range { char *base; size_t size; };
  static struct jit_range jit_ranges[2048];
  static unsigned int jit_count;
-@@ -2090,6 +2130,11 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+@@ -2090,6 +2129,11 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
      if ((unix_prot & PROT_EXEC) && (unix_prot & PROT_WRITE))
      {
          struct file_view *view = find_view( base, 0 );
@@ -188,7 +187,7 @@ index 2fe3ef2..f29d64c 100644
          if (view && (view->protect & SEC_IMAGE)) unix_prot &= ~PROT_WRITE;  /* image code: read-execute, writes flip the page */
          else if (is_jit_addr( base )) return 0;                              /* already a W^X range, keep its current state */
          else return make_jit_range( base, size );
-@@ -4857,6 +4902,18 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4857,6 +4901,18 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
      vprot = get_host_page_vprot( page );
  
  #ifdef HB_JIT
@@ -207,7 +206,7 @@ index 2fe3ef2..f29d64c 100644
      if (!(vprot & VPROT_GUARD) && is_jit_addr( addr ) &&
          (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT))
      {
-@@ -5407,8 +5464,20 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
+@@ -5407,8 +5463,20 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
  
              if (vprot & VPROT_WRITECOPY) status = STATUS_INVALID_PAGE_PROTECTION;
              else if (is_dos_memory) status = allocate_dos_memory( &view, vprot );
