@@ -105,7 +105,7 @@
     "name": "Vulkan headers, for building the loader only, Apache-2.0",
     "repo": "https://github.com/KhronosGroup/Vulkan-Headers.git",
     "tag": "v1.4.363",
-    "commit": "7feeb71f59b8c1531ef5f7bb4b36e1aac46a0acb"
+    "commit": "6802bb4733b63ed5efd3adb308a6c885ef180ea1"
   },
   "spirv-cross": {
     "name": "SPIRV-Cross (SPIR-V to Metal Shading Language, inside MoltenVK), Apache-2.0",
