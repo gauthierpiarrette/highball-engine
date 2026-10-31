@@ -17,6 +17,11 @@ with two sets of patches, applied in this order:
   - `0005` `HB_PRESENT_PACE_FPS` presents through Metal's minimum duration, so a capped game reaches the panel evenly.
   - `0006` a disk shader cache: the driver saved none, so every start compiled every shader again. A loaded shader keeps
     its program choice, which keeps its compile off the render thread.
+  - `0007` `HB_KK_IGNORE_MINMAX=1` treats a sampler with a min/max reduction as an ordinary one on GPUs before Apple10,
+    which have no such reduction in hardware. One such sampler written into vkd3d-proton's descriptor heap sends every
+    later draw to programs that emulate it in the shader, and Forza Horizon 6 creates one as its world loads: on a base
+    M4 that cost a burst of stalls on the first drive, 6.2 s against 0.4 s without it, with no difference seen in the
+    picture.
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.
