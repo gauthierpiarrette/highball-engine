@@ -1,0 +1,32 @@
+From: Tarik Caramanico <tarikcaramanico@gmail.com>
+Subject: [PATCH] ARM64EC: bound native call redirection to the 32-bit table size
+
+Backport upstream FEX commits:
+  4dbb046d62c57639fd93d433bb64896df7332ff0
+  3a2b1c0b438fed5062bebff0c5f7c8e21879fe48
+
+NtDllRedirectionLUTSize is uint32_t. A 64-bit load includes the adjacent
+four bytes in the bound, and the valid offsets exclude the size itself.
+Load the declared width and reject offsets greater than or equal to it.
+
+An isolated process calling the runtime's actual CheckCall routine with
+controlled table entries gives 2 pass / 2 fail before, 4 / 0 after in both
+validation modes. The probe restores all original runtime variables
+before returning to x64 code. This does not establish game compatibility.
+
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 754511c..8ed5976 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -163,9 +163,9 @@ DIRECT_SYSCALL_WRAPPER("#NtProtectVirtualMemoryNative", WineNtProtectVirtualMemo
+   subs x16, x11, x9
+   b.lo end
+   adrp x17, NtDllRedirectionLUTSize
+-  ldr x17, [x17, #:lo12:NtDllRedirectionLUTSize]
++  ldr w17, [x17, #:lo12:NtDllRedirectionLUTSize]
+   cmp x16, x17
+-  b.hi end
++  b.hs end
+   adrp x17, NtDllRedirectionLUT
+   ldr x17, [x17, #:lo12:NtDllRedirectionLUT]
+   ldr w11, [x17, x16, lsl #2]

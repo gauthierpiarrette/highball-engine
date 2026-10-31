@@ -1,0 +1,90 @@
+ARM64EC: Report guest protection boundaries to Wine's memory query.
+
+Write traps split a physically writable code allocation into RX and RWX
+regions; adjacent real RX pages can also join the trapped pages. Adjusting
+only MEMORY_BASIC_INFORMATION.Protect leaves incorrect RegionSize values.
+Expose an optional hook that adjusts protection and clamps the physical
+region at the next writable-code or DEP-promotion interval boundary.
+Keep the existing nonblocking lock rule and the old scalar export.
+
+Paired with Wine 0047. tests/x64-fidelity/regiontest.c checks every page
+before/after execution, then genuine RX and decommit boundaries. M4 control:
+78 pass / 82 fail; paired correction 160/0, in normal and full validation.
+The x64 Wine control gives 160/0. Native Windows references and FH6 gameplay
+remain pending. No JIT code generation changes or cache-format change.
+
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -67,6 +67,9 @@
+   // page (read-execute, or read-only for a DEP-promoted one) reads back as the program's own protection. Never blocks
+   // (ntdll calls it while the program queries memory, maybe while this tracker's lock is held elsewhere).
+   ULONG GuestProtection(uint64_t Address, ULONG Prot);
++  // Adjust one physical memory region, stopping at the next guest-protection boundary.
++  // Never blocks, like GuestProtection; false leaves both outputs unchanged.
++  bool GuestProtectionRange(uint64_t Address, ULONG& Prot, SIZE_T& Size);
+ 
+ private:
+   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -676,6 +676,30 @@
+   return Prot;
+ }
+ 
++bool InvalidationTracker::GuestProtectionRange(uint64_t Address, ULONG& Prot, SIZE_T& Size) {
++  std::shared_lock Lock(IntervalsLock, std::try_to_lock);
++  if (!Lock.owns_lock()) {
++    return false;
++  }
++  if (SMCDetectionDisabled) {
++    return true;
++  }
++
++  const auto RWX = RWXIntervals.Query(Address);
++  const auto DEP = DEPPromotedIntervals.Query(Address);
++  if (RWX.Size) {
++    Size = std::min<uint64_t>(Size, RWX.Size);
++  }
++  if (DEP.Size) {
++    Size = std::min<uint64_t>(Size, DEP.Size);
++  }
++  constexpr ULONG Modifiers = PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
++  if (RWX.Enclosed && (Prot & ~Modifiers) == GetTrapProt(Address)) {
++    Prot = GetUntrapProt(Address) | (Prot & Modifiers);
++  }
++  return true;
++}
++
+ bool InvalidationTracker::MemoryCallCannotConcernCode(uint64_t Address, uint64_t Size, ULONG Prot, bool Fresh) {
+   if (ProtHasExec(Prot) || (!Fresh && Size == 0)) {
+     return false;
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1518,6 +1518,12 @@
+   return InvalidationTracker->GuestProtection(reinterpret_cast<uint64_t>(Address), Prot);
+ }
+ 
++// Optional ntdll query hook: report guest protections and their next boundary.
++BOOL GuestProtectionRange(void* Address, ULONG* Prot, SIZE_T* Size) {
++  return !InvalidationTracker ||
++         InvalidationTracker->GuestProtectionRange(reinterpret_cast<uint64_t>(Address), *Prot, *Size);
++}
++
+ // Not part of the Windows emulator interface. The calling thread's x87 state, for ntdll's RtlCaptureContext and setjmp,
+ // which run as native code and cannot read it: x64 Windows captures the live control word and RtlRestoreContext and
+ // longjmp load it back, so a made up one would reset the precision and rounding of every program that unwinds an
+--- a/Source/Windows/ARM64EC/BTInterface.h
++++ b/Source/Windows/ARM64EC/BTInterface.h
+@@ -28,4 +28,5 @@
+ BOOL STDMETHODCALLTYPE GetX64Mxcsr(UINT32* Mxcsr);
+ BOOL STDMETHODCALLTYPE SetX64Mxcsr(UINT32 Mxcsr);
+ ULONG STDMETHODCALLTYPE GuestProtection(void* Address, ULONG Prot);
++BOOL STDMETHODCALLTYPE GuestProtectionRange(void* Address, ULONG* Prot, SIZE_T* Size);
+ }
+--- a/Source/Windows/ARM64EC/libarm64ecfex.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex.def
+@@ -26,3 +26,4 @@
+   GetX64Mxcsr
+   SetX64Mxcsr
+   GuestProtection
++  GuestProtectionRange

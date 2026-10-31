@@ -1,0 +1,81 @@
+ntdll: Prefer high addresses for Windows top-down allocations on arm64 macOS.
+
+The arm64 loader reserves only the low PAGEZERO area. Searching reserved
+areas first puts FEX's large allocator reservations immediately above PE
+images, exhausting the limited space for nearby generated code. Search
+free addresses above 4 GB first for Windows MEM_TOP_DOWN requests, respecting
+the caller's bounds and alignment. Retain reserved-area fallback, explicit
+address handling and allocations constrained below 4 GB.
+
+Keep Wine's internal mapping policy: moving its native syscall/first-thread
+stack to the top of the address space caused posix_spawn to fail with EFAULT
+in the M4 test. This policy change belongs at the Windows allocation API.
+
+Regression: tests/x64-fidelity/topdown.c compares an unbounded top-down
+allocation against a known available high range and checks low bounds.
+
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2235,9 +2235,10 @@
+  * Create a view and mmap the corresponding memory area.
+  * virtual_mutex must be held by caller.
+  */
+-static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
+-                          unsigned int alloc_type, unsigned int vprot,
+-                          ULONG_PTR limit_low, ULONG_PTR limit_high, size_t align_mask )
++static NTSTATUS map_view_ex( struct file_view **view_ret, void *base, size_t size,
++                             unsigned int alloc_type, unsigned int vprot,
++                             ULONG_PTR limit_low, ULONG_PTR limit_high, size_t align_mask,
++                             BOOL prefer_high )
+ {
+     int top_down = alloc_type & MEM_TOP_DOWN;
+     void *ptr;
+@@ -2294,6 +2295,19 @@
+ 
+         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
+         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
++
++#if defined(__APPLE__) && defined(__aarch64__)
++        /* The arm64 loader reserves only low memory. Windows top-down requests
++         * must search high addresses before consuming the space near PE images.
++         * Internal Wine mappings retain their existing placement policy. */
++        if (prefer_high && top_down && end > (void *)limit_4g &&
++            (ptr = map_free_area( max( start, (void *)limit_4g ), end, host_size,
++                                  top_down, unix_prot, align_mask )))
++        {
++            TRACE( "got top-down mem above 4GB %p-%p\n", ptr, (char *)ptr + size );
++            goto done;
++        }
++#endif
+ 
+         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
+         {
+@@ -2330,6 +2344,17 @@
+     status = create_view( view_ret, ptr, size, vprot );
+     if (status != STATUS_SUCCESS) unmap_area( ptr, size );
+     return status;
++}
++
++
++/* Wine's own mappings also use MEM_TOP_DOWN, notably its native signal and
++ * syscall stacks. Keep their reserved-area preference separate from the API. */
++static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
++                          unsigned int alloc_type, unsigned int vprot,
++                          ULONG_PTR limit_low, ULONG_PTR limit_high, size_t align_mask )
++{
++    return map_view_ex( view_ret, base, size, alloc_type, vprot, limit_low, limit_high,
++                        align_mask, FALSE );
+ }
+ 
+ 
+@@ -5224,8 +5249,8 @@
+ 
+             if (vprot & VPROT_WRITECOPY) status = STATUS_INVALID_PAGE_PROTECTION;
+             else if (is_dos_memory) status = allocate_dos_memory( &view, vprot );
+-            else status = map_view( &view, base, size, type, vprot, limit_low, limit_high,
+-                                    align ? align - 1 : granularity_mask );
++            else status = map_view_ex( &view, base, size, type, vprot, limit_low, limit_high,
++                                       align ? align - 1 : granularity_mask, TRUE );
+ 
+             if (status == STATUS_SUCCESS)
+             {

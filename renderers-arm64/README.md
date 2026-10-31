@@ -47,6 +47,16 @@ vkd3d-proton or DXVK yet.
   float16 denorm preservation nor an independent denorm behaviour (MoltenVK and KosmicKrisp on Apple GPUs). Without
   it, games that use 16-bit operations without checking the cap lose those pipelines (16 compute pipelines per
   Microsoft Flight Simulator 2024 run). Float16 denormals may flush with it. Off unless the flag is set.
+- `0009` experimental reserved-resource fallback on devices without sparse binding, including buffers. Extends
+  the existing committed fallback used for unsupported sparse image formats. It commits the whole allocation
+  and ignores tile mappings; it does not implement residency or tile aliasing. The standalone reserved-buffer
+  probe changes from 2 pass / 1 fail to 4 / 0, and FH6 gets past its FHE21 resource-creation error. Gameplay
+  validation is still pending. Number 0008 is reserved for the r6 early-fragment patch on the renderer branch.
+- `0010` limit the companion texel view for raw/structured buffers backed by an SSBO. A full 2 GB raw view in FH6
+  exceeded MoltenVK's texel limit and triggered a Metal assertion. The SSBO descriptor and byte bounds retain
+  the full range; actual typed buffers are unchanged. `tests/vkd3d-reserved/large-raw-buffer.c` reproduces the
+  assertion on the control and passes all 35 checks with the patch, including raw and structured GPU reads
+  through the last word of 2 GB. Oversized actual typed views and type aliasing beyond the limit remain unsupported.
 
 ### DXVK (master of 2026-10-09, 1cad6cd)
 

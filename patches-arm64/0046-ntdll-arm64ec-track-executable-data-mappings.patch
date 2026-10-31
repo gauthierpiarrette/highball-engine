@@ -1,0 +1,41 @@
+ntdll: Notify the ARM64EC emulator about non-image section protections.
+
+New executable data-section mappings were absent from FEX's executable
+intervals: VirtualQuery reported PAGE_EXECUTE_READ, but the first call
+faulted as non-executable. The map helper only reached its notification
+path during image loading, and then only for image sections.
+
+Report successful non-image mappings through the existing paired memory
+protection callbacks. Keep loader-only image notifications unchanged.
+Both NtMapViewOfSection and NtMapViewOfSectionEx use this helper. No new
+emulator export or game-specific behavior is required.
+
+Regression: tests/x64-fidelity/memtest.c, code.mapped_alias_flush.
+M4 control: 50 pass / 1 fail, execute AV on the first call.
+Patched: 51/0 in normal and full validation modes; context 546/0.
+Native Windows reference and FH6 gameplay verification remain pending.
+
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -834,9 +834,20 @@
+     SECTION_IMAGE_INFORMATION info;
+     NTSTATUS status;
+ 
++    if (!pNotifyMapViewOfSection && !pNotifyMemoryProtect) return;
++    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL ))
++    {
++        /* Data-section mappings can also contain x64 code. They do not receive
++         * image notifications; report their protection to the emulator. */
++        if (pNotifyMemoryProtect)
++        {
++            pNotifyMemoryProtect( addr, size, protect, FALSE, 0 );
++            pNotifyMemoryProtect( addr, size, protect, TRUE, STATUS_SUCCESS );
++        }
++        return;
++    }
+     if (!pNotifyMapViewOfSection) return;
+     if (!NtCurrentTeb()->Tib.ArbitraryUserPointer) return;
+-    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL )) return;
+     status = pNotifyMapViewOfSection( NULL, addr, NULL, size, alloc, protect );
+     if (NT_SUCCESS(status)) return;
+     NtUnmapViewOfSection( GetCurrentProcess(), addr );

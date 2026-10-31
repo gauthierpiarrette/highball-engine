@@ -1,0 +1,41 @@
+JIT: Compare the initialized CRC accumulator for empty code entries.
+
+A failed decode can produce a zero-length entry. ValidateCode initializes
+its accumulator to zero but only writes TMP1 for nonempty code. Comparing
+TMP1 unconditionally repeatedly invalidates the empty entry. Compare the
+actual accumulator, preserving all nonempty behavior. Bump the disk-cache
+version so previously generated validation code is discarded.
+
+Regression: tests/x64-fidelity/memtest.c with FEX_SMCCHECKS=full and
+FEX_DISKCACHE=0. Before: hangs at access.noaccess.execute, even with 0025.
+After: 51 pass / 0 fail with Wine's mapped-execute correction; 50/0 with
+the earlier 50-check test. Normal mode has the same result. FH6 still
+exits during startup under full validation; this is not a game fix.
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index ab0264d..0b43365 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -249,7 +249,7 @@ namespace DiskCache {
+   // The current version of the diskcache.
+   // This must be changed any time codegen changes occur!
+   // Be aware of the impact of changing this frequently!
+-  static constexpr uint16_t FormatVersion = 30;
++  static constexpr uint16_t FormatVersion = 31;
+ 
+   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index c2b1d8e..116de5d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -362,7 +362,8 @@ DEF_OP(ValidateCode) {
+     WorkingReg = TMP1;
+   }
+ 
+-  sub(ARMEmitter::Size::i32Bit, Dst, TMP1, CRC32Reg);
++  // Empty decode entries have a zero CRC; TMP1 is only initialized for nonempty code.
++  sub(ARMEmitter::Size::i32Bit, Dst, WorkingReg, CRC32Reg);
+ 
+   ARMEmitter::ForwardLabel End;
+   cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &End);

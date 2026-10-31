@@ -1,0 +1,26 @@
+ARM64EC: Disable native memory callbacks while invalidating guest code.
+
+Full SMC validation can invalidate code directly from the JIT. Erasing
+cached translations frees FEX metadata through ntdll, whose memory-free
+notifications otherwise reenter the tracker while its code lock is held.
+Use the existing scoped callback guard around this internal operation.
+
+Independent M4 repro: rewrite executable code through a writable alias,
+with full validation and the empty-code CRC fix. Without this guard the
+second call hangs in NtWaitForAlertByThreadId; with it, 1,000 rewrites
+complete with zero stale calls. No FH6 gameplay claim.
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 2312437..90200d6 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -821,6 +821,9 @@ public:
+   }
+ 
+   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
++    // Removing cached translations can free FEX's own metadata. Do not reenter
++    // the invalidation tracker through ntdll while its code-cache lock is held.
++    ScopedCallbackDisable Guard;
+     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+   }
+ 

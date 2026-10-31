@@ -1,0 +1,28 @@
+ntdll: Preserve guard faults in ARM64 macOS W^X handling.
+
+The W^X fault fast path runs before normal guard-page handling. An executable
+writable guard page therefore accepted writes while retaining PAGE_GUARD,
+instead of reporting the one-shot write exception. Let guard accesses reach
+the existing guard/stack-growth handling before flipping host permissions.
+
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4857,7 +4857,8 @@
+     vprot = get_host_page_vprot( page );
+ 
+ #ifdef HB_JIT
+-    if (is_jit_addr( addr ) && (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT))
++    if (!(vprot & VPROT_GUARD) && is_jit_addr( addr ) &&
++        (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT))
+     {
+         int prot = (err == EXCEPTION_WRITE_FAULT) ? PROT_READ | PROT_WRITE : PROT_READ | PROT_EXEC;
+         mprotect( page, host_page_size, prot );
+@@ -4868,7 +4869,7 @@
+ #ifdef HB_JIT
+     /* a 16K host page holding both code and writable data (4K-aligned PE sections) cannot be RWX on
+      * arm64 macOS: flip it between read-write and read-execute on each kind of fault */
+-    if (!is_jit_addr( addr ) && is_vprot_exec_write( vprot ) &&
++    if (!(vprot & VPROT_GUARD) && !is_jit_addr( addr ) && is_vprot_exec_write( vprot ) &&
+         (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT))
+     {
+         int prot = (err == EXCEPTION_WRITE_FAULT) ? PROT_READ | PROT_WRITE : PROT_READ | PROT_EXEC;
