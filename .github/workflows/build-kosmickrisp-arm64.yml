@@ -10,6 +10,7 @@ on:
   push:
     paths:
       - "kosmickrisp-arm64/**"
+      - "inputs-arm64.json"
       - ".github/workflows/build-kosmickrisp-arm64.yml"
   workflow_dispatch:
     inputs:
