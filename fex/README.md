@@ -193,3 +193,9 @@ The Wine half is `patches-arm64/0022` to `0029` and `0043`. A one-line summary o
 
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.
+
+`0033` holds the opt-in switches for programs that keep rewriting their own code, each off unless its variable is set: its
+header lists them. Many of its counters under `FEX_PROFILESTATS` reuse existing slots of the shared statistics and are
+for diagnosis only. With Wine `0052` it takes Forza Horizon 6's copy protection from a stall of about 100 ms every 1.1 s
+to none over 80 ms on a base M4 (2026-10-31). `0024` to `0032` apply to every program, and the notes above were written
+as each was found: the game now plays to free roam and exits normally with the whole series.

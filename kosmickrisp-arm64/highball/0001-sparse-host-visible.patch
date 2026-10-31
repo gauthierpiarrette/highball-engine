@@ -1,0 +1,15 @@
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1227,11 +1227,8 @@
+    };
+    pdev->host_visible_mem_types = BITFIELD_BIT(host_visible_idx);
+ 
+-   /* Sparse resources map 64 KiB pages of placement heaps. Host-visible
+-    * memory may be a host pointer import (virglrenderer imports all of it),
+-    * which has no heap, so sparse resources only bind the device-local type. */
+    if (pdev->info.placement_sparse)
+-      pdev->sparse_mem_types = BITFIELD_BIT(0);
++      pdev->sparse_mem_types = BITFIELD_MASK(pdev->mem_type_count);
+ 
+    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
+    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));

@@ -1,0 +1,81 @@
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1000,6 +1000,12 @@
+    STATIC_ASSERT(BLAKE3_KEY_LEN >= VK_UUID_SIZE);
+    memcpy(pdev->vk.properties.pipelineCacheUUID, blake3, VK_UUID_SIZE);
+    memcpy(pdev->vk.properties.shaderBinaryUUID, blake3, VK_UUID_SIZE);
++
++#ifdef ENABLE_SHADER_CACHE
++   char timestamp[BLAKE3_HEX_LEN];
++   _mesa_blake3_format(timestamp, blake3);
++   pdev->vk.disk_cache = disk_cache_create("kk_metal", timestamp, 0);
++#endif
+ }
+ 
+ static void
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -412,6 +412,15 @@
+       dev->has_queue = true;
+    }
+ 
++   struct vk_pipeline_cache_create_info cache_info = {
++      .weak_ref = true,
++   };
++   dev->vk.mem_cache = vk_pipeline_cache_create(&dev->vk, &cache_info, NULL);
++   if (dev->vk.mem_cache == NULL) {
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      goto fail_queue;
++   }
++
+    result = kk_device_init_meta(dev);
+    if (result != VK_SUCCESS)
+       goto fail_mem_cache;
+@@ -448,6 +457,8 @@
+ fail_meta:
+    kk_device_finish_meta(dev);
+ fail_mem_cache:
++   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
++fail_queue:
+    if (dev->has_queue) {
+       kk_queue_finish(dev, &dev->queue);
+       dev->has_queue = false;
+@@ -496,6 +507,8 @@
+       kk_queue_finish(dev, &dev->queue);
+       dev->has_queue = false;
+    }
++
++   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+ 
+    /* Release the residency set last once all BOs are released. */
+    mtl_release(dev->residency_set.handle);
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -59,6 +59,7 @@
+    /* VS or CS with a minmax program: descriptor sets whose reduction samplers
+     * need it (kk_compile_programs) */
+    uint32_t minmax_sets;
++   bool minmax_first;
+ 
+    union {
+       /* Vertex shader is the pipeline, store all relevant data here. */
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -2283,6 +2283,7 @@
+       minmax_sets && kk_minmax_layouts_used(minmax_sets,
+                                             infos[0].set_layout_count,
+                                             infos[0].set_layouts);
++   s->info.minmax_first = minmax_first;
+    struct kk_program_job job = {.dev = dev, .s = s};
+    thrd_t thread;
+    const bool threaded =
+@@ -2501,8 +2502,7 @@
+    /* Without the pipeline's set layouts: the minmax program first once any
+     * set got a reduction sampler */
+    if (info.stage == MESA_SHADER_COMPUTE || info.stage == MESA_SHADER_VERTEX)
+-      result = kk_compile_programs(
+-         dev, shader, p_atomic_read(&dev->reduction_sampler_sets));
++      result = kk_compile_programs(dev, shader, info.minmax_first);
+ 
+    if (result != VK_SUCCESS)
+       goto fail;

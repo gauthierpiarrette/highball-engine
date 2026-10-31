@@ -88,6 +88,25 @@
     "commit": "db66022459ffb663aa2b50f6b018bc2e124f5edf",
     "note": "The base of every MSFS 2024 run on the arm64 engine (the gin19 builds, 2026-10-11 and 12). Highball's changes are moltenvk-arm64/moltenvk, built by build-moltenvk-arm64.yml."
   },
+  "mesa": {
+    "name": "Mesa (KosmicKrisp, its Vulkan driver on Metal 4), MIT",
+    "repo": "https://gitlab.freedesktop.org/mesa/mesa.git",
+    "commit": "ce576c29ed90822ea15564e1e60cb48e455881bb",
+    "note": "Mesa main of 2026-10-05, the base of steamac's series in kosmickrisp-arm64/steamac. Highball's changes are kosmickrisp-arm64/highball."
+  },
+  "Vulkan-Loader": {
+    "name": "Khronos Vulkan loader, Apache-2.0",
+    "repo": "https://github.com/KhronosGroup/Vulkan-Loader.git",
+    "tag": "v1.4.363",
+    "commit": "9e9518d2cf00054a220ae1a40f4406804b420ef5",
+    "note": "Opens KosmicKrisp for Wine's winevulkan, as libMoltenVK.dylib in engine/lib. The version every Forza Horizon 6 run used (Homebrew's build of it)."
+  },
+  "Vulkan-Headers": {
+    "name": "Vulkan headers, for building the loader only, Apache-2.0",
+    "repo": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+    "tag": "v1.4.363",
+    "commit": "7feeb71f59b8c1531ef5f7bb4b36e1aac46a0acb"
+  },
   "spirv-cross": {
     "name": "SPIRV-Cross (SPIR-V to Metal Shading Language, inside MoltenVK), Apache-2.0",
     "repo": "https://github.com/KhronosGroup/SPIRV-Cross.git",

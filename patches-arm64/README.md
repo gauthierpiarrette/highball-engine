@@ -316,3 +316,17 @@ Syscall245/0, context546/0, memory53/0 and fibers86/0 pass in normal/full modes.
 title, completes Xbox sign-in and reaches the main menu and shader optimization on M4. One prototype
 repeat stalls during saved-account loading; the reproducible patch build subsequently loads the cached
 account, cloud save and main menu. Driving, a complete repeat and the same-build control remain pending. This is not a verified ARM64 compatibility claim or a published engine.
+
+`0052` makes two opt-in switches for programs that rewrite their own code all the time. `HB_FEX_MAPJIT=1` maps the
+emulator's code buffers MAP_JIT and lets the emulator flip its own thread between writing and executing
+(ThreadHbJitWrite, class 0x7fe of NtSetInformationThread), with no W^X page flips. `HB_DIRECT_CONTINUE=1` continues
+emulated code straight from the syscall instead of through a signal. Both are off unless set.
+
+### Forza Horizon 6
+
+`0044` to `0052` with FEX `0024` to `0033`, vkd3d-proton `0008` to `0010` and KosmicKrisp (`kosmickrisp-arm64/`) play Forza
+Horizon 6 on a base M4 with 32 GB, macOS 27.0, with the switches in highball-db's recipe: intro, Xbox sign-in, menus, free
+roam and normal exit, many sessions between 2026-10-29 and 2026-10-31. The stall of about 100 ms every 1.1 s from its copy
+protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the panel showed 8995 of 8997 frames at an even
+2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
+from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.
