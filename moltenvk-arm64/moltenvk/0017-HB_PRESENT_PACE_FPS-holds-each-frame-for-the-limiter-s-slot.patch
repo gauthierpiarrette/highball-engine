@@ -1,0 +1,50 @@
+HB_PRESENT_PACE_FPS=N keeps every presented frame on screen for at least 1/N s (presentAfterMinimumDuration).
+
+A game held at N frames per second by a limiter (VKD3D_FRAME_RATE, DXVK_FRAME_RATE, the app's Frame rate cap)
+still reaches the panel unevenly: the limiter sleeps to the period but nothing aligns the present to vsync, so
+a frame that finishes past a boundary shows after 3 vsyncs and the next one after 1. Measured with a
+ScreenCaptureKit recorder on the M4 (Forza Horizon 6 on the arm64 line, 1080p, GPU-bound at 31 ms a frame,
+60 Hz panel): uncapped ~36 fps, the interval between displayed frames changed 69% of the time; VKD3D_FRAME_RATE=30,
+74% of intervals at 2 vsyncs and 36% changes; with Metal holding each frame for 1/30 s, 98.3% at exactly
+2 vsyncs and 1.5% changes over 8 minutes of driving (2026-10-31, gin private/notes/fh6-arm64-current.md).
+That measurement is the same change in Mesa's Metal WSI (KosmicKrisp); this is its MoltenVK form, compiled
+by CI and not yet measured at runtime. Off by default; the app sets it with the Frame rate cap once a shipped
+renderer reads it, N should divide the refresh rate, and a desiredPresentTime from VK_GOOGLE_display_timing
+keeps precedence.
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index ef8ca60..d79517d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -1635,11 +1635,19 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 	return _mtlTextureHeadless ? _mtlTextureHeadless : getCAMetalDrawable().texture;
+ }
+ 
++// Highball pacing: the minimum time a frame stays on screen, from HB_PRESENT_PACE_FPS (0 = Metal's default).
++static double hbGetPresentMinDuration() {
++	static const char* hbPace = getenv("HB_PRESENT_PACE_FPS");
++	static double fps = hbPace ? atof(hbPace) : 0.0;
++	return fps > 0.0 ? 1.0 / fps : 0.0;
++}
++
+ // Present the drawable and make myself available only once the command buffer has completed.
+ // Pass MVKImagePresentInfo by value because it may not exist when the callback runs.
+ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffer> mtlCmdBuff,
+ 															  MVKImagePresentInfo presentInfo) {
+ 	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
++	double hbPresentMinDuration = hbGetPresentMinDuration();
+ 
+ 	// According to Apple, it is more performant to call MTLDrawable present from within a
+ 	// MTLCommandBuffer scheduled-handler than it is to call MTLCommandBuffer presentDrawable:.
+@@ -1658,6 +1666,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 		}
+ 		if (presentInfo.desiredPresentTime) {
+ 			[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
++		} else if (hbPresentMinDuration > 0.0) {
++			// Highball pacing: HB_PRESENT_PACE_FPS=N keeps every frame on screen for at least 1/N s, so a game
++			// held at N frames per second by a limiter lands on the same vsync slots each time (N a divisor of
++			// the refresh rate). A sleeping limiter alone leaves the frames 1, 2 or 3 vsyncs apart.
++			[mtlDrwbl presentAfterMinimumDuration: hbPresentMinDuration];
+ 		} else {
+ 			[mtlDrwbl present];
+ 		}
