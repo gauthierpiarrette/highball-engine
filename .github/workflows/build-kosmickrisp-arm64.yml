@@ -55,7 +55,7 @@ jobs:
       - name: tools
         run: |
           set -euo pipefail
-          brew install -q meson ninja pkgconf cmake llvm spirv-llvm-translator
+          brew install -q meson ninja pkgconf cmake llvm spirv-llvm-translator spirv-tools glslang
           python3 -m venv kk/venv
           kk/venv/bin/pip -q install "mako==1.3.10" "pyyaml==6.0.3" "packaging==25.0"
           echo "LLVM $(brew list --versions llvm), $(brew list --versions spirv-llvm-translator), $(xcodebuild -version | tr '\n' ' ')"
