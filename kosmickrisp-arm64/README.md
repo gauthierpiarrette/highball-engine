@@ -17,6 +17,12 @@ with two sets of patches, applied in this order:
   - `0005` `HB_PRESENT_PACE_FPS` presents through Metal's minimum duration, so a capped game reaches the panel evenly.
   - `0006` a disk shader cache: the driver saved none, so every start compiled every shader again. A loaded shader keeps
     its program choice, which keeps its compile off the render thread.
+  - `0007` frame time. An encoder's end barrier asks for Device visibility instead of ResourceAlias, unless a render
+    encoder ran an occlusion query (`HB_KK_ALIAS_BARRIERS=1` brings the old flush back): GPU time 26.7 to 24.4 ms in
+    Forza Horizon 6's benchmark on a base M4. `HB_KK_NO_UBO_ROBUST=1`, asked for per game, drops the bounds check on
+    constant buffer reads, 24.4 to 21 ms there, and null constant buffer descriptors then read a buffer of zeros. A read
+    past a bound constant buffer returns the memory after it instead of zero. Also 256 command buffer records, so
+    `MESA_KK_DEBUG=cbs` logs all of a frame's.
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.
