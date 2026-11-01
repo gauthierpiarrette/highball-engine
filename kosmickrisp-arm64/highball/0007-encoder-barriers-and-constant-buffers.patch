@@ -1,0 +1,222 @@
+--- a/src/kosmickrisp/bridge/mtl_encoder.h
++++ b/src/kosmickrisp/bridge/mtl_encoder.h
+@@ -15,6 +15,9 @@
+ void mtl_end_encoding(void *encoder);
+ void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+                               enum mtl_stages before_queue_stages);
++void mtl_barrier_after_stages_device(void *encoder,
++                                     enum mtl_stages after_stages,
++                                     enum mtl_stages before_queue_stages);
+ void mtl_barrier_after_encoder_stages(void *encoder,
+                                       enum mtl_stages after_stages,
+                                       enum mtl_stages before_queue_stages);
+--- a/src/kosmickrisp/bridge/mtl_encoder.m
++++ b/src/kosmickrisp/bridge/mtl_encoder.m
+@@ -36,6 +36,17 @@
+ }
+ 
+ void
++mtl_barrier_after_stages_device(void *encoder, enum mtl_stages after_stages,
++                                enum mtl_stages before_queue_stages)
++{
++   @autoreleasepool {
++      id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
++      [enc barrierAfterStages:(MTLStages)after_stages beforeQueueStages:(MTLStages)before_queue_stages
++           visibilityOptions:MTL4VisibilityOptionDevice];
++   }
++}
++
++void
+ mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
+                                  enum mtl_stages before_queue_stages)
+ {
+--- a/src/kosmickrisp/vulkan/kk_queue.h
++++ b/src/kosmickrisp/vulkan/kk_queue.h
+@@ -21,7 +21,7 @@
+ #include "util/simple_mtx.h"
+ 
+ #define KK_QUEUE_PENDING_WAITS 8u
+-#define KK_QUEUE_RECORDS       16u
++#define KK_QUEUE_RECORDS       256u
+ 
+ /* A commit's command buffer record and, once its feedback handler ran, its
+  * outcome */
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -570,6 +570,7 @@
+                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
+    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+    uint32_t oq_index = kk_pool_index_ptr(pool)[query];
++   cmd->state.gfx.occlusion.used = true;
+    cmd->state.gfx.occlusion.index = oq_index % KK_OQ_CHUNK_QUERIES;
+    cmd->state.gfx.occlusion.chunk = oq_index / KK_OQ_CHUNK_QUERIES;
+ }
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -100,6 +100,8 @@
+ 
+    struct vk_meta_device meta;
+ 
++   struct kk_bo *null_ubo;
++
+    /* Geomtry heap */
+    struct kk_bo *heap;
+    util_once_flag heap_init_once;
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -214,6 +214,16 @@
+    struct kk_descriptor_set_binding_layout *binding_layout =
+       &set->layout->binding[binding];
+    get_storage_image_view_desc(binding_layout, info, dst, dst_size);
++}
++
++static uint64_t
++kk_hb_buffer_addr(const struct kk_descriptor_set *set, uint64_t addr)
++{
++   if (addr != 0 || set->base.device == NULL)
++      return addr;
++   const struct kk_device *dev =
++      container_of(set->base.device, struct kk_device, vk);
++   return dev->null_ubo ? dev->null_ubo->gpu : 0;
+ }
+ 
+ static void
+@@ -228,7 +238,7 @@
+    assert(addr_range.range <= UINT32_MAX);
+ 
+    const struct kk_buffer_address desc = {
+-      .base_addr = addr_range.addr,
++      .base_addr = kk_hb_buffer_addr(set, addr_range.addr),
+       .size = addr_range.range,
+    };
+    write_desc(set, binding, elem, &desc, sizeof(desc));
+@@ -250,7 +260,7 @@
+    struct kk_buffer_address *desc =
+       &set->dynamic_buffers[binding_layout->dynamic_buffer_index + elem];
+    *desc = (struct kk_buffer_address){
+-      .base_addr = addr_range.addr,
++      .base_addr = kk_hb_buffer_addr(set, addr_range.addr),
+       .size = addr_range.range,
+    };
+ }
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -21,6 +21,8 @@
+ #include "kosmickrisp/bridge/mtl_encoder.h"
+ #include "kosmickrisp/bridge/vk_to_mtl_map.h"
+ 
++#include "util/u_debug.h"
++
+ #include "vk_alloc.h"
+ #include "vk_common_entrypoints.h"
+ #include "vk_format.h"
+@@ -529,12 +531,21 @@
+       cmd->metal.pre_gfx.cmd_buf = NULL;
+    }
+ }
++
++DEBUG_GET_ONCE_BOOL_OPTION(hb_alias_barriers, "HB_KK_ALIAS_BARRIERS", false)
+ 
+ static void
+ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+ {
+    /* TODO_KOSMICKRISP This is probably overkill */
+-   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   const bool is_render = encoder == cmd->metal.render;
++   if ((is_render && cmd->state.gfx.occlusion.used) ||
++       debug_get_option_hb_alias_barriers())
++      mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   else
++      mtl_barrier_after_stages_device(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   if (is_render)
++      cmd->state.gfx.occlusion.used = false;
+    mtl_end_encoding(encoder);
+    mtl_release(encoder);
+ 
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -419,6 +419,13 @@
+    if (dev->vk.mem_cache == NULL) {
+       result = VK_ERROR_OUT_OF_HOST_MEMORY;
+       goto fail_queue;
++   }
++
++   if (debug_get_bool_option("HB_KK_NO_UBO_ROBUST", false)) {
++      result = kk_alloc_bo(dev, &dev->vk.base, 65536u, 256u, &dev->null_ubo);
++      if (result != VK_SUCCESS)
++         goto fail_mem_cache;
++      memset(dev->null_ubo->cpu, 0, 65536u);
+    }
+ 
+    result = kk_device_init_meta(dev);
+@@ -499,6 +506,9 @@
+    kk_oq_heap_finish(dev, &dev->occlusion_queries);
+    kk_destroy_sampler_heap(dev, &dev->samplers);
+ 
++   if (dev->null_ubo)
++      kk_destroy_bo(dev, dev->null_ubo);
++
+    /* Geometry heap */
+    if (dev->heap)
+       kk_destroy_bo(dev, dev->heap);
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -7,6 +7,9 @@
+ 
+ #include "kk_shader.h"
+ 
++#include "util/u_debug.h"
++
++
+ #include "kk_cmd_buffer.h"
+ #include "kk_debug.h"
+ #include "kk_descriptor_set.h"
+@@ -165,13 +168,27 @@
+    .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2,
+ };
+ 
++DEBUG_GET_ONCE_BOOL_OPTION(hb_no_ubo_robust, "HB_KK_NO_UBO_ROBUST", false)
++
++static struct vk_pipeline_robustness_state
++kk_hb_robustness(const struct vk_pipeline_robustness_state *rs)
++{
++   struct vk_pipeline_robustness_state out = *rs;
++   if (debug_get_option_hb_no_ubo_robust())
++      out.uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
++   return out;
++}
++
+ static struct spirv_to_nir_options
+ kk_get_spirv_options(struct vk_physical_device *vk_pdev,
+                      UNUSED mesa_shader_stage stage,
+-                     const struct vk_pipeline_robustness_state *rs)
++                     const struct vk_pipeline_robustness_state *in_rs)
+ {
++   const struct vk_pipeline_robustness_state *rs = in_rs;
+    if (KK_DEBUG(FORCE_ROBUSTNESS))
+       rs = &rs_all_supported;
++   const struct vk_pipeline_robustness_state hb_rs = kk_hb_robustness(rs);
++   rs = &hb_rs;
+    return (struct spirv_to_nir_options){
+       .environment = NIR_SPIRV_VULKAN,
+       .ssbo_addr_format = kk_buffer_addr_format(rs->storage_buffers),
+@@ -816,6 +833,8 @@
+ 
+    if (KK_DEBUG(FORCE_ROBUSTNESS))
+       rs = &rs_all_supported;
++   const struct vk_pipeline_robustness_state hb_rs = kk_hb_robustness(rs);
++   rs = &hb_rs;
+ 
+    const nir_opt_access_options access_options = {
+       .is_vulkan = true,
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -180,6 +180,8 @@
+        * (hardware constraint).
+        */
+       uint32_t index;
++      bool used;
++
+       /* Chunk of the current occlusion query */
+       uint32_t chunk;
+       /* Chunk the render pass descriptor writes visibility results to */
