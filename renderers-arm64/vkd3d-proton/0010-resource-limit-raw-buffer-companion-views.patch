@@ -1,0 +1,39 @@
+vkd3d: Limit companion texel views for raw buffers backed by SSBOs.
+
+Without mutable descriptors, raw and structured buffer descriptors also get a
+texel view for type aliasing. A 2 GB raw view exceeds MoltenVK's texel limit,
+causing a Metal assertion even though shader access uses a full-range SSBO.
+Limit only this companion view when raw SSBO support is active. Preserve the
+storage-buffer descriptor and byte bounds; actual typed views are unchanged.
+This does not implement oversized typed buffers or undefined type aliasing
+beyond the device's texel limit.
+
+Regression: tests/vkd3d-reserved/large-raw-buffer.c creates 2 GB raw/structured
+views and checks GPU reads through both at offsets through the last word.
+
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -5296,6 +5296,23 @@
+     key.u.buffer.format = format;
+     key.u.buffer.offset = resource->mem.offset + offset * element_size;
+     key.u.buffer.size = size * element_size;
++
++    /* Raw and structured shaders use the SSBO descriptor when available. The
++     * companion texel view exists for descriptor type aliasing; do not exceed
++     * the Vulkan limit while creating it. Keep the SSBO range and its byte
++     * bounds intact so raw/structured reads still reach the entire buffer. */
++    if (d3d12_device_use_ssbo_raw_buffer(device) &&
++            ((flags & VKD3D_VIEW_RAW_BUFFER) || (view_format == DXGI_FORMAT_UNKNOWN && structure_stride)))
++    {
++        VkDeviceSize max_size = (VkDeviceSize)device->device_info.properties2.properties.limits.maxTexelBufferElements
++                * format->byte_count;
++        if (key.u.buffer.size > max_size)
++        {
++            WARN("Limiting companion texel view from %llu to %llu bytes; keeping full SSBO range.\n",
++                    (unsigned long long)key.u.buffer.size, (unsigned long long)max_size);
++            key.u.buffer.size = max_size;
++        }
++    }
+ 
+     return !!(*view = vkd3d_view_map_create_view(&resource->view_map, device, &key));
+ }

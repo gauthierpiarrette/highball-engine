@@ -1,0 +1,32 @@
+ARM64EC: Track executable image sections at Windows page granularity.
+
+A late-loaded DLL with a six-byte executable writable section must report a
+page-sized memory region. Using VirtualSize as the interval end exposes
+sub-page boundaries through GuestProtectionRange and misses zero-VirtualSize
+sections. Round section ranges to FEX/Windows pages and use raw size when
+VirtualSize is zero, matching the image loader.
+
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -186,8 +186,10 @@
+ 
+   for (auto* Section = SectionsBegin; Section != SectionsEnd; Section++) {
+     if (Section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+-      uint64_t SectionBase = Address + Section->VirtualAddress;
+-      uint64_t SectionEnd = SectionBase + Section->Misc.VirtualSize;
++      const uint64_t SectionAddress = Address + Section->VirtualAddress;
++      const uint64_t SectionSize = Section->Misc.VirtualSize ? Section->Misc.VirtualSize : Section->SizeOfRawData;
++      const uint64_t SectionBase = SectionAddress & FEXCore::Utils::FEX_PAGE_MASK;
++      const uint64_t SectionEnd = (SectionAddress + SectionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+       FEXCore::IntervalList<uint64_t> SectionWriteCopy;
+       if (Section->Characteristics & IMAGE_SCN_MEM_WRITE) {
+         for (uint64_t Cursor = SectionBase; Cursor < SectionEnd;) {
+@@ -210,7 +212,7 @@
+       LastExecutableSectionEnd = std::max(LastExecutableSectionEnd, SectionEnd);
+       if (Section->Characteristics & IMAGE_SCN_MEM_WRITE) {
+         LogMan::Msg::DFmt("Add image SMC interval: {:X} - {:X}", SectionBase, SectionBase + Section->Misc.VirtualSize);
+-        RWXIntervals.Insert({SectionBase, SectionBase + Section->Misc.VirtualSize});
++        RWXIntervals.Insert({SectionBase, SectionEnd});
+         WriteCopyIntervals.Insert(SectionWriteCopy);
+       }
+     }

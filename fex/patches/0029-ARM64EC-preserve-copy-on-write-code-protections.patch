@@ -1,0 +1,168 @@
+ARM64EC: Preserve copy-on-write protection while tracking executable pages.
+
+Keep COW intervals distinct from ordinary writable code for SMC fault recovery,
+query results and bulk protection changes. Track image, data-map, DEP promotion
+and free/unmap transitions. Otherwise an executable COW map is reported as RWX
+and a later write can repeatedly fail when FEX requests shared-write access.
+
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -87,9 +87,11 @@
+   // NOTE: Must be called with IntervalsLock held.
+   ULONG GetTrapProt(uint64_t Address) const;
+   ULONG GetUntrapProt(uint64_t Address) const;
++  uint64_t ProtectionRegionSize(uint64_t Address, uint64_t Size) const;
+ 
+   FEXCore::IntervalList<uint64_t> XIntervals;
+   FEXCore::IntervalList<uint64_t> RWXIntervals;
++  FEXCore::IntervalList<uint64_t> WriteCopyIntervals; // Protected by IntervalsLock
+   std::shared_mutex IntervalsLock;
+   FEXCore::Context::Context& CTX;
+   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -87,6 +87,15 @@
+     const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
+     const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
+ 
++    if (EffectiveRWX && (Prot & (PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY))) {
++      WriteCopyIntervals.Insert(ProtInterval);
++    } else {
++      WriteCopyIntervals.Remove(ProtInterval);
++    }
++    if (!(DEPDisabled && !HasExec && EffectiveExec)) {
++      DEPPromotedIntervals.Remove(ProtInterval);
++    }
++
+     if (EffectiveExec) {
+       XIntervals.Insert(ProtInterval);
+       if (EffectiveRWX) {
+@@ -146,6 +155,9 @@
+         XIntervals.Insert(ProtInterval);
+         if (ProtIsWritable(Info.Protect)) {
+           RWXIntervals.Insert(ProtInterval);
++          if (Info.Protect & PAGE_WRITECOPY) {
++            WriteCopyIntervals.Insert(ProtInterval);
++          }
+         }
+         DEPPromotedIntervals.Insert(ProtInterval);
+       }
+@@ -156,6 +168,7 @@
+     for (const auto& Interval : DEPPromotedIntervals) {
+       XIntervals.Remove(Interval);
+       RWXIntervals.Remove(Interval);
++      WriteCopyIntervals.Remove(Interval);
+     }
+     DEPPromotedIntervals.Clear();
+   }
+@@ -173,15 +186,32 @@
+ 
+   for (auto* Section = SectionsBegin; Section != SectionsEnd; Section++) {
+     if (Section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+-      std::unique_lock Lock(IntervalsLock);
+-
+       uint64_t SectionBase = Address + Section->VirtualAddress;
+       uint64_t SectionEnd = SectionBase + Section->Misc.VirtualSize;
++      FEXCore::IntervalList<uint64_t> SectionWriteCopy;
++      if (Section->Characteristics & IMAGE_SCN_MEM_WRITE) {
++        for (uint64_t Cursor = SectionBase; Cursor < SectionEnd;) {
++          MEMORY_BASIC_INFORMATION Info;
++          if (!VirtualQuery(reinterpret_cast<void*>(Cursor), &Info, sizeof(Info))) {
++            break;
++          }
++          const uint64_t Next = std::min(SectionEnd, reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize);
++          if (Next <= Cursor) {
++            break;
++          }
++          if (Info.Protect & (PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) {
++            SectionWriteCopy.Insert({Cursor, Next});
++          }
++          Cursor = Next;
++        }
++      }
++      std::unique_lock Lock(IntervalsLock);
+       XIntervals.Insert({SectionBase, SectionEnd});
+       LastExecutableSectionEnd = std::max(LastExecutableSectionEnd, SectionEnd);
+       if (Section->Characteristics & IMAGE_SCN_MEM_WRITE) {
+         LogMan::Msg::DFmt("Add image SMC interval: {:X} - {:X}", SectionBase, SectionBase + Section->Misc.VirtualSize);
+         RWXIntervals.Insert({SectionBase, SectionBase + Section->Misc.VirtualSize});
++        WriteCopyIntervals.Insert(SectionWriteCopy);
+       }
+     }
+   }
+@@ -223,6 +253,8 @@
+     std::unique_lock Lock(IntervalsLock);
+     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
+     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
++    WriteCopyIntervals.Remove({SectionBase, SectionBase + SectionSize});
++    DEPPromotedIntervals.Remove({SectionBase, SectionBase + SectionSize});
+   }
+ 
+   return {SectionBase, SectionSize};
+@@ -243,6 +275,8 @@
+     std::unique_lock Lock(IntervalsLock);
+     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
++    WriteCopyIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
++    DEPPromotedIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+   }
+ }
+ 
+@@ -686,13 +720,7 @@
+   }
+ 
+   const auto RWX = RWXIntervals.Query(Address);
+-  const auto DEP = DEPPromotedIntervals.Query(Address);
+-  if (RWX.Size) {
+-    Size = std::min<uint64_t>(Size, RWX.Size);
+-  }
+-  if (DEP.Size) {
+-    Size = std::min<uint64_t>(Size, DEP.Size);
+-  }
++  Size = ProtectionRegionSize(Address, Size);
+   constexpr ULONG Modifiers = PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
+   if (RWX.Enclosed && (Prot & ~Modifiers) == GetTrapProt(Address)) {
+     Prot = GetUntrapProt(Address) | (Prot & Modifiers);
+@@ -831,6 +859,7 @@
+   FEXCore::IntervalList<uint64_t>::QueryResult Query;
+   do {
+     Query = RWXIntervals.Query(Address);
++    Query.Size = ProtectionRegionSize(Address, Query.Size);
+     if (Query.Enclosed) {
+       void* TmpAddress = reinterpret_cast<void*>(Address);
+       SIZE_T TmpSize = static_cast<SIZE_T>(Query.Size);
+@@ -849,10 +878,21 @@
+ }
+ 
+ ULONG InvalidationTracker::GetUntrapProt(uint64_t Address) const {
++  const bool WriteCopy = WriteCopyIntervals.Query(Address).Enclosed;
+   if (DEPDisabled && DEPPromotedIntervals.Query(Address).Enclosed) {
+-    return PAGE_READWRITE;
+-  }
+-  return PAGE_EXECUTE_READWRITE;
++    return WriteCopy ? PAGE_WRITECOPY : PAGE_READWRITE;
++  }
++  return WriteCopy ? PAGE_EXECUTE_WRITECOPY : PAGE_EXECUTE_READWRITE;
++}
++
++uint64_t InvalidationTracker::ProtectionRegionSize(uint64_t Address, uint64_t Size) const {
++  for (const auto* Intervals : {&RWXIntervals, &DEPPromotedIntervals, &WriteCopyIntervals}) {
++    const auto Query = Intervals->Query(Address);
++    if (Query.Size) {
++      Size = std::min(Size, Query.Size);
++    }
++  }
++  return Size;
+ }
+ 
+ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t Size) {
+@@ -906,7 +946,8 @@
+ 
+   bool HitRWXInterval = false;
+   do {
+-    const auto Query = RWXIntervals.Query(Address);
++    auto Query = RWXIntervals.Query(Address);
++    Query.Size = ProtectionRegionSize(Address, Query.Size);
+     if (Query.Enclosed) {
+       if (!HitRWXInterval) {
+         if (ForWriteLocked) {

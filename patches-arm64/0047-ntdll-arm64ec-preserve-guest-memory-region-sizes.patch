@@ -1,0 +1,69 @@
+ntdll: Preserve guest region sizes across ARM64EC emulator write traps.
+
+FEX's SMC write traps can split a single guest RWX allocation or physically
+join its trapped pages with real RX pages. Updating only Protect leaves
+incorrect RegionSize values. Use the optional GuestProtectionRange hook
+to split each physical region at guest boundaries, then coalesce equal
+adjacent guest regions within the same allocation and with matching state,
+type and allocation protection. Preserve the scalar-hook fallback for
+older emulators, errors, other information classes and cross-process queries.
+
+Paired with FEX 0028. tests/x64-fidelity/regiontest.c: M4 control 78/82,
+paired correction 160/0 in normal/full validation, x64 Wine control 160/0.
+Memory 51/0, context 546/0, fibers 86/0 and invalid-context 108/0 unchanged.
+Native Windows reference and FH6 gameplay verification remain pending.
+
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -63,6 +63,7 @@
+ static BOOL     (WINAPI *pGetX64Mxcsr)(UINT*);
+ static BOOL     (WINAPI *pSetX64Mxcsr)(UINT);
+ static ULONG    (WINAPI *pGuestProtection)(void*,ULONG);
++static BOOL     (WINAPI *pGuestProtectionRange)(void*,ULONG*,SIZE_T*);
+ 
+ static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+ static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
+@@ -253,6 +254,7 @@
+     GET_PTR( GetX64Mxcsr );
+     GET_PTR( SetX64Mxcsr );
+     GET_PTR( GuestProtection );
++    GET_PTR( GuestProtectionRange );
+ #undef GET_PTR
+ 
+     RtlGetCurrentPeb()->ChpeV2ProcessInfo = info;
+@@ -913,7 +915,34 @@
+         pGuestProtection && RtlIsCurrentProcess( process ))
+     {
+         MEMORY_BASIC_INFORMATION *info = buffer;
+-        if (info->State == MEM_COMMIT) info->Protect = pGuestProtection( info->BaseAddress, info->Protect );
++        if (info->State == MEM_COMMIT)
++        {
++            if (pGuestProtectionRange &&
++                pGuestProtectionRange( info->BaseAddress, &info->Protect, &info->RegionSize ))
++            {
++                /* FEX's write traps can split one guest region or join pages
++                 * with different guest protections. Clamp each physical region
++                 * at the emulator's boundary, then coalesce equal guest regions. */
++                MEMORY_BASIC_INFORMATION next;
++                ULONG_PTR end;
++
++                while (info->RegionSize &&
++                       (end = (ULONG_PTR)info->BaseAddress + info->RegionSize) > (ULONG_PTR)info->BaseAddress)
++                {
++                    if (syscall_NtQueryVirtualMemory( process, (void *)end, info_class,
++                                                      &next, sizeof(next), NULL )) break;
++                    if (next.BaseAddress != (void *)end || !next.RegionSize ||
++                        next.AllocationBase != info->AllocationBase ||
++                        next.AllocationProtect != info->AllocationProtect ||
++                        next.State != info->State || next.Type != info->Type) break;
++                    if (!pGuestProtectionRange( next.BaseAddress, &next.Protect, &next.RegionSize ) ||
++                        !next.RegionSize || next.Protect != info->Protect ||
++                        next.RegionSize > ~(SIZE_T)0 - info->RegionSize) break;
++                    info->RegionSize += next.RegionSize;
++                }
++            }
++            else info->Protect = pGuestProtection( info->BaseAddress, info->Protect );
++        }
+     }
+     leave_syscall_callback();
+     return status;

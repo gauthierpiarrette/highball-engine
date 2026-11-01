@@ -1,0 +1,196 @@
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -34,6 +34,121 @@
+ #include "vk_graphics_state.h"
+ #include "vk_nir_convert_ycbcr.h"
+ #include "vk_pipeline.h"
++#include "util/hash_table.h"
++#include "util/simple_mtx.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++struct kk_msl_source {
++   char *code;
++   uint64_t references;
++   uint32_t hash;
++};
++
++static simple_mtx_t kk_msl_sources_lock = SIMPLE_MTX_INITIALIZER;
++static struct hash_table *kk_msl_sources;
++
++static void
++kk_msl_source_intern(struct msl_compile_data *data)
++{
++   data->source = NULL;
++   if (data->code == NULL)
++      return;
++
++   const uint32_t hash = _mesa_hash_string(data->code);
++   simple_mtx_lock(&kk_msl_sources_lock);
++   if (kk_msl_sources == NULL)
++      kk_msl_sources = _mesa_hash_table_create(
++         NULL, _mesa_hash_string, _mesa_key_string_equal);
++   if (kk_msl_sources == NULL) {
++      simple_mtx_unlock(&kk_msl_sources_lock);
++      return;
++   }
++
++   struct hash_entry *entry = _mesa_hash_table_search_pre_hashed(
++      kk_msl_sources, hash, data->code);
++   if (entry != NULL) {
++      struct kk_msl_source *source = entry->data;
++      source->references++;
++      char *old = data->code;
++      data->code = source->code;
++      data->source = source;
++      simple_mtx_unlock(&kk_msl_sources_lock);
++      if (old != source->code)
++         ralloc_free(old);
++      return;
++   }
++
++   struct kk_msl_source *source = malloc(sizeof(*source));
++   if (source == NULL) {
++      simple_mtx_unlock(&kk_msl_sources_lock);
++      return;
++   }
++
++   char *compact = reralloc_size(NULL, data->code, strlen(data->code) + 1u);
++   if (compact != NULL)
++      data->code = compact;
++   *source = (struct kk_msl_source){
++      .code = data->code,
++      .references = 1u,
++      .hash = hash,
++   };
++   entry = _mesa_hash_table_insert_pre_hashed(
++      kk_msl_sources, hash, source->code, source);
++   if (entry == NULL) {
++      free(source);
++      simple_mtx_unlock(&kk_msl_sources_lock);
++      return;
++   }
++   data->source = source;
++   simple_mtx_unlock(&kk_msl_sources_lock);
++}
++
++static void
++kk_msl_source_copy(struct msl_compile_data *dst,
++                    const struct msl_compile_data *src)
++{
++   if (src->source != NULL) {
++      simple_mtx_lock(&kk_msl_sources_lock);
++      src->source->references++;
++      dst->source = src->source;
++      dst->code = src->code;
++      simple_mtx_unlock(&kk_msl_sources_lock);
++   } else {
++      dst->code = ralloc_strdup(NULL, src->code);
++      kk_msl_source_intern(dst);
++   }
++}
++
++static void
++kk_msl_source_finish(struct msl_compile_data *data)
++{
++   struct kk_msl_source *source = data->source;
++   if (source == NULL) {
++      ralloc_free(data->code);
++   } else {
++      simple_mtx_lock(&kk_msl_sources_lock);
++      bool last = --source->references == 0u;
++      if (last) {
++         struct hash_entry *entry = _mesa_hash_table_search_pre_hashed(
++            kk_msl_sources, source->hash, source->code);
++         assert(entry != NULL && entry->data == source);
++         _mesa_hash_table_remove(kk_msl_sources, entry);
++         if (kk_msl_sources->entries == 0u) {
++            _mesa_hash_table_destroy(kk_msl_sources, NULL);
++            kk_msl_sources = NULL;
++         }
++      }
++      simple_mtx_unlock(&kk_msl_sources_lock);
++      if (last) {
++         ralloc_free(source->code);
++         free(source);
++      }
++   }
++   data->source = NULL;
++   data->code = NULL;
++}
+ 
+ static const nir_shader_compiler_options *
+ kk_get_nir_options(struct vk_physical_device *vk_pdev, mesa_shader_stage stage,
+@@ -882,20 +997,20 @@
+       u_foreach_bit(i, shader->info.vs.additional_stages_bits) {
+          struct msl_compile_data *data = &shader->msl_data[i];
+          ralloc_free((void *)data->entrypoint_name);
+-         ralloc_free((void *)data->code);
++         kk_msl_source_finish(data);
+       }
+    }
+ 
+    struct msl_compile_data *data = &shader->msl_data[shader->info.stage];
+    ralloc_free((void *)data->entrypoint_name);
+-   ralloc_free((void *)data->code);
++   kk_msl_source_finish(data);
+ 
+    ralloc_free((void *)shader->gs_main.entrypoint_name);
+-   ralloc_free((void *)shader->gs_main.code);
++   kk_msl_source_finish(&shader->gs_main);
+    ralloc_free((void *)shader->gs_count.entrypoint_name);
+-   ralloc_free((void *)shader->gs_count.code);
++   kk_msl_source_finish(&shader->gs_count);
+    ralloc_free((void *)shader->pre_gs.entrypoint_name);
+-   ralloc_free((void *)shader->pre_gs.code);
++   kk_msl_source_finish(&shader->pre_gs);
+ 
+    if (shader->minmax)
+       kk_shader_destroy(vk_dev, shader->minmax, pAllocator);
+@@ -1052,6 +1167,7 @@
+    }
+ 
+    data->code = nir_to_msl(nir, &translate_options);
++   kk_msl_source_intern(data);
+    const char *entrypoint_name = nir_shader_get_entrypoint(nir)->function->name;
+ 
+    /* We need to steal so it doesn't get destroyed with the nir. Needs to happen
+@@ -1424,7 +1540,7 @@
+ static void
+ kk_msl_copy(struct msl_compile_data *dst, const struct msl_compile_data *src)
+ {
+-   dst->code = ralloc_strdup(NULL, src->code);
++   kk_msl_source_copy(dst, src);
+    dst->entrypoint_name = ralloc_strdup(NULL, src->entrypoint_name);
+ }
+ 
+@@ -2301,9 +2417,12 @@
+    blob_copy_bytes(blob, (void *)data->entrypoint_name, entrypoint_length);
+    blob_copy_bytes(blob, (void *)data->code, code_length);
+ 
+-   if (blob->overrun)
++   if (blob->overrun || entrypoint_length == 0u || code_length == 0u ||
++       data->entrypoint_name[entrypoint_length - 1u] != '\0' ||
++       data->code[code_length - 1u] != '\0')
+       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+ 
++   kk_msl_source_intern(data);
+    return VK_SUCCESS;
+ }
+ 
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -148,9 +148,12 @@
+    struct kk_cb_program record;
+ };
+ 
++struct kk_msl_source;
++
+ struct msl_compile_data {
+    char *code;
+    char *entrypoint_name;
++   struct kk_msl_source *source;
+ };
+ 
+ struct kk_shader {

@@ -1,0 +1,31 @@
+vkd3d: Use the existing reserved-resource fallback without sparse binding.
+
+Feature-level overrides can expose tiled resources on devices without Vulkan
+sparse binding. Reserved buffers then have no device address and fail to
+create. Extend the existing committed fallback for unsupported sparse image
+formats to devices without sparse binding, including buffers.
+
+This is a compatibility fallback, not sparse residency emulation: it commits
+the entire resource, and existing fallback code ignores UpdateTileMappings.
+Real tile aliasing is not implemented and VRAM usage can increase.
+
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -4674,6 +4674,17 @@
+     const struct vkd3d_format *format;
+     struct d3d12_resource *object;
+     HRESULT hr;
++
++    /* Some backends have no sparse binding at all. Use the same committed
++     * fallback as unsupported sparse image formats, including for buffers. */
++    if (!device->device_info.features2.features.sparseBinding)
++    {
++        FIXME("Sparse binding is unavailable, falling back to committed resource. "
++              "Dimension %u, width %"PRIu64", height %u, layers %u. VRAM bloat expected.\n",
++                desc->Dimension, desc->Width, desc->Height, desc->DepthOrArraySize);
++        return d3d12_resource_create_reserved_fallback(device, desc, initial_state,
++                optimized_clear_value, num_castable_formats, castable_formats, resource);
++    }
+ 
+     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+     {

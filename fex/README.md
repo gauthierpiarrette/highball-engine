@@ -135,6 +135,67 @@ The Wine half is `patches-arm64/0022` to `0029` and `0043`. A one-line summary o
   (`Source/Windows/UnixLib/FEXUnixLib.cpp`), whose table-size check then fails: Highball builds only the Darwin
   helper, but the series does not build FEX's Linux helper as it stands. The x86-64 fidelity programs pass
   with every switch off and on (`memtest`'s `code.writeprocessmemory` fails with 0022 as well).
+- `0024` removes stale writable-code intervals when an executable page becomes read-only. After
+  WriteProcessMemory temporarily changed RX to RWX and restored RX, the tracker still reported RWX; later
+  writes skipped the protection change and failed with access denied. The M4 `memtest` result improves from
+  49/1 to 50/0, with the other fidelity results unchanged. The existing seven x87 failures per architecture
+  remain. This fixes a memory-protection regression; FH6 gameplay is still unverified.
+- `0025` prevents native memory callbacks while full code validation removes cached translations. Freeing FEX's
+  own metadata otherwise reenters its invalidation lock through ntdll. A writable-alias probe hangs on its second
+  call without the guard and completes 1,000 rewrites with zero stale calls with it. This is independent of 0026.
+- `0026` compares the initialized CRC accumulator for empty decode entries, rather than an uninitialized temporary.
+  With `FEX_SMCCHECKS=full`, the no-access execution check in `memtest` otherwise spins even with 0025. The updated
+  memory suite passes 51/0 in both normal and full modes with Wine 0046; context remains 546/0. Cache format 31
+  discards old generated code. Both ARM64EC and rebuilt WoW64 components are tested: the 32-bit no-access/code
+  rewrite probe changes from a 25-second full-mode timeout to 2/0, with its existing suites unchanged. Native
+  Windows references remain pending. Full validation still fails to get FH6 beyond startup and is not enabled by default.
+- `0027` restores the read-only protection of FEX's dispatch-slot page after updating its three ARM64EC
+  call-checker pointers. The restore passed a null output pointer, so NtProtectVirtualMemory rejected it and
+  left the page writable. The read-only probe in `tests/fex-runtime` changes from 0/3 to 3/0; memory, context
+  and fiber results are unchanged. FH6 gameplay remains unverified.
+- `0028` exposes guest protection boundaries for Wine 0047. SMC write traps split one RWX allocation into
+  physical RX/RWX regions and can join trapped pages with genuine RX pages. Correcting only the protection
+  flags left incorrect region sizes. The paired query fix splits at guest boundaries, then merges matching
+  regions within the same allocation. `regiontest` improves from 78/82 to 160/0 in normal/full modes; the x64
+  Wine control gives 160/0. Existing memory/context/fiber results remain passing. The rebuilt WoW64 half passes
+  its regression checks; this optional region hook is ARM64EC-only. Native Windows references and FH6 gameplay
+  verification remain pending.
+
+
+- `0029` preserves copy-on-write protection in executable data mappings and image sections, including DEP
+  promotion, protection changes and unmapping. Trapping a PAGE_EXECUTE_WRITECOPY page otherwise turns its guest
+  protection into ordinary RWX; its next write can loop trying to grant shared-write access. The independent
+  eight-check repro changes from two wrong-protection results plus a 25-second timeout to 8/0 in normal/full
+  modes. Expanded `cowtest` gives 22/0 in both modes and on x64 Wine, checking RX boundaries, rewrites and unchanged
+  shared/file contents. Memory 51/0, region 160/0, context 546/0, fibers 86/0 and WoW64 SMC 2/0 remain passing.
+  Both FEX components are rebuilt. The 32-bit COW view probe still faults on its first execution, as it does
+  before 0029; the passing WoW64 SMC probe does not cover that mapping gap. Native Windows reference remains
+  pending. FH6 still renders only the intro and exits during startup.
+
+- `0030` rounds executable image-section intervals to Windows pages and uses raw size when VirtualSize is zero.
+  A late-loaded DLL containing a six-byte writable executable section otherwise reports a six-byte memory region
+  before and after execution. `imagequery` changes from 4/2 to 6/0 in normal/full modes, matching x64 Wine 6/0.
+  Existing memory, region, COW, context, fiber and WoW64 SMC checks retain their passing results. Native Windows
+  references and FH6 gameplay verification remain pending.
+
+- `0031` backports upstream call-checker bounds fixes 4dbb046 and 3a2b1c0. The native redirection table's
+  size is 32-bit, and the size itself is outside its valid indices. A controlled call to the actual runtime
+  checker gives 2/2 before and 4/0 after in normal/full modes. Context 546/0, memory 53/0 and fibers 86/0
+  remain passing. This internal runtime check does not establish game compatibility.
+
+- `0032` advances the stack-argument pointer when a misaligned x64 call retains its return address for native
+  alignment. The old path passed argument five from the preceding slot and argument six from argument five's
+  slot. An independent six-argument ARM64EC helper changes from 11/3 to 14/0 in normal/full modes; x64 Wine
+  gives 14/0 with an AMD64 build of the helper. Context 546/0, memory 53/0, fibers 86/0, invalid-instruction
+  context 108/0, expanded legacy context 1068/0 and the call-checker 4/0 remain passing. The change matches
+  [upstream report 6015](https://github.com/FEX-Emu/FEX/issues/6015). Native Windows references and FH6 gameplay
+  verification remain pending. FH6 still exits during the intro with this correction.
 
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.
+
+`0033` holds the opt-in switches for programs that keep rewriting their own code, each off unless its variable is set: its
+header lists them. Many of its counters under `FEX_PROFILESTATS` reuse existing slots of the shared statistics and are
+for diagnosis only. With Wine `0052` it takes Forza Horizon 6's copy protection from a stall of about 100 ms every 1.1 s
+to none over 80 ms on a base M4 (2026-10-31). `0024` to `0032` apply to every program, and the notes above were written
+as each was found: the game now plays to free roam and exits normally with the whole series.

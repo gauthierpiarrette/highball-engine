@@ -5,7 +5,7 @@
  *   split      an 8-byte access across a page boundary: fault address, partial store
  *   protect    VirtualProtect transitions and the old protection it returns
  *   code       generated code: documented RW -> RX + FlushInstructionCache path, RWX without a flush,
- *              inline self-modification, WriteProcessMemory, another thread modifying running code
+ *              inline self-modification, WriteProcessMemory, mapped aliases with a flush, another thread modifying running code
  *   watch      MEM_WRITE_WATCH / GetWriteWatch granularity
  *   stack      stack growth through the guard page down 1.5 MB
  *   layout     page size, allocation granularity, addresses
@@ -150,6 +150,17 @@ static void group_access(void)
         fid_check(mbi.Protect == (PAGE_READWRITE | PAGE_GUARD), "access.guard.neighbour_kept", "protect %#lx", mbi.Protect);
         VirtualFree(p, 0, MEM_RELEASE);
     }
+    /* A W^X implementation must deliver guard faults before handling writable executable pages. */
+    {
+        uint8_t *p = VirtualAlloc(NULL, PG, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        MEMORY_BASIC_INFORMATION mbi;
+        DWORD old;
+        VirtualProtect(p, PG, PAGE_EXECUTE_READWRITE | PAGE_GUARD, &old);
+        expect("access.exec_guard.write", probe('w', p + 0x20), STATUS_GUARD_PAGE_VIOLATION, 1, p + 0x20);
+        VirtualQuery(p, &mbi, sizeof(mbi));
+        fid_check(mbi.Protect == PAGE_EXECUTE_READWRITE, "access.exec_guard.cleared", "protect %#lx", mbi.Protect);
+        VirtualFree(p, 0, MEM_RELEASE);
+    }
     /* reserved and decommitted pages */
     {
         uint8_t *p = VirtualAlloc(NULL, 4 * PG, MEM_RESERVE, PAGE_NOACCESS);
@@ -246,6 +257,8 @@ static void group_code(unsigned n)
     }
     /* WriteProcessMemory into our own RX code */
     {
+        unsigned failed_writes = 0;
+        DWORD first_error = 0;
         uint8_t *c = VirtualAlloc(NULL, PG, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         emit_mov_ret(c, 1);
         VirtualProtect(c, PG, PAGE_EXECUTE_READ, &old);
@@ -255,11 +268,52 @@ static void group_code(unsigned n)
             uint32_t v = 0x5000 + i;
             SIZE_T done = 0;
             ((fn0)c)();
-            if (!WriteProcessMemory(GetCurrentProcess(), c + 1, &v, 4, &done) || done != 4) { stale++; continue; }
+            if (!WriteProcessMemory(GetCurrentProcess(), c + 1, &v, 4, &done) || done != 4)
+            {
+                if (!failed_writes) first_error = GetLastError();
+                failed_writes++;
+                continue;
+            }
             if (((fn0)c)() != v) stale++;
         }
-        fid_check(!stale, "code.writeprocessmemory", "%u of %u calls after WriteProcessMemory ran the previous code", stale, n / 10);
+        fid_check(!failed_writes && !stale, "code.writeprocessmemory",
+                  "%u of %u writes failed (first error %lu); %u successful writes ran stale code",
+                  failed_writes, n / 10, first_error, stale);
         VirtualFree(c, 0, MEM_RELEASE);
+    }
+    /* A writable and an executable view of the same section. The executable
+     * mapping must work immediately, without a redundant VirtualProtect call. */
+    {
+        HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE, 0, 65536, NULL);
+        uint8_t *rw = NULL, *rx = NULL;
+        unsigned completed = 0;
+        DWORD error = 0, fault = 0;
+        stale = 0;
+        if (mapping)
+        {
+            rw = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 65536);
+            rx = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, 65536);
+        }
+        if (!mapping || !rw || !rx) error = GetLastError();
+        else for (i = 0; i < n / 10; ++i)
+        {
+            int64_t result;
+            emit_mov_ret(rw, 0x6000 + i);
+            if (!FlushInstructionCache(GetCurrentProcess(), rx, 6)) { error = GetLastError(); break; }
+            g_code = 0;
+            g_probing = 1;
+            result = mprobe_exec(rx);
+            g_probing = 0;
+            if ((fault = g_code)) break;
+            if ((uint32_t)result != 0x6000 + i) ++stale;
+            ++completed;
+        }
+        fid_check(completed == n / 10 && !stale && !error && !fault, "code.mapped_alias_flush",
+                  "%u of %u calls completed, %u stale; API error %lu exception %#lx",
+                  completed, n / 10, stale, error, fault);
+        if (rx) UnmapViewOfFile(rx);
+        if (rw) UnmapViewOfFile(rw);
+        if (mapping) CloseHandle(mapping);
     }
     /* another thread rewrites code this thread keeps calling */
     {

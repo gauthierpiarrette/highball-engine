@@ -1,0 +1,60 @@
+ntdll: Notify ARM64EC about executable sections in directly mapped images.
+
+SEC_IMAGE mappings made outside LoadLibrary bypass the loader-only image
+callback. Their executable pages were therefore absent from FEX's intervals:
+a direct call faulted until a redundant VirtualProtect registered the page.
+
+Report the actual committed region protections for mappings that do not use
+the loader callback. A SEC_IMAGE map's requested protection does not describe
+its PE section protections. Keep the loader's existing image callback intact.
+Both NtMapViewOfSection variants share this helper.
+
+Regression: tests/x64-fidelity/imagemap.c plus imagequery-helper.dll.
+M4 clean FEX0030: 3/1 before, 4/0 after, normal/full modes; x64 Wine 4/0.
+Native Windows references and FH6 gameplay verification remain pending.
+
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -823,19 +823,35 @@
+     NTSTATUS status;
+ 
+     if (!pNotifyMapViewOfSection && !pNotifyMemoryProtect) return;
+-    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL ))
+-    {
+-        /* Data-section mappings can also contain x64 code. They do not receive
+-         * image notifications; report their protection to the emulator. */
++    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL ) ||
++        !NtCurrentTeb()->Tib.ArbitraryUserPointer)
++    {
++        /* Direct image mappings do not pass through the loader's image callback.
++         * Image protections come from the PE sections, not the map argument. */
+         if (pNotifyMemoryProtect)
+         {
+-            pNotifyMemoryProtect( addr, size, protect, FALSE, 0 );
+-            pNotifyMemoryProtect( addr, size, protect, TRUE, STATUS_SUCCESS );
++            SIZE_T offset = 0;
++            while (offset < size)
++            {
++                MEMORY_BASIC_INFORMATION mbi;
++                SIZE_T length;
++                char *cursor = (char *)addr + offset;
++
++                if (NtQueryVirtualMemory( GetCurrentProcess(), cursor, MemoryBasicInformation,
++                                          &mbi, sizeof(mbi), NULL )) break;
++                length = min( size - offset, (char *)mbi.BaseAddress + mbi.RegionSize - cursor );
++                if (!length) break;
++                if (mbi.State == MEM_COMMIT)
++                {
++                    pNotifyMemoryProtect( cursor, length, mbi.Protect, FALSE, 0 );
++                    pNotifyMemoryProtect( cursor, length, mbi.Protect, TRUE, STATUS_SUCCESS );
++                }
++                offset += length;
++            }
+         }
+         return;
+     }
+     if (!pNotifyMapViewOfSection) return;
+-    if (!NtCurrentTeb()->Tib.ArbitraryUserPointer) return;
+     status = pNotifyMapViewOfSection( NULL, addr, NULL, size, alloc, protect );
+     if (NT_SUCCESS(status)) return;
+     NtUnmapViewOfSection( GetCurrentProcess(), addr );

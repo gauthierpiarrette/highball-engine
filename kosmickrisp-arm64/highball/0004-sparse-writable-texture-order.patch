@@ -1,0 +1,57 @@
+--- a/src/kosmickrisp/vulkan/kk_sparse.c
++++ b/src/kosmickrisp/vulkan/kk_sparse.c
+@@ -240,17 +240,20 @@
+ kk_sparse_update_texture(struct kk_queue *queue, mtl_texture *texture,
+                          mtl_heap *heap,
+                          const struct mtl_sparse_texture_mapping *mappings,
+-                         uint32_t count)
++                         uint32_t count, bool writable)
+ {
+    simple_mtx_lock(&queue->sparse.lock);
+-   if (queue->sparse.buffer_after_texture) {
++   if (!writable && queue->sparse.buffer_after_texture) {
+       mtl_signal_event(queue->mtl_handle, queue->sparse.separator,
+                        ++queue->sparse.separator_value);
+       mtl_wait_for_event(queue->mtl_handle, queue->sparse.separator,
+                          queue->sparse.separator_value);
+       queue->sparse.buffer_after_texture = false;
+    }
+-   queue->sparse.texture_mapped = true;
++   if (writable)
++      queue->sparse.buffer_after_texture |= queue->sparse.texture_mapped;
++   else
++      queue->sparse.texture_mapped = true;
+    mtl_command_queue_update_texture_mappings(queue->mtl_handle, texture, heap,
+                                              mappings, count);
+    simple_mtx_unlock(&queue->sparse.lock);
+@@ -388,7 +391,8 @@
+       };
+       p += len;
+       if (n == ARRAY_SIZE(mappings) || p == first + count) {
+-         kk_sparse_update_texture(queue, sparse->residency, heap, mappings, n);
++         kk_sparse_update_texture(queue, sparse->residency, heap, mappings, n,
++                                   false);
+          n = 0u;
+       }
+    }
+@@ -759,7 +763,8 @@
+          queue, image->planes[0].mtl_handle, kk_sparse_memory_heap(mem),
+          util_dynarray_begin(mappings),
+          util_dynarray_num_elements(mappings,
+-                                    struct mtl_sparse_texture_mapping));
++                                    struct mtl_sparse_texture_mapping),
++         image->planes[0].layout.usage & MTL_TEXTURE_USAGE_SHADER_WRITE);
+    }
+ }
+ 
+@@ -789,7 +794,9 @@
+          .heap_offset = mem ? bind->memoryOffset / KK_SPARSE_PAGE_SIZE_B : 0u,
+       };
+       kk_sparse_update_texture(queue, image->planes[0].mtl_handle,
+-                               kk_sparse_memory_heap(mem), &mapping, 1u);
++                               kk_sparse_memory_heap(mem), &mapping, 1u,
++                               image->planes[0].layout.usage &
++                                  MTL_TEXTURE_USAGE_SHADER_WRITE);
+    }
+ }
+ 

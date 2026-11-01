@@ -1,0 +1,231 @@
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sat, 31 Oct 2026 12:00:00 +0100
+Subject: [PATCH] ntdll: arm64 macOS: MAP_JIT for the emulator's code buffers and a
+ direct continue into emulated code (opt-in)
+
+A copy-protected game that rewrites its code around every trap (Forza Horizon 6, some 15,000 exceptions a second)
+spends its time in two places outside the emulator's own work.
+
+HB_FEX_MAPJIT=1: the emulator's code buffers (allocations with MEM_EXTENDED_PARAMETER_EC_CODE and
+PAGE_EXECUTE_READWRITE) are mapped MAP_JIT and stay read-write-execute, and the emulator flips its own thread between
+writing and executing through ThreadHbJitWrite (NtSetInformationThread class 0x7fe, pthread_jit_write_protect_np).
+Without it every write to a translated page takes the W^X dance of patch HB_JIT: two host faults per translation.
+
+HB_DIRECT_CONTINUE=1: a syscall that continues emulated code (NtContinue from an x64 exception handler) restored its
+context through raise(SIGUSR2). The emulator reloads every register from the context its dispatcher finds on the stack,
+so the switch needs only the stack pointer, the entry point and the floating-point control registers. A frame whose
+emulation bit is set but whose target is native code with x16 == pc and x17 == sp is a plain return into a native thunk,
+which the fast path restores itself.
+
+Both are off unless the variable is set. Measured with FEX patch 0033 on a base M4, macOS 27.0: Forza Horizon 6 went from
+a stall of about 100 ms every 1.1 s to none over 80 ms in free roam (2026-10-31).
+---
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index d1ee3de..a9a9b70 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -1766,9 +1766,59 @@ void signal_init_process( TEB *teb )
+ /***********************************************************************
+  *           syscall_dispatcher_return_slowpath
+  */
+-void syscall_dispatcher_return_slowpath(void)
++#ifdef __APPLE__
++/* Highball (2026-10-31, HB_DIRECT_CONTINUE=1): a syscall that continues emulated code (NtContinue from an x64
++ * exception handler) restored its context through raise(SIGUSR2) and usr2_handler. The emulator reloads every
++ * register from the context the dispatcher finds on its stack, so the switch needs only the stack pointer, the
++ * entry point and the floating-point control registers: made here directly, without the signal round trip
++ * (a copy-protected game continues this way some 15,000 times a second). */
++extern void hb_enter_emulation_dispatcher( void *sp, void *pc, ULONG_PTR fpcr, ULONG_PTR fpsr );
++__ASM_GLOBAL_FUNC( hb_enter_emulation_dispatcher,
++                   "msr fpcr, x2\n\t"
++                   "msr fpsr, x3\n\t"
++                   "mov sp, x0\n\t"
++                   "br x1" )
++
++static BOOL hb_direct_continue_enabled(void)
+ {
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *env = getenv( "HB_DIRECT_CONTINUE" );
++        enabled = env && env[0] == '1';
++    }
++    return enabled;
++}
++#endif
++
++/* Returns its argument (the syscall's x0) when the dispatcher's fast path can finish the return itself. */
++ULONG_PTR syscall_dispatcher_return_slowpath( ULONG_PTR x0 )
++{
++#ifdef __APPLE__
++    struct thread_data *data = get_thread_data();
++    struct syscall_frame *frame = get_syscall_frame( data );
++
++    /* Highball: a frame whose emulation bit is set but whose target is native code with x16 == pc and x17 == sp is
++     * a plain return into a native thunk (the game's protection made over a million of them in 200 s): the fast
++     * path restores it, there is nothing for a signal to do. */
++    if (frame && (frame->restore_flags & RESTORE_FLAGS_EMULATION) && !is_emulated_code( frame->pc ) &&
++        frame->x[16] == frame->pc && frame->x[17] == frame->sp && hb_direct_continue_enabled())
++        return x0;
++
++    if (frame && (frame->restore_flags & RESTORE_FLAGS_EMULATION) && is_emulated_code( frame->pc ) &&
++        hb_direct_continue_enabled())
++    {
++        CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
++
++        data->teb->ChpeV2CpuAreaInfo->InSimulation = 1;
++        user_context->ContextFlags = CONTEXT_FULL;
++        NtGetContextThread( GetCurrentThread(), user_context );
++        x64_debug_to_emulator( data, user_context );
++        hb_enter_emulation_dispatcher( user_context, pKiUserEmulationDispatcher, frame->fpcr, frame->fpsr );
++    }
++#endif
+     raise( SIGUSR2 );
++    return x0;
+ }
+ 
+ /***********************************************************************
+@@ -1963,14 +2013,16 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
+                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
+                    "tbz x16, #16, 1f\n\t"       /* RESTORE_FLAGS_EMULATION */
+-                   "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n"
++                   "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n\t"
++                   "ldr w16, [sp, #0x10c]\n"   /* Highball: the slow path may return (x0 kept); reload the flags */
+                    "1:\ttbz x16, #1, 2f\n"      /* CONTEXT_INTEGER */
+                    "ldp x12, x13, [sp, #0x80]\n\t" /* frame->x[16..17] */
+                    "ldp x14, x15, [sp, #0xf8]\n\t" /* frame->sp, frame->pc */
+                    "cmp x12, x15\n\t"              /* frame->x16 == frame->pc? */
+                    "ccmp x13, x14, #0, eq\n\t"     /* frame->x17 == frame->sp? */
+                    "beq 1f\n\t"                    /* take slowpath if unequal */
+-                   "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n"
++                   "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n\t"
++                   "ldr w16, [sp, #0x10c]\n"
+                    "1:\tldp x0, x1, [sp, #0x00]\n\t"
+                    "ldp x2, x3, [sp, #0x10]\n\t"
+                    "ldp x4, x5, [sp, #0x20]\n\t"
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index b06ea92..8461482 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -2649,6 +2649,16 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
+         return status;
+     }
+ 
++#ifdef __APPLE__
++    case 0x7fe: /* ThreadHbJitWrite (Highball): the calling thread writes (1) or executes (0) MAP_JIT memory */
++    {
++        if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
++        if (handle != GetCurrentThread()) return STATUS_INVALID_PARAMETER;
++        pthread_jit_write_protect_np( !*(const ULONG *)data );
++        return STATUS_SUCCESS;
++    }
++#endif
++
+     case ThreadWineNativeThreadName:
+     {
+         const THREAD_NAME_INFORMATION *info = data;
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 2fe3ef2..bbcd4b2 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -274,6 +274,45 @@ static inline BOOL use_aslr(void)
+  * Code inside PE images stays read-execute; a mixed 16K page flips the same way. */
+ #define HB_JIT 1
+ #include <pthread.h>
++/* Highball (2026-10-31, HB_FEX_MAPJIT=1): the emulator's own code buffers (allocations carrying
++ * MEM_EXTENDED_PARAMETER_EC_CODE with PAGE_EXECUTE_READWRITE) are mapped MAP_JIT and kept read-write-execute;
++ * the emulator flips its own thread between writing and executing with ThreadHbJitWrite
++ * (NtSetInformationThread), so no page ever flips here. Everything else keeps the W^X dance below. */
++#define VPROT_HB_MAPJIT      0x2000  /* an emulator code buffer that wants MAP_JIT */
++#define VPROT_HB_MAPJIT_DONE 0x4000  /* and is mapped so */
++static int hb_mapjit_request;   /* the allocation being mapped wants MAP_JIT (under virtual_mutex) */
++static BOOL hb_mapjit_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *env = getenv( "HB_FEX_MAPJIT" );
++        enabled = env && env[0] == '1';
++    }
++    return enabled;
++}
++/* MAP_JIT refuses MAP_FIXED on macOS, and every view lives in a reserved area, so the fresh (still zero) view is
++ * unmapped and mapped again with its address as a hint; the kernel keeps the hint for a range that is free. */
++static int hb_remap_jit( struct file_view *view )
++{
++    void *base = view->base;
++    size_t size = ROUND_SIZE( 0, view->size, host_page_mask );
++    void *ptr;
++
++    munmap( base, size );
++    ptr = mmap( base, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0 );
++    if (ptr == base)
++    {
++        view->protect |= VPROT_HB_MAPJIT_DONE;
++        return 0;
++    }
++    WARN( "MAP_JIT remap of %p-%p gave %p\n", base, (char *)base + size, ptr );
++    if (ptr != MAP_FAILED) munmap( ptr, size );
++    view->protect &= ~VPROT_HB_MAPJIT;
++    if (mmap( base, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 ) == MAP_FAILED)
++        ERR( "could not map %p-%p back: %s\n", base, (char *)base + size, strerror(errno) );
++    return -1;
++}
+ struct jit_range { char *base; size_t size; };
+ static struct jit_range jit_ranges[2048];
+ static unsigned int jit_count;
+@@ -2090,6 +2129,11 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+     if ((unix_prot & PROT_EXEC) && (unix_prot & PROT_WRITE))
+     {
+         struct file_view *view = find_view( base, 0 );
++        if (view && (view->protect & VPROT_HB_MAPJIT))
++        {
++            if (view->protect & VPROT_HB_MAPJIT_DONE) return mprotect( base, size, unix_prot ); /* MAP_JIT: RWX is real */
++            if (!hb_remap_jit( view )) return 0;                                                /* fresh view: now MAP_JIT, RWX */
++        }
+         if (view && (view->protect & SEC_IMAGE)) unix_prot &= ~PROT_WRITE;  /* image code: read-execute, writes flip the page */
+         else if (is_jit_addr( base )) return 0;                              /* already a W^X range, keep its current state */
+         else return make_jit_range( base, size );
+@@ -4857,6 +4901,18 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+     vprot = get_host_page_vprot( page );
+ 
+ #ifdef HB_JIT
++    if (hb_mapjit_enabled())
++    {
++        struct file_view *view = find_view( addr, 0 );
++        if (view && (view->protect & VPROT_HB_MAPJIT_DONE))
++        {
++            /* a write from a thread in execute mode or the other way round: the emulator's fault, not ours */
++            WARN( "fault %lx at %p in a MAP_JIT buffer\n", (unsigned long)err, addr );
++            mutex_unlock( &virtual_mutex );
++            rec->ExceptionCode = STATUS_ACCESS_VIOLATION;
++            return STATUS_ACCESS_VIOLATION;
++        }
++    }
+     if (!(vprot & VPROT_GUARD) && is_jit_addr( addr ) &&
+         (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT))
+     {
+@@ -5407,8 +5463,20 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
+ 
+             if (vprot & VPROT_WRITECOPY) status = STATUS_INVALID_PAGE_PROTECTION;
+             else if (is_dos_memory) status = allocate_dos_memory( &view, vprot );
+-            else status = map_view_ex( &view, base, size, type, vprot, limit_low, limit_high,
+-                                       align ? align - 1 : granularity_mask, TRUE );
++            else
++            {
++#ifdef HB_JIT
++                hb_mapjit_request = hb_mapjit_enabled() && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE) &&
++                                    (vprot & VPROT_EXEC) && (vprot & VPROT_WRITE) && (type & MEM_COMMIT);
++#endif
++                status = map_view_ex( &view, base, size, type, vprot, limit_low, limit_high,
++                                      align ? align - 1 : granularity_mask, TRUE );
++#ifdef HB_JIT
++                /* the view is mapped without execute; the protection pass below remaps it MAP_JIT (hb_remap_jit) */
++                if (status == STATUS_SUCCESS && hb_mapjit_request) view->protect |= VPROT_HB_MAPJIT;
++                hb_mapjit_request = 0;
++#endif
++            }
+ 
+             if (status == STATUS_SUCCESS)
+             {

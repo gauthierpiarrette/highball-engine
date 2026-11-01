@@ -1,0 +1,31 @@
+ARM64EC: Remove writable-code tracking when executable pages become read-only.
+
+The protection tracker added executable pages to RWXIntervals when they
+became writable, but retained that interval when they changed back to RX.
+GuestProtection then mistook the program's real RX protection for FEX's
+write trap and reported RWX. After WriteProcessMemory temporarily made an
+RX page writable and restored it, subsequent writes skipped that temporary
+protection change and failed with ERROR_ACCESS_DENIED.
+
+Remove the writable interval when the new executable protection is not
+writable. Keep the executable interval and normal code invalidation.
+
+Regression: tests/x64-fidelity/memtest.c, code.writeprocessmemory.
+M4 r6 control: 49 pass / 1 fail (249 of 250 writes failed after the first).
+Patched: 50 / 0. Other fidelity results are unchanged, including the seven
+existing x87 failures in each architecture. FH6 gameplay remains unverified.
+
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 342525a..705fb92 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -92,6 +92,9 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+       if (EffectiveRWX) {
+         LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
+         RWXIntervals.Insert(ProtInterval);
++      } else {
++        // A transition from RWX to RX must stop treating FEX's RX trap as guest RWX.
++        RWXIntervals.Remove(ProtInterval);
+       }
+       if (DEPDisabled && !HasExec) {
+         DEPPromotedIntervals.Insert(ProtInterval);

@@ -55,6 +55,11 @@ jobs:
           for name in vkd3d-proton dxvk; do
             for p in renderers-arm64/$name/*.patch; do echo "applying $p"; git -C "src/$name" apply "$PWD/$p"; done
           done
+          # dxil-spirv is vkd3d-proton's submodule: its patches apply inside it.
+          for p in renderers-arm64/dxil-spirv/*.patch; do
+            [ -e "$p" ] || continue
+            echo "applying $p"; git -C src/vkd3d-proton/subprojects/dxil-spirv apply "$PWD/$p"
+          done
       - name: tools
         run: |
           set -euo pipefail

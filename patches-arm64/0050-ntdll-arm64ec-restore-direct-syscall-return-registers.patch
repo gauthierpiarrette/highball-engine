@@ -1,0 +1,81 @@
+Subject: [PATCH] ntdll: use a private frame for direct x64 syscalls on ARM64EC
+
+invoke_arm64ec_syscall treats the guest's stack as a function-call home
+area. Direct SYSCALL instructions may instead have live local values
+there. The helper overwrites them with bookkeeping, and leaves RCX and
+flags from the native function ABI when returning to emulated code.
+
+Build a separate aligned call frame below the guest stack. Generate the
+argument-size table from ALL_SYSCALLS and copy only declared stack
+arguments. Keep the synthetic continuation, original RBP, flags and R11
+in that frame. Return with the guest RSP and stack contents unchanged,
+RCX=continuation and restored flags. Save entry flags separately because
+INT 2E shares the helper without placing flags in R11. The service target,
+number, parameter values and returned status are unchanged.
+
+Standalone checks cover guest-stack canaries, both entry instructions,
+success and error statuses, and nine arithmetic/direction flag patterns.
+The corrected M4 runtime gives SYSCALL245/0 and INT2E218/0 in normal/full
+validation. x64 Wine gives SYSCALL245/0. An inline syscall in an own state
+fixture previously corrupts its caller and exits5; it now returns0 with
+x87/XMM/YMM/MXCSR and flags intact. Direct 3-to-10 argument calls retain
+all expected results. Native Windows reference and FH6 gameplay remain
+unverified.
+
+diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
+--- a/dlls/ntdll/signal_x86_64.c
++++ b/dlls/ntdll/signal_x86_64.c
+@@ -62,15 +62,46 @@
+  *
+  * Helper to call a syscall entry point from x64 code.
+  */
++/* Copy only the stack parameters described by this build's syscall table. */
++asm( ".section .rdata, \"dr\"\n\t"
++     ".balign 2\n"
++     ".Larm64ec_syscall_args:\n\t"
++#define SYSCALL_ENTRY(id,name,args) ".short " #args "\n\t"
++     ALL_SYSCALLS
++#undef SYSCALL_ENTRY
++     ".text" );
++
+ __ASM_GLOBAL_FUNC( invoke_arm64ec_syscall,
+-                   "movq %r10,8(%rsp)\n\t"  /* ret address to syscall thunk */
+-                   "popq %r10\n\t"          /* remove ret address to thunk caller */
+-                   "movq %r10,8(%rsp)\n\t"  /* and save it */
+-                   "leaq arm64ec_syscalls(%rip),%r10\n\t"
++                   "pushq %r10\n\t"             /* synthetic return to the guest continuation */
++                   "pushq %rbp\n\t"
++                   ".seh_pushreg %rbp\n\t"
++                   "movq %rsp,%rbp\n\t"
++                   ".seh_setframe %rbp,0\n\t"
++                   ".seh_endprologue\n\t"
++                   "pushfq\n\t"                 /* INT 2E does not save flags in R11 */
++                   "pushq %r11\n\t"
++                   "leaq .Larm64ec_syscall_args(%rip),%r11\n\t"
++                   "movzwl (%r11,%rax,2),%r10d\n\t"
++                   "subq $0x20,%r10\n\t"        /* first four arguments are in registers */
++                   "jge 1f\n\t"
++                   "xorl %r10d,%r10d\n"
++                   "1:\tsubq $0x20,%rsp\n\t"    /* native call's home space */
++                   "subq %r10,%rsp\n\t"
++                   "andq $-16,%rsp\n\t"
++                   "testq %r10,%r10\n\t"
++                   "jz 3f\n"
++                   "2:\tmovq 0x30(%rbp,%r10),%r11\n\t"
++                   "movq %r11,0x18(%rsp,%r10)\n\t"
++                   "subq $8,%r10\n\t"
++                   "jnz 2b\n"
++                   "3:\tleaq arm64ec_syscalls(%rip),%r10\n\t"
+                    "callq *(%r10,%rax,8)\n\t"
+-                   "movq (%rsp),%r10\n\t"
+-                   "pushq 8(%rsp)\n\t"      /* restore ret to caller */
+-                   "pushq %r10\n\t"         /* and return to syscall thunk */
++                   "movq -16(%rbp),%r11\n\t"
++                   "movq 8(%rbp),%rcx\n\t"      /* architectural SYSCALL return address */
++                   "pushq -8(%rbp)\n\t"
++                   "popfq\n\t"
++                   "movq %rbp,%rsp\n\t"
++                   "popq %rbp\n\t"
+                    "ret" )
+ 
+ /*******************************************************************

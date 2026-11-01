@@ -1,0 +1,24 @@
+ARM64EC: Restore page protections after patching dispatch slots.
+
+NtProtectVirtualMemory requires a non-null old-protection output. Passing
+nullptr when restoring FEX's dispatch-slot page returns ACCESS_VIOLATION
+and leaves the originally read-only page writable. Supply the existing
+local output variable, which is no longer needed after the restore.
+
+Independent M4 probe checks the three CHPE dispatch slots against their
+PE section write flags: before 0 pass / 3 fail (PAGE_WRITECOPY); after
+3 / 0 (PAGE_READONLY). Memory 51/0, context 546/0, fibers 86/0 and
+invalid-instruction context 108/0 remain unchanged. The probe is in
+tests/fex-runtime; this is not evidence of FH6 gameplay.
+
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -317,7 +317,7 @@
+   ULONG Prot;
+   NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, PAGE_READWRITE, &Prot);
+   *reinterpret_cast<T*>(Address) = Data;
+-  NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, Prot, nullptr);
++  NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, Prot, &Prot);
+ }
+ 
+ void PatchCallChecker() {

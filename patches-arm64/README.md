@@ -261,3 +261,72 @@ The rest came from Microsoft Flight Simulator 2024 runs on the M4 between 2026-1
   NtQueryVirtualMemory's (MemoryBasicInformation) go through the emulator's `GuestProtection` (FEX `0022`), so a
   page FEX made read-execute to see writes into translated code reads back with the program's own protection, as on
   Windows. NtQueryVirtualMemory is wrapped like the other memory calls for this; the emulator's own calls skip it.
+- `0044-ntdll-globalroot-dos-file-paths.patch`: resolve GLOBALROOT aliases that lead back into a DOS namespace
+  before Unix file translation. FH6 reopens a mapped file this way; the failed open caused its later startup
+  exception to go unhandled. Nested and mixed-case aliases work; native object paths still use server lookup.
+  `tests/x64-fidelity/globalroot.c`: initial stock control 3/12, patched 12/12; final test adds native Null and
+  passes 13/13 on the M4. Native Windows reference testing remains pending.
+- `0045-ntdll-arm64-macos-top-down-high-addresses.patch`: Windows MEM_TOP_DOWN allocations on ARM64 macOS search
+  high free addresses before the small reserved low region. FEX's large reservations previously consumed the
+  space above the PE image, preventing FH6 from placing generated code nearby. Explicit addresses, caller bounds,
+  alignment and fallback are preserved. Wine's own stack mappings retain their old policy: moving those high
+  caused posix_spawn EFAULT. `tests/x64-fidelity/topdown.c`: stock 7/8, patched 8/8. The full fidelity suite has no
+  new failures versus stock r6 FEX; x87 failures remain, and FEX patch 0024 addresses WriteProcessMemory. Native Windows reference
+  testing remains pending. These two patches reach FH6 graphics initialization; gameplay is not yet verified.
+- `0046-ntdll-arm64ec-track-executable-data-mappings.patch`: successful non-image section mappings report their
+  protection through the emulator's existing callbacks. Previously a new FILE_MAP_EXECUTE view reported RX but
+  faulted on its first call until a redundant VirtualProtect registered it. Loader-only image notifications retain
+  their existing behavior. `memtest` adds a mapped alias / FlushInstructionCache check: control 50/1, patched 51/0
+  in normal and full validation modes; context 546/0. Native Windows reference and FH6 gameplay remain pending.
+- `0047-ntdll-arm64ec-preserve-guest-memory-region-sizes.patch`: use FEX 0028's optional protection-range hook
+  to report coherent guest regions across SMC write traps. Clamp at genuine guest protection boundaries, then
+  coalesce adjacent matching regions within one allocation. The old scalar hook remains the fallback for older
+  emulators; other information classes and cross-process queries retain their existing behavior. `regiontest`
+  covers generated code, a true RX boundary and decommit: M4 control 78/82, paired correction 160/0 in normal/full
+  modes; x64 Wine control 160/0. Memory 51/0 and context 546/0 remain passing. Native Windows references and FH6
+  gameplay verification remain pending.
+
+`0048` preserves PAGE_GUARD faults in the macOS ARM64 W^X fast paths. An executable writable guard page
+otherwise accepts a write before the normal guard handler runs, retaining PAGE_GUARD and delivering no exception.
+The expanded `memtest` changes from 51/2 to 53/0 in normal/full modes on the M4, using clean FEX through 0030.
+The independent write fixture also matches x64 Wine afterward. This fixes the Unix memory layer only; executable
+instruction decoding through guard pages has a separate FEX limitation, and native Windows references remain pending.
+FH6 still exits during startup; this is not a game compatibility claim.
+
+`0049` reports the actual committed region protections for directly mapped images and data sections through
+the existing ARM64EC protection callbacks. A SEC_IMAGE map outside LoadLibrary previously skipped the loader's
+image notification, so an executable PE section faulted until a redundant VirtualProtect registered it with FEX.
+The requested mapping protection does not describe an image's individual section protections. Loader-managed
+images retain their existing callback. `imagemap` changes from 3/1 to 4/0 on clean FEX0030 in normal/full modes,
+with x64 Wine also 4/0. Memory53/0, region160/0, COW22/0, image-query6/0 and context546/0 retain their passing
+results in both modes. Native Windows references and FH6 gameplay remain unverified.
+
+`0050` gives direct x64 syscalls a separate aligned frame, preserving the guest's live stack values and
+instruction-defined RCX/R11/flags. It copies only the stack arguments declared in ALL_SYSCALLS, rather than
+using guest stack slots for bookkeeping. Entry flags are saved separately because INT 2E does not put them
+in R11. The final `syscalltest` changes from 173/72 to 245/0; its Wine/FEX-only INT 2E mode changes from
+164/54 to 218/0. Corrected results pass normal/full validation with either RSP alignment, and x64 Wine gives
+245/0 for SYSCALL. Context546/0, memory53/0 and fibers86/0 retain their passing results. A synthetic unwind
+recovers the guest continuation, RBP and RSP. Native Windows reference and FH6 gameplay remain unverified.
+
+`0051` is a compatibility candidate for kernel32's imported ARM64EC exports. Their x64 entry points now use
+the same eight-byte no-op prologue as x64 Wine, then jump through the same IAT destination. The list of 791
+forwarders is selected from Wine 11.18's ARM64EC spec and must be regenerated if those imports change.
+Syscall245/0, context546/0, memory53/0 and fibers86/0 pass in normal/full modes. A prototype reaches FH6's
+title, completes Xbox sign-in and reaches the main menu and shader optimization on M4. One prototype
+repeat stalls during saved-account loading; the reproducible patch build subsequently loads the cached
+account, cloud save and main menu. Driving, a complete repeat and the same-build control remain pending. This is not a verified ARM64 compatibility claim or a published engine.
+
+`0052` makes two opt-in switches for programs that rewrite their own code all the time. `HB_FEX_MAPJIT=1` maps the
+emulator's code buffers MAP_JIT and lets the emulator flip its own thread between writing and executing
+(ThreadHbJitWrite, class 0x7fe of NtSetInformationThread), with no W^X page flips. `HB_DIRECT_CONTINUE=1` continues
+emulated code straight from the syscall instead of through a signal. Both are off unless set.
+
+### Forza Horizon 6
+
+`0044` to `0052` with FEX `0024` to `0033`, vkd3d-proton `0008` to `0010` and KosmicKrisp (`kosmickrisp-arm64/`) play Forza
+Horizon 6 on a base M4 with 32 GB, macOS 27.0, with the switches in highball-db's recipe: intro, Xbox sign-in, menus, free
+roam and normal exit, many sessions between 2026-10-29 and 2026-10-31. The stall of about 100 ms every 1.1 s from its copy
+protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the panel showed 8995 of 8997 frames at an even
+2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
+from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.

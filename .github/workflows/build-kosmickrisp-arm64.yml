@@ -1,0 +1,150 @@
+name: build-kosmickrisp-arm64
+
+# KosmicKrisp, Mesa's Vulkan driver on Metal 4, for the arm64 engine line: Mesa at the pinned commit plus the patches in
+# kosmickrisp-arm64/ (steamac's series, then Highball's), and the Khronos Vulkan loader that opens it. Wine's winevulkan
+# opens a library named libMoltenVK.dylib in engine/lib, so the loader ships under that name and VK_DRIVER_FILES (the
+# engine manifest's baseEnv) points it at the driver in renderers/kosmickrisp. The driver links only system libraries:
+# LLVM and SPIRV-LLVM-Translator build its host tools (mesa_clc, vtn_bindgen2) and stay out of the archive.
+
+on:
+  push:
+    paths:
+      - "kosmickrisp-arm64/**"
+      - "inputs-arm64.json"
+      - ".github/workflows/build-kosmickrisp-arm64.yml"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "publish a GitHub release with the tarball"
+        type: boolean
+        default: false
+      ref_note:
+        description: "short note for the archive name"
+        default: "manual"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: pinned sources
+        run: |
+          set -euo pipefail
+          j() { python3 -c "import json;print(json.load(open('inputs-arm64.json'))['$1']['$2'])"; }
+          git init -q src/mesa
+          git -C src/mesa remote add origin "$(j mesa repo)"
+          git -C src/mesa fetch -q --depth 1 origin "$(j mesa commit)"
+          git -C src/mesa checkout -q --detach FETCH_HEAD
+          test "$(git -C src/mesa rev-parse HEAD)" = "$(j mesa commit)"
+          for name in Vulkan-Headers Vulkan-Loader; do
+            git clone -q --depth 1 --branch "$(j "$name" tag)" "$(j "$name" repo)" "src/$name"
+            test "$(git -C "src/$name" rev-parse HEAD)" = "$(j "$name" commit)"
+          done
+      - name: apply patch series
+        run: |
+          set -euo pipefail
+          # steamac's series first, in its order. Its Asahi hunks touch drivers this build leaves out.
+          for p in kosmickrisp-arm64/steamac/*.patch kosmickrisp-arm64/highball/*.patch; do
+            echo "applying $p"
+            git -C src/mesa apply --whitespace=nowarn --exclude='src/asahi/*' --exclude='src/gallium/drivers/asahi/*' "$PWD/$p"
+          done
+      - name: tools
+        run: |
+          set -euo pipefail
+          brew install -q meson ninja pkgconf cmake llvm spirv-llvm-translator spirv-tools glslang
+          python3 -m venv kk/venv
+          kk/venv/bin/pip -q install "mako==1.3.10" "pyyaml==6.0.3" "packaging==25.0"
+          echo "LLVM $(brew list --versions llvm), $(brew list --versions spirv-llvm-translator), $(xcodebuild -version | tr '\n' ' ')"
+      - name: host tools (mesa_clc, vtn_bindgen2)
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/kk/venv/bin:$PATH:$(brew --prefix llvm)/bin"
+          export PKG_CONFIG_PATH="$(brew --prefix spirv-llvm-translator)/lib/pkgconfig:$(brew --prefix llvm)/lib/pkgconfig"
+          meson setup kk/build-clc src/mesa --prefix="$PWD/kk/clc" --buildtype=release -Db_ndebug=true \
+            -Dplatforms= -Dvulkan-drivers= -Dgallium-drivers= -Dopengl=false -Dglx=disabled \
+            -Degl=disabled -Dgbm=disabled -Dzstd=disabled \
+            -Dllvm=enabled -Dshared-llvm=enabled \
+            -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
+            -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true
+          ninja -C kk/build-clc install > kk/clc-build.log || { tail -40 kk/clc-build.log; exit 1; }
+      - name: driver
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/kk/clc/bin:$PWD/kk/venv/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=26.0
+          meson setup kk/build src/mesa --buildtype=release -Db_ndebug=true \
+            -Dplatforms=macos -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dzstd=disabled -Dexpat=disabled \
+            -Dllvm=disabled -Dspirv-tools=disabled -Dmesa-clc=system -Dprecomp-compiler=enabled \
+            --prefer-static
+          ninja -C kk/build src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib > kk/driver-build.log || { tail -40 kk/driver-build.log; exit 1; }
+      - name: loader
+        run: |
+          set -euo pipefail
+          cmake -S src/Vulkan-Headers -B kk/headers -DCMAKE_INSTALL_PREFIX="$PWD/kk/headers-install" -DVULKAN_HEADERS_ENABLE_MODULE=OFF > /dev/null
+          cmake --install kk/headers > /dev/null
+          cmake -G Ninja -S src/Vulkan-Loader -B kk/loader -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            -DVULKAN_HEADERS_INSTALL_DIR="$PWD/kk/headers-install" -DBUILD_TESTS=OFF > /dev/null
+          ninja -C kk/loader > kk/loader-build.log || { tail -40 kk/loader-build.log; exit 1; }
+      - name: package
+        run: |
+          set -euo pipefail
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          note="${{ github.event.inputs.ref_note || 'push' }}"
+          name="kosmickrisp-arm64-${stamp}-${note}"
+          DRIVER=out/renderers/kosmickrisp/libvulkan_kosmickrisp.dylib
+          LOADER=out/lib/libMoltenVK.dylib
+          mkdir -p out/lib out/renderers/kosmickrisp out/licenses
+          cp kk/build/src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib "$DRIVER"
+          cp "$(find kk/loader/loader -name 'libvulkan.1.*.dylib' -type f | head -1)" "$LOADER"
+          install_name_tool -id @rpath/libvulkan_kosmickrisp.dylib "$DRIVER"
+          install_name_tool -id @rpath/libMoltenVK.dylib "$LOADER"
+          for lib in "$DRIVER" "$LOADER"; do
+            lipo -archs "$lib"
+            # Only system libraries: nothing of the build machine may reach a player's Mac.
+            if otool -L "$lib" | sed 1,2d | grep -qv -e '^[[:space:]]*/usr/lib/' -e '^[[:space:]]*/System/'; then
+              otool -L "$lib"; exit 1
+            fi
+            codesign --force -s - "$lib"
+          done
+          # Output to files first: `nm | grep -q` under pipefail fails when grep stops reading early.
+          nm -gU "$DRIVER" > kk/driver-exports.txt
+          grep -q ' _vk_icdGetInstanceProcAddr$' kk/driver-exports.txt
+          nm -gU "$LOADER" > kk/loader-exports.txt
+          grep -q ' _vkGetInstanceProcAddr$' kk/loader-exports.txt
+          strings -a "$DRIVER" > kk/driver-strings.txt
+          grep -q HB_PRESENT_PACE_FPS kk/driver-strings.txt
+          printf '{"file_format_version": "1.0.1", "ICD": {"library_path": "./libvulkan_kosmickrisp.dylib", "api_version": "1.4.305"}}\n' \
+            > out/renderers/kosmickrisp/kosmickrisp_icd.json
+          cp src/mesa/docs/license.rst out/licenses/Mesa-license.rst
+          cp kosmickrisp-arm64/steamac/LICENSE out/licenses/steamac-LICENSE
+          cp kosmickrisp-arm64/steamac/NOTICE out/licenses/steamac-NOTICE
+          cp src/Vulkan-Loader/LICENSE.txt out/licenses/Vulkan-Loader-LICENSE
+          {
+            echo "Mesa $(git -C src/mesa rev-parse HEAD) plus kosmickrisp-arm64/steamac and kosmickrisp-arm64/highball:"
+            ls kosmickrisp-arm64/steamac kosmickrisp-arm64/highball
+            echo "Vulkan-Loader $(git -C src/Vulkan-Loader rev-parse HEAD) as lib/libMoltenVK.dylib"
+            echo "built by highball-engine $(git rev-parse HEAD) with $(xcodebuild -version | tr '\n' ' '), $(brew list --versions llvm), $(brew list --versions spirv-llvm-translator)"
+          } > out/BUILD.txt
+          (cd out && shasum -a 256 lib/libMoltenVK.dylib renderers/kosmickrisp/libvulkan_kosmickrisp.dylib) | tee -a out/BUILD.txt
+          tar -czf "$name.tar.gz" -C out .
+          shasum -a 256 "$name.tar.gz" | tee "$name.tar.gz.sha256"
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kosmickrisp-arm64
+          path: |
+            ${{ env.ARCHIVE }}.tar.gz
+            ${{ env.ARCHIVE }}.tar.gz.sha256
+          retention-days: 14
+      # A workflow can be dispatched only once its file is on the default branch, so a commit message can ask too.
+      - name: release
+        if: ${{ github.event.inputs.publish_release == 'true' || contains(github.event.head_commit.message, '[publish]') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$ARCHIVE" "$ARCHIVE.tar.gz" "$ARCHIVE.tar.gz.sha256" --title "$ARCHIVE" --target "$GITHUB_SHA" \
+            --notes "KosmicKrisp (Mesa's Vulkan driver on Metal 4) for the arm64 engine line, with steamac's and Highball's patches, and the Khronos Vulkan loader. See BUILD.txt inside."
