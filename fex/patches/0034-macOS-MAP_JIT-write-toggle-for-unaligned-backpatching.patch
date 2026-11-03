@@ -1,0 +1,37 @@
+From: Inesh Dey <79165198+ineshd@users.noreply.github.com>
+Subject: [PATCH] macOS: MAP_JIT write toggle for unaligned atomic backpatching
+
+HandleUnalignedAccess takes the spinlock in the block's JITCodeTail and rewrites
+the faulting instruction. Both live in the code buffer, which HB_FEX_MAPJIT=1
+maps as MAP_JIT, so a thread may write them only between HbJitWrite(true) and
+HbJitWrite(false). Patch 0033 wraps the other code-buffer writers but not this
+one, so the first unaligned STLUR/LDAPUR/STLR/LDAR in a block faults on the lock.
+
+The guard is declared before the lock so it is destroyed after it: the unlock is
+also a write to the code buffer.
+
+Compiled for arm64ec with llvm-mingw 20260922 on FEX 2610 plus 0001 to 0033.
+Tested in Forza Horizon 6 on a base M5 (macOS 27.2) with an Xbox Bluetooth controller:
+before it, the game crashed at xtajit64.dll+0x1177ac within about a minute of the
+controller becoming active. With it, about 30 minutes of play with the controller
+had no crash, unhandled exception or crash dump.
+---
+ FEXCore/Source/Utils/ArchHelpers/Arm64.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -2103,6 +2103,12 @@
+   // Lock code mutex during any SIGBUS handling that potentially changes code.
+   // Due to code buffer sharing between threads, code must be carefully backpatched from last to first.
+   // Multiple threads can be attempting to handle the SIGBUS or even be executing the code being backpatched.
++  struct HbJitWriteScope {
++    HbJitWriteScope() { FEXCore::Context::HbJitWrite(true); }
++    ~HbJitWriteScope() { FEXCore::Context::HbJitWrite(false); }
++  };
++  // Before lk: the lock and the patched instructions are in the MAP_JIT code buffer, and so is the unlock.
++  HbJitWriteScope JitWrite;
+   FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(&InlineTail->SpinLockFutex);
+
+   if ((Instr & LDAXR_MASK) == LDAR_INST ||  // LDAR*

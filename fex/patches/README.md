@@ -31,5 +31,8 @@ Wine are in [`../README.md`](../README.md). None has been sent to FEX upstream y
 | `0022` GuestProtection export | A program saw FEX's write trap as its page protection and locked its own pages. | copy protections, Microsoft Flight Simulator 2024 | x86-64 fidelity | Wine 0043 |
 | `0023` code rewriting and lock work | The game stuttered while recompiling code its copy protection rewrites. | Microsoft Flight Simulator 2024 (its recipe sets four switches) | performance (opt-in, seven switches) | 0019 to 0021, the Darwin helper's `ZeroPages` |
 
+`0034` adds the `HbJitWrite` toggle around unaligned atomic backpatching. With `HB_FEX_MAPJIT=1`, that path wrote to the MAP_JIT
+code buffer without it and crashed Forza Horizon 6 at `HandleUnalignedAccess`, seen when a controller came into use. With it, about 30 minutes of play with a controller had no crash.
+
 0019 and 0020 were on by default when they were added. 0023 does not build FEX's own Linux helper as it stands (see
 its paragraph). With no switch set, 0023 behaves as 0001 to 0022.
