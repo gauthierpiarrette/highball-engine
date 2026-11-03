@@ -52,6 +52,11 @@ jobs:
           path: ~/Library/Caches/ccache
           key: ccache-${{ runner.os }}-${{ hashFiles('inputs.json', 'patches/**') }}
           restore-keys: ccache-${{ runner.os }}-
+      # The 32-bit PE side is built for SSE2 maths, as Windows' own DLLs are. GCC's i686 default is
+      # the x87 unit, which Rosetta runs slowly, and every 32-bit game pays it in Wine's own audio
+      # and Direct3D code: r27 to r29 had 1,615 x87 instructions and no SSE in dsound.dll, where
+      # Sikarugir's Wine 10 build has 51 and 1,142 (counted 2026-11-03, highball-db#462, #926). The
+      # Windows ABI only promises a 4-byte aligned stack on i386, so GCC realigns where it spills.
       # OpenGL is not passed explicitly: configure then treats the missing EGL headers
       # (there is no EGL on macOS) as a notice, and the Mac driver links OpenGL.framework.
       - name: configure and build
@@ -69,7 +74,8 @@ jobs:
             --disable-tests \
             CC="ccache clang" CXX="ccache clang++" \
             CROSSCC="ccache x86_64-w64-mingw32-gcc" \
-            i386_CC="ccache i686-w64-mingw32-gcc" x86_64_CC="ccache x86_64-w64-mingw32-gcc"
+            i386_CC="ccache i686-w64-mingw32-gcc" x86_64_CC="ccache x86_64-w64-mingw32-gcc" \
+            i386_CFLAGS="-g -O2 -msse2 -mfpmath=sse -mincoming-stack-boundary=2"
           make -j"$(sysctl -n hw.ncpu)"
           make install-lib
       - name: engine layout
