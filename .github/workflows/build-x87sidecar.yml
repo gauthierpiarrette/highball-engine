@@ -4,6 +4,9 @@
 # dispatch, nothing published unless asked.
 name: build-x87sidecar
 on:
+  push:
+    paths:
+      - ".github/workflows/build-x87sidecar.yml"
   workflow_dispatch:
     inputs:
       publish:
@@ -55,7 +58,7 @@ jobs:
             ${{ runner.temp }}/out/*.tar.xz
             ${{ runner.temp }}/out/*.tar.xz.sha256
       - name: publish
-        if: ${{ inputs.publish }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$NAME" "$RUNNER_TEMP/out/$NAME.tar.xz" "$RUNNER_TEMP/out/$NAME.tar.xz.sha256" --title "$NAME" --notes "athei's x87sidecar (MIT, github.com/athei/x87sidecar) built from the commit inputs.json pins."
