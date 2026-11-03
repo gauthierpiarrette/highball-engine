@@ -10,7 +10,11 @@ one, so the first unaligned STLUR/LDAPUR/STLR/LDAR in a block faults on the lock
 The guard is declared before the lock so it is destroyed after it: the unlock is
 also a write to the code buffer.
 
-Compiled for arm64ec with llvm-mingw 20260922 on FEX 2610 plus 0001 to 0033. Not yet tested in game.
+Compiled for arm64ec with llvm-mingw 20260922 on FEX 2610 plus 0001 to 0033.
+Tested in Forza Horizon 6 on a base M5 (macOS 27.2) with an Xbox Bluetooth controller:
+before it, the game crashed at xtajit64.dll+0x1177ac within about a minute of the
+controller becoming active. With it, about 30 minutes of play with the controller
+had no crash, unhandled exception or crash dump.
 ---
  FEXCore/Source/Utils/ArchHelpers/Arm64.cpp | 6 ++++++
  1 file changed, 6 insertions(+)
