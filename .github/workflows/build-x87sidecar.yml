@@ -1,0 +1,64 @@
+# Builds athei's x87sidecar (MIT) from the commit inputs.json pins, for the Wine 11 engines. Wine
+# re-executes a 32-bit program through it when ROSETTA_X87_PATH names it (patches/0012, cooperative
+# attach, no entitlements), which Highball sets only for games the database opts in. Manual
+# dispatch, nothing published unless asked.
+name: build-x87sidecar
+on:
+  push:
+    paths:
+      - ".github/workflows/build-x87sidecar.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the archive as a GitHub release (tag x87sidecar-<tag>-<date>)"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: pinned source
+        run: |
+          set -euo pipefail
+          repo=$(python3 -c 'import json;print(json.load(open("inputs.json"))["x87sidecar"]["repo"])')
+          commit=$(python3 -c 'import json;print(json.load(open("inputs.json"))["x87sidecar"]["commit"])')
+          git clone --quiet "$repo" src
+          git -C src checkout --quiet "$commit"
+          git -C src log --oneline -1
+      - name: build
+        run: |
+          set -euo pipefail
+          cd src
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target x87sidecar -j "$(sysctl -n hw.ncpu)"
+          file build/bin/x87sidecar
+      - name: package
+        run: |
+          set -euo pipefail
+          tag=$(python3 -c 'import json;print(json.load(open("inputs.json"))["x87sidecar"]["tag"])')
+          name="x87sidecar-$tag-$(date -u +%Y%m%dT%H%M%SZ)"
+          out="$RUNNER_TEMP/out/$name"; mkdir -p "$out/x87sidecar"
+          cp src/build/bin/x87sidecar "$out/x87sidecar/"
+          cp src/LICENSE "$out/x87sidecar/LICENSE"
+          git -C src rev-parse HEAD > "$out/x87sidecar/SOURCE_COMMIT"
+          codesign -f -s - "$out/x87sidecar/x87sidecar"
+          codesign -v "$out/x87sidecar/x87sidecar"
+          tar -C "$out" -cJf "$RUNNER_TEMP/out/$name.tar.xz" x87sidecar
+          (cd "$RUNNER_TEMP/out" && shasum -a 256 "$name.tar.xz" > "$name.tar.xz.sha256")
+          echo "NAME=$name" >> "$GITHUB_ENV"
+          cat "$RUNNER_TEMP/out/$name.tar.xz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x87sidecar
+          path: |
+            ${{ runner.temp }}/out/*.tar.xz
+            ${{ runner.temp }}/out/*.tar.xz.sha256
+      - name: publish
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$NAME" "$RUNNER_TEMP/out/$NAME.tar.xz" "$RUNNER_TEMP/out/$NAME.tar.xz.sha256" --title "$NAME" --notes "athei's x87sidecar (MIT, github.com/athei/x87sidecar) built from the commit inputs.json pins."

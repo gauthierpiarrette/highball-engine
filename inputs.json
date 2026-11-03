@@ -16,5 +16,12 @@
     "runner": "macos-15-intel",
     "mingw": "mingw-w64 (gcc) via Homebrew; llvm-mingw is known to break Steam's login (frankea, 2026-08-04)",
     "hostArch": "x86_64"
+  },
+  "x87sidecar": {
+    "repo": "https://github.com/athei/x87sidecar",
+    "tag": "v1.9.0",
+    "commit": "0b7c5e54dad37f6ed8374b91443e2d2083652452",
+    "license": "MIT",
+    "note": "athei's x87sidecar, built from source for the Wine 11 engines; Wine's side (cooperative attach, ROSETTA_X87_PATH) is patches/0012 since r12."
   }
 }
