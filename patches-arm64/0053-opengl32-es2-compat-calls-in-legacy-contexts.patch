@@ -1,0 +1,98 @@
+opengl32: GL_ARB_ES2_compatibility's calls answer in legacy contexts (arm64 line).
+
+The Wine 11 line's patch 0021 for Wine 11.18, where wglGetProcAddress moved to the PE side
+(dlls/opengl32/wgl.c) and the unix side's table of alternatives is gone.
+
+macOS gives a program that creates an OpenGL context without attributes a legacy 2.1 context,
+and lists GL_ARB_ES2_compatibility only in its 4.1 core contexts. opengl32 then withholds the
+extension's calls and returns no function. Programs written against OpenGL ES 2 load them anyway,
+since every Windows driver offers them in any context, and call the empty pointer. Paperback: The
+Game (Steam 710700, Loom engine, SDL and OpenGL) faulted executing address 0 a few seconds after
+start on engine arm64-kk-wine11.18-r3 (M4, macOS 27.0, 2026-11-04), as it did on the Wine 11 line
+before patch 0021 (highball-db#349).
+
+When the extension is missing, glClearDepthf and glDepthRangef now go through glClearDepth and
+glDepthRange, glGetShaderPrecisionFormat answers what desktop drivers answer (single precision
+floats, 32-bit integers), and glReleaseShaderCompiler and glShaderBinary do nothing (no binary
+formats are listed without the extension). A context that has the extension is unchanged.
+
+--- a/dlls/opengl32/wgl.c	2026-11-04 11:11:26
++++ b/dlls/opengl32/wgl.c	2026-11-04 11:11:26
+@@ -2257,8 +2257,51 @@
+ {
+     FIXME( "hdc %p, plane %d, start %d, count %d, colors %p, stub!\n", hdc, plane, start, count, colors );
+     return 0;
++}
++
++/* GL_ARB_ES2_compatibility's calls. macOS lists that extension only in 4.1 core contexts, but
++ * programs written against OpenGL ES 2 call these in a legacy (2.1) context too, which every
++ * Windows driver allows. The depth calls go through the double precision core ones. */
++static void WINAPI compat_glClearDepthf( GLfloat d )
++{
++    glClearDepth( d );
++}
++
++static void WINAPI compat_glDepthRangef( GLfloat n, GLfloat f )
++{
++    glDepthRange( n, f );
++}
++
++/* What desktop drivers answer: IEEE single precision floats and 32-bit integers. */
++static void WINAPI compat_glGetShaderPrecisionFormat( GLenum shadertype, GLenum precisiontype, GLint *range, GLint *precision )
++{
++    switch (precisiontype)
++    {
++    case GL_LOW_FLOAT:
++    case GL_MEDIUM_FLOAT:
++    case GL_HIGH_FLOAT:
++        range[0] = range[1] = 127;
++        *precision = 23;
++        break;
++    case GL_LOW_INT:
++    case GL_MEDIUM_INT:
++    case GL_HIGH_INT:
++        range[0] = 31;
++        range[1] = 30;
++        *precision = 0;
++        break;
++    }
+ }
+ 
++static void WINAPI compat_glReleaseShaderCompiler(void)
++{
++}
++
++/* No binary formats are listed without the extension, so there is nothing to load. */
++static void WINAPI compat_glShaderBinary( GLsizei count, const GLuint *shaders, GLenum binaryformat, const void *binary, GLsizei length )
++{
++}
++
+ /***********************************************************************
+  *		wglGetProcAddress (OPENGL32.@)
+  */
+@@ -2290,6 +2333,25 @@
+     for (ext = func->extensions; *ext != GL_EXTENSION_COUNT; ext++)
+     {
+         if (ctx->base.extensions[*ext]) return func->func;
++    }
++
++    {
++        static const struct { const char *name; PROC func; } emulated[] =
++        {
++            { "glClearDepthf", (PROC)compat_glClearDepthf },  /* needed by Paperback: The Game (Loom) */
++            { "glDepthRangef", (PROC)compat_glDepthRangef },
++            { "glGetShaderPrecisionFormat", (PROC)compat_glGetShaderPrecisionFormat },
++            { "glReleaseShaderCompiler", (PROC)compat_glReleaseShaderCompiler },
++            { "glShaderBinary", (PROC)compat_glShaderBinary },
++        };
++        unsigned int i;
++
++        for (i = 0; i < ARRAY_SIZE(emulated); i++)
++        {
++            if (strcmp( name, emulated[i].name )) continue;
++            WARN( "Extensions required for %s not supported, emulating it\n", name );
++            return emulated[i].func;
++        }
+     }
+ 
+     WARN( "Extensions required for %s not supported\n", name );
