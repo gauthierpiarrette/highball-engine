@@ -86,6 +86,10 @@ jobs:
           set -euo pipefail
           cmake -S src/Vulkan-Headers -B kk/headers -DCMAKE_INSTALL_PREFIX="$PWD/kk/headers-install" -DVULKAN_HEADERS_ENABLE_MODULE=OFF > /dev/null
           cmake --install kk/headers > /dev/null
+          # MoltenVK's vkGetMTLDeviceMVK goes into the loader, which ships as libMoltenVK.dylib: GStreamer's
+          # applemedia plugin (VideoToolbox decoding) imports it and does not load without it.
+          cp kosmickrisp-arm64/mvk_compat.c src/Vulkan-Loader/loader/mvk_compat.c
+          printf '\ntarget_sources(vulkan PRIVATE mvk_compat.c)\ntarget_link_libraries(vulkan PRIVATE "-framework Metal")\n' >> src/Vulkan-Loader/loader/CMakeLists.txt
           cmake -G Ninja -S src/Vulkan-Loader -B kk/loader -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
             -DVULKAN_HEADERS_INSTALL_DIR="$PWD/kk/headers-install" -DBUILD_TESTS=OFF > /dev/null
           ninja -C kk/loader > kk/loader-build.log || { tail -40 kk/loader-build.log; exit 1; }
@@ -115,6 +119,7 @@ jobs:
           grep -q ' _vk_icdGetInstanceProcAddr$' kk/driver-exports.txt
           nm -gU "$LOADER" > kk/loader-exports.txt
           grep -q ' _vkGetInstanceProcAddr$' kk/loader-exports.txt
+          grep -q ' _vkGetMTLDeviceMVK$' kk/loader-exports.txt
           strings -a "$DRIVER" > kk/driver-strings.txt
           grep -q HB_PRESENT_PACE_FPS kk/driver-strings.txt
           printf '{"file_format_version": "1.0.1", "ICD": {"library_path": "./libvulkan_kosmickrisp.dylib", "api_version": "1.4.305"}}\n' \
