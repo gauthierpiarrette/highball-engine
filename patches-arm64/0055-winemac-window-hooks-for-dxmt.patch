@@ -1,0 +1,163 @@
+winemac: the window hooks DXMT looks up (arm64 line).
+
+DXMT's Unix side (winemetal) puts a Metal layer in a window's client area through a table it
+finds with dlsym, macdrv_functions, which CrossOver's winemac exports for D3DMetal and DXMT
+(dlls/winemac.drv/d3dmetal.c, Brendan Shanks for CodeWeavers, LGPL). Wine 11.18's winemac
+exports nothing but its unix call table, and its macdrv_win_data no longer has the layout DXMT
+reads (window, view, client view), so DXMT could not draw on the arm64 line.
+
+The table now exists with the first ten entries DXMT uses. Its get_win_data makes a client
+surface for the swapchain first (making one takes the window data lock), keeps it with the
+window until DestroyWindow, and answers in DXMT's layout with that surface's view as the client
+view, as CrossOver's does. The registry and window entries CrossOver adds after those ten are
+D3DMetal's and not here. Nothing changes for a program that does not use DXMT.
+
+--- a/dlls/winemac.drv/window.c	2026-11-04 15:55:25
++++ b/dlls/winemac.drv/window.c	2026-11-04 15:55:25
+@@ -1262,11 +1262,15 @@
+ /***********************************************************************
+  *              DestroyWindow   (MACDRV.@)
+  */
++static void dxmt_release_client_surfaces(HWND hwnd);
++
+ void macdrv_DestroyWindow(HWND hwnd)
+ {
+     struct macdrv_win_data *data;
+ 
+     TRACE("%p\n", hwnd);
++
++    dxmt_release_client_surfaces(hwnd);
+ 
+     if (!(data = get_win_data(hwnd))) return;
+ 
+@@ -2214,4 +2218,130 @@
+     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+     pthread_mutex_init(&win_data_mutex, &attr);
+     pthread_mutexattr_destroy(&attr);
++}
++
++
++/***********************************************************************
++ *              macdrv_functions
++ *
++ * The table DXMT's Unix side looks up with dlsym to put a Metal layer in a window's client area,
++ * as CrossOver's winemac exports it (dlls/winemac.drv/d3dmetal.c, Brendan Shanks for CodeWeavers).
++ * Its get_win_data answers in the layout DXMT reads: the window, then the view, then the client
++ * view, which is the view of a client surface made for the swapchain. The surfaces stay with the
++ * window until it is destroyed, since the Metal view DXMT puts in one outlives the call.
++ */
++struct dxmt_win_data
++{
++    HWND                    hwnd;
++    WineWindow             *cocoa_window;
++    WineContentView        *cocoa_view;
++    WineContentView        *client_cocoa_view;
++    struct macdrv_win_data *data;
++};
++
++struct dxmt_functions
++{
++    void (*init_display_devices)(BOOL force);
++    struct dxmt_win_data *(*get_win_data)(HWND hwnd);
++    void (*release_win_data)(struct dxmt_win_data *data);
++    WineWindow *(*get_cocoa_window)(HWND hwnd, BOOL require_on_screen);
++    id_MTLDevice (*create_metal_device)(void);
++    void (*release_metal_device)(id_MTLDevice device);
++    WineMetalView *(*view_create_metal_view)(WineContentView *view, id_MTLDevice device);
++    CAMetalLayer *(*view_get_metal_layer)(WineMetalView *view);
++    void (*view_release_metal_view)(WineMetalView *view);
++    void *on_main_thread;
++};
++
++static pthread_mutex_t dxmt_surfaces_mutex = PTHREAD_MUTEX_INITIALIZER;
++static CFMutableDictionaryRef dxmt_surfaces;
++
++static void dxmt_surface_release(CFAllocatorRef allocator, const void *client)
++{
++    client_surface_release((struct client_surface *)client);
++}
++
++static void dxmt_keep_client_surface(HWND hwnd, struct client_surface *client)
++{
++    static const CFArrayCallBacks callbacks = { .release = dxmt_surface_release };
++    CFMutableArrayRef surfaces;
++
++    pthread_mutex_lock(&dxmt_surfaces_mutex);
++    if (!dxmt_surfaces) dxmt_surfaces = CFDictionaryCreateMutable(NULL, 0, NULL, &kCFTypeDictionaryValueCallBacks);
++    if (!(surfaces = (CFMutableArrayRef)CFDictionaryGetValue(dxmt_surfaces, hwnd)))
++    {
++        surfaces = CFArrayCreateMutable(NULL, 0, &callbacks);
++        CFDictionarySetValue(dxmt_surfaces, hwnd, surfaces);
++        CFRelease(surfaces);
++    }
++    CFArrayAppendValue(surfaces, client);
++    pthread_mutex_unlock(&dxmt_surfaces_mutex);
++}
++
++static void dxmt_release_client_surfaces(HWND hwnd)
++{
++    pthread_mutex_lock(&dxmt_surfaces_mutex);
++    if (dxmt_surfaces) CFDictionaryRemoveValue(dxmt_surfaces, hwnd);
++    pthread_mutex_unlock(&dxmt_surfaces_mutex);
+ }
++
++static void dxmt_init_display_devices(BOOL force)
++{
++    TRACE("%d, nothing to do\n", force);
++}
++
++static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct macdrv_client_surface *surface;
++    struct client_surface *client;
++    struct macdrv_win_data *data;
++    struct dxmt_win_data *ret;
++
++    TRACE("%p\n", hwnd);
++
++    /* The client surface comes first: making it takes the window data lock itself. */
++    if (!(client = macdrv_CreateClientSurface(hwnd, 0, FALSE))) return NULL;
++    surface = impl_from_client_surface(client);
++    if (!(data = get_win_data(hwnd)))
++    {
++        client_surface_release(client);
++        return NULL;
++    }
++    if (!(ret = calloc(1, sizeof(*ret))))
++    {
++        release_win_data(data);
++        client_surface_release(client);
++        return NULL;
++    }
++    dxmt_keep_client_surface(hwnd, client);
++
++    ret->hwnd = data->hwnd;
++    ret->cocoa_window = data->cocoa_window;
++    ret->cocoa_view = surface->cocoa_view;
++    ret->client_cocoa_view = surface->cocoa_view;
++    ret->data = data;
++    return ret;
++}
++
++static void dxmt_release_win_data(struct dxmt_win_data *ret)
++{
++    TRACE("%p\n", ret);
++
++    if (!ret) return;
++    release_win_data(ret->data);
++    free(ret);
++}
++
++DECLSPEC_EXPORT const struct dxmt_functions macdrv_functions =
++{
++    dxmt_init_display_devices,
++    dxmt_get_win_data,
++    dxmt_release_win_data,
++    macdrv_get_cocoa_window,
++    macdrv_create_metal_device,
++    macdrv_release_metal_device,
++    macdrv_view_create_metal_view,
++    macdrv_view_get_metal_layer,
++    macdrv_view_release_metal_view,
++    NULL,
++};
