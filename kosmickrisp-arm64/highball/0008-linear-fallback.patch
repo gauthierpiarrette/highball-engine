@@ -1,3 +1,33 @@
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -909,13 +909,20 @@
+       }
+    }
+ 
+-   pLayout->subresourceLayout = (VkSubresourceLayout){
+-      .offset = offset_B,
+-      .size = plane->layout.size_B,
+-      .rowPitch = plane->layout.linear_stride_B,
+-      .arrayPitch = plane->layout.layer_stride_B,
+-      .depthPitch = 1u,
+-   };
++   if (image->vk.tiling == VK_IMAGE_TILING_LINEAR && !plane->layout.linear) {
++      kk_image_layout_host_subresource(&plane->layout, isr->mipLevel,
++                                       isr->arrayLayer,
++                                       &pLayout->subresourceLayout);
++      pLayout->subresourceLayout.offset += offset_B;
++   } else {
++      pLayout->subresourceLayout = (VkSubresourceLayout){
++         .offset = offset_B,
++         .size = plane->layout.size_B,
++         .rowPitch = plane->layout.linear_stride_B,
++         .arrayPitch = plane->layout.layer_stride_B,
++         .depthPitch = 1u,
++      };
++   }
+ 
+    VkSubresourceHostMemcpySize *memcpy_size =
+       vk_find_struct(pLayout, SUBRESOURCE_HOST_MEMCPY_SIZE_EXT);
 --- a/src/kosmickrisp/vulkan/kk_image_layout.c
 +++ b/src/kosmickrisp/vulkan/kk_image_layout.c
 @@ -230,6 +230,10 @@
@@ -11,3 +41,51 @@
     layout->optimized_layout = kk_image_layout_can_optimize(
        pdev, image->usage, image->tiling, image->create_flags, format);
     layout->usage = vk_image_usage_flags_to_mtl_texture_usage(
+@@ -261,4 +265,36 @@
+    } else {
+       kk_image_layout_calc_tiled(dev, layout);
+    }
++
++   if (image->tiling == VK_IMAGE_TILING_LINEAR && !layout->linear)
++      layout->size_B = MAX2(layout->size_B,
++                            kk_image_layout_host_subresource(layout, 0, 0, NULL));
++}
++
++uint64_t
++kk_image_layout_host_subresource(const struct kk_image_layout *layout,
++                                 uint32_t level, uint32_t layer,
++                                 VkSubresourceLayout *out)
++{
++   uint64_t offset_B = 0;
++   for (uint32_t l = 0; l < layout->levels; l++) {
++      const uint32_t depth_px = u_minify(layout->depth_px, l);
++      const uint64_t row_B =
++         util_format_get_stride(layout->format.pipe, u_minify(layout->width_px, l));
++      const uint64_t slice_B =
++         row_B * util_format_get_nblocksy(layout->format.pipe,
++                                          u_minify(layout->height_px, l));
++      const uint64_t layer_B = slice_B * depth_px;
++      if (out && l == level) {
++         *out = (VkSubresourceLayout){
++            .offset = offset_B + layer_B * layer,
++            .size = layer_B,
++            .rowPitch = row_B,
++            .arrayPitch = layer_B,
++            .depthPitch = slice_B,
++         };
++      }
++      offset_B += layer_B * layout->layers;
++   }
++   return offset_B;
+ }
+--- a/src/kosmickrisp/vulkan/kk_image_layout.h
++++ b/src/kosmickrisp/vulkan/kk_image_layout.h
+@@ -221,4 +221,8 @@
+                           const uint8_t width_scale, const uint8_t height_scale,
+                           struct kk_image_layout *layout);
+ 
++uint64_t kk_image_layout_host_subresource(const struct kk_image_layout *layout,
++                                          uint32_t level, uint32_t layer,
++                                          VkSubresourceLayout *out);
++
+ #endif /* KK_IMAGE_LAYOUT_H */
