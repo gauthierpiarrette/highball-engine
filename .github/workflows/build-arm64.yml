@@ -170,6 +170,9 @@ jobs:
             i386_CC="ccache i686-w64-mingw32-clang"
           make -j"$(sysctl -n hw.ncpu)"
           make install-lib
+          # Headers, import libraries and winebuild for renderers built against this Wine (DXMT's
+          # winemetal links winecrt0 and ntdll for its own architecture), kept out of the engine.
+          make install-dev prefix="$PWD/../sdk"
           grep -E "SONAME_LIB(VULKAN|FREETYPE|GNUTLS|SDL2) " include/config.h
           test -f ../out/engine/lib/wine/aarch64-unix/winegstreamer.so
       - name: FEX
@@ -334,6 +337,16 @@ jobs:
           path: |
             engine-arm64-*.tar.gz
             engine-arm64-*.tar.gz.sha256
+          retention-days: 14
+      - name: dev kit
+        run: |
+          set -euo pipefail
+          tar -C sdk -czf wine-arm64-sdk.tar.gz include lib bin
+          ls sdk/lib/wine; ls -la wine-arm64-sdk.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wine-arm64-sdk
+          path: wine-arm64-sdk.tar.gz
           retention-days: 14
       - name: publish release
         if: ${{ github.event.inputs.publish_release == 'true' }}
