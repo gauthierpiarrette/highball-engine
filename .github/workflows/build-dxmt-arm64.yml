@@ -1,13 +1,18 @@
 name: build-dxmt-arm64
 
-# DXMT for the native arm64 engine line: the x86_64 and i386 Windows halves as in build-dxmt
-# (games and their DLLs run under FEX there), and the Unix half, winemetal.so with its airconv
-# shader converter, built for arm64 against the arm64 line's own winemac.so and ntdll.so.
-# Needs the DXMT fork's native_cpu option and, at run time, an engine whose winemac exports the
-# macdrv_functions window hooks (patches-arm64 0055). Packaged in the layout an engine extracts:
-# renderers/dxmt/wine/{x86_64-windows,i386-windows,aarch64-unix}.
+# DXMT for the native arm64 engine line. The 64-bit half is built for ARM64EC with DXMT's own
+# arm64ec support (build-arm64ec.txt, upstream 7ef5d9c), so its DLLs install to aarch64-windows
+# and winemetal.dll is a builtin Wine maps in an ARM64EC process (an x86_64 builtin is refused
+# there, measured on arm64-kk r4h, 2026-11-04). Its Unix half, winemetal.so with the airconv shader
+# converter, is arm64. winemetal links Wine's winecrt0 and ntdll for aarch64-windows: those import
+# libraries, the headers and winebuild come from the wine-arm64-sdk artifact of a build-engine-arm64
+# run (input sdk_run), the toolchain is the engine's own llvm-mingw (inputs-arm64.json). The i386
+# half is as in build-dxmt. At run time it needs an engine whose winemac exports the macdrv_functions
+# window hooks (patches-arm64 0055). Packaged in the layout an engine extracts:
+# renderers/dxmt/wine/{aarch64-windows,i386-windows,aarch64-unix}.
 
 on:
+  # Pushes of this file build it: workflow_dispatch works only for workflows on the default branch.
   push:
     paths:
       - ".github/workflows/build-dxmt-arm64.yml"
@@ -16,6 +21,9 @@ on:
       ref:
         description: "dxmt fork ref to build"
         default: "highball-arm64"
+      sdk_run:
+        description: "build-engine-arm64 run id whose wine-arm64-sdk artifact to build against (default SDK_RUN below)"
+        required: false
       publish_release:
         description: "publish a GitHub release with the tarball"
         type: boolean
@@ -23,6 +31,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 env:
   LLVM_VERSION: llvmorg-15.0.7
@@ -30,6 +39,8 @@ env:
   # Any published arm64 engine: only its aarch64-unix winemac.so and ntdll.so are linked against.
   ARM64_WINE: engine-arm64-wine-11.18-20261103T154050Z-fh6-native-r3-fex0034
   DXMT_REPO: gauthierpiarrette/dxmt
+  # The build-engine-arm64 run whose wine-arm64-sdk artifact a push builds against.
+  SDK_RUN: ${{ inputs.sdk_run || '41996895127' }}
 
 jobs:
   llvm-darwin-arm64:
@@ -80,37 +91,73 @@ jobs:
           repository: ${{ env.DXMT_REPO }}
           ref: ${{ inputs.ref || 'highball-arm64' }}
           submodules: true
-      - name: Wine headers, and the arm64 line's winemac.so and ntdll.so
+      - name: Checkout highball-engine (for the pinned llvm-mingw)
+        uses: actions/checkout@v4
+        with:
+          path: he
+      - name: llvm-mingw for ARM64EC
         run: |
           set -euo pipefail
-          mkdir -p ./toolchains/wine
-          curl -sSL "${{ env.WINE_URL }}" | tar -xz -C ./toolchains/wine
+          url=$(python3 -c "import json;print(json.load(open('he/inputs-arm64.json'))['llvm-mingw']['url'])")
+          sha=$(python3 -c "import json;print(json.load(open('he/inputs-arm64.json'))['llvm-mingw']['sha256'])")
+          curl -sSL --retry 3 -o llvm-mingw.tar.xz "$url"
+          echo "$sha  llvm-mingw.tar.xz" | shasum -a 256 -c -
+          mkdir -p toolchains/llvm-mingw && tar -xJf llvm-mingw.tar.xz -C toolchains/llvm-mingw --strip-components 1
+          echo "$PWD/toolchains/llvm-mingw/bin" >> "$GITHUB_PATH"
+          toolchains/llvm-mingw/bin/arm64ec-w64-mingw32-clang --version | head -1
+      - name: Wine dev kit for aarch64-windows, and the arm64 line's winemac.so and ntdll.so
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$SDK_RUN" -R "${{ github.repository }}" -n wine-arm64-sdk -D sdk-dl
+          mkdir -p toolchains/wine && tar -xzf sdk-dl/wine-arm64-sdk.tar.gz -C toolchains/wine
+          ls toolchains/wine/lib/wine/aarch64-windows | grep -E '^lib(winecrt0|ntdll|dbghelp)\.a$'
+          toolchains/wine/bin/winebuild --version
           curl -sSL -o arm64-wine.tar.gz "https://github.com/${{ github.repository_owner }}/highball-engine/releases/download/${{ env.ARM64_WINE }}/${{ env.ARM64_WINE }}.tar.gz"
-          mkdir -p arm64-wine ./toolchains/wine/lib/wine/aarch64-unix
+          mkdir -p arm64-wine toolchains/wine/lib/wine/aarch64-unix
           tar -xzf arm64-wine.tar.gz -C arm64-wine engine/lib/wine/aarch64-unix/winemac.so engine/lib/wine/aarch64-unix/ntdll.so
-          cp arm64-wine/engine/lib/wine/aarch64-unix/winemac.so arm64-wine/engine/lib/wine/aarch64-unix/ntdll.so ./toolchains/wine/lib/wine/aarch64-unix/
-          lipo -archs ./toolchains/wine/lib/wine/aarch64-unix/winemac.so
+          cp arm64-wine/engine/lib/wine/aarch64-unix/winemac.so arm64-wine/engine/lib/wine/aarch64-unix/ntdll.so toolchains/wine/lib/wine/aarch64-unix/
       - name: Restore LLVM cache
         uses: actions/cache/restore@v4
         with:
           key: llvm-darwin-${{ env.LLVM_VERSION }}-arm64-macos
           path: ./toolchains/llvm-darwin
           fail-on-cache-miss: true
-      - name: mingw-w64 and meson
-        run: |
-          brew install mingw-w64 >/dev/null
-          pip3 install meson==1.10.0 --break-system-packages
+      - name: meson
+        run: pip3 install meson==1.10.0 --break-system-packages
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.1.app
-      - name: Build (x86_64 Windows half, arm64 Unix half)
+      - name: Build (ARM64EC Windows half, arm64 Unix half)
         run: |
-          meson setup --cross-file build-win64.txt -Denable_nvapi=true -Denable_nvngx=true -Dnative_cpu=aarch64 \
+          set -euo pipefail
+          # build-arm64ec.txt names gcc-style tools; llvm-mingw's are clang and llvm-*.
+          cat > arm64ec-llvm.txt <<'EOF'
+          [binaries]
+          c = 'arm64ec-w64-mingw32-clang'
+          cpp = 'arm64ec-w64-mingw32-clang++'
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          windres = 'arm64ec-w64-mingw32-windres'
+
+          [properties]
+          needs_exe_wrapper = true
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+          meson setup --cross-file arm64ec-llvm.txt -Denable_nvapi=true -Denable_nvngx=true \
             -Dnative_llvm_path=toolchains/llvm-darwin -Dwine_install_path=toolchains/wine \
             build --buildtype release --prefix "$(pwd)/install" --strip
           meson compile -C build
           meson install -C build
           git rev-parse --short HEAD > install/DXMT_COMMIT
+          find install -maxdepth 2
           find install -name 'winemetal.so' -exec lipo -archs {} \;
+          for f in $(find install -name '*.dll'); do printf '%s ' "$f"; llvm-objdump -f "$f" | grep -i 'file format'; done
       - uses: actions/upload-artifact@v4
         with:
           name: dxmt-win64
@@ -163,7 +210,7 @@ jobs:
         run: |
           commit=$(cat ./combined/highball/DXMT_COMMIT)
           rm -f ./combined/highball/DXMT_COMMIT
-          name="dxmt-arm64-highball-$(date -u +%Y%m%dT%H%M%SZ)-${commit}"
+          name="dxmt-arm64ec-highball-$(date -u +%Y%m%dT%H%M%SZ)-${commit}"
           tar -czf "$name.tar.gz" -C ./combined --exclude='*.a' highball
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -181,4 +228,4 @@ jobs:
         run: |
           n="${{ steps.tar.outputs.name }}"
           gh release create "$n" "$n.tar.gz" "$n.tar.gz.sha256" -R "${{ github.repository }}" \
-            --title "$n" --notes "DXMT for the arm64 engine line from ${{ env.DXMT_REPO }}@${{ inputs.ref || 'highball-arm64' }}: x86_64 and i386 Windows halves, arm64 Unix half. Extracts into renderers/dxmt/wine with subpath highball."
+            --title "$n" --notes "DXMT for the arm64 engine line from ${{ env.DXMT_REPO }}@${{ inputs.ref || 'highball-arm64' }}: ARM64EC and i386 Windows halves, arm64 Unix half, built against the wine-arm64-sdk of build-engine-arm64 run ${{ env.SDK_RUN }}. Extracts into renderers/dxmt/wine with subpath highball."
