@@ -330,3 +330,12 @@ roam and normal exit, many sessions between 2026-10-29 and 2026-10-31. The stall
 protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the panel showed 8995 of 8997 frames at an even
 2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
 from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.
+
+### Spatial audio (0056, 0057)
+
+The Intel line's `0022` and `0023` by Tx (highball#313), carried unchanged. A game that renders through ISpatialAudioClient
+as a surround bed (Forza Horizon 6 uses 7.1.4) got only front left and right on a Mac's stereo output, so voices, the
+navigator and most of the engine were lost, and on the arm64 line sounds behind the camera dropped out (highball#672).
+`0056` puts static objects in speaker-bit order and `0057` renders a bed with more channels than the device through
+AUSpatialMixer, for speakers or headphones (`HB_SPATIAL=speakers|headphones|external` overrides the guess, `HB_SPATIAL=0`
+turns it off). Tested by Tx on the Intel line with Forza Horizon 6, not yet run on the arm64 line.
