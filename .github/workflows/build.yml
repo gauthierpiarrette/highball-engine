@@ -22,7 +22,7 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 300
     env:
-      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@v4
       - name: pinned source
