@@ -1,0 +1,50 @@
+gdi32: D3DKMTSetProcessSchedulingPriorityClass exists and succeeds.
+
+Steam's client service (bin/SteamService.dll, 32-bit, the client of
+2026-10-31 in a Highball environment) imports
+GDI32.D3DKMTSetProcessSchedulingPriorityClass by name. Neither CrossOver 26.3
+nor upstream Wine master (gdi32.spec, 2026-11-12) exports it, so Wine's
+loader binds the import to a stub that ends the process when called: "wine:
+Call from 7BE7E998 to unimplemented function
+GDI32.dll.D3DKMTSetProcessSchedulingPriorityClass, aborting". In highball#699
+that line came while Satisfactory's Steam overlay was opening on the Wine 11
+engine r31 (M5, macOS 27.2), followed by Steam's "CSteamEngine::BMainLoop
+appears to have stalled > 15 seconds", and the game froze. That the abort
+caused the freeze is a reading of the log, not measured.
+
+The service already handles a failure ("SteamService:
+D3DKMTSetProcessSchedulingPriorityClass failed with status=%d!"), so a stub
+that answers is enough; it answers success, as Windows does for a caller that
+may set the class. Measured before the patch: GetProcAddress for the name
+returns NULL on the Wine 11 engine r31 and the Wine 10 engine r28.
+
+Upstream: not sent.
+
+--- a/dlls/gdi32/gdi32.spec	2026-11-12 10:03:02
++++ b/dlls/gdi32/gdi32.spec	2026-11-12 10:03:02
+@@ -143,6 +143,7 @@
+ @ stdcall D3DKMTQueryVideoMemoryInfo(ptr) win32u.NtGdiDdDDIQueryVideoMemoryInfo
+ @ stdcall D3DKMTReleaseKeyedMutex(ptr) win32u.NtGdiDdDDIReleaseKeyedMutex
+ @ stdcall D3DKMTReleaseKeyedMutex2(ptr) win32u.NtGdiDdDDIReleaseKeyedMutex2
++@ stdcall D3DKMTSetProcessSchedulingPriorityClass(long long)
+ @ stdcall D3DKMTSetQueuedLimit(ptr) win32u.NtGdiDdDDISetQueuedLimit
+ @ stdcall D3DKMTSetVidPnSourceOwner(ptr) win32u.NtGdiDdDDISetVidPnSourceOwner
+ @ stdcall D3DKMTShareObjects(long ptr ptr long ptr) win32u.NtGdiDdDDIShareObjects
+--- a/dlls/gdi32/objects.c	2026-11-12 10:03:02
++++ b/dlls/gdi32/objects.c	2026-11-12 10:03:02
+@@ -898,6 +898,15 @@
+ }
+ 
+ /***********************************************************************
++ *           D3DKMTSetProcessSchedulingPriorityClass    (GDI32.@)
++ */
++NTSTATUS WINAPI D3DKMTSetProcessSchedulingPriorityClass( HANDLE process, INT priority_class )
++{
++    FIXME( "(%p, %d): stub\n", process, priority_class );
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
+  *           SetObjectOwner    (GDI32.@)
+  */
+ void WINAPI SetObjectOwner( HGDIOBJ handle, HANDLE owner )
