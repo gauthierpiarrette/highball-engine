@@ -32,3 +32,17 @@ zero. 8x8, 16x4, 8x4 and uncompressed 4x4 pass. With `0008` every size from 4 to
 Unbinding: with `0008` the one-block-wide textures read zero at every level once their tail is unbound (3 of 3).
 Real placement sparse textures do so only in part, with or without the patch: an 8x8 BC texture 2 of 4 tail
 levels, a 256 or larger BC texture 6 of 8 or 7 of 9, RGBA8, R8 and RGBA16F none. That is not looked into.
+
+## Metal only
+
+`metal_sparse_tail.m` does the same write and read-back with Metal alone, no Vulkan and no KosmicKrisp, for BC1, BC4
+and BC7, as a placement sparse texture and as an ordinary one:
+
+```sh
+clang -fobjc-arc -O2 metal_sparse_tail.m -framework Metal -framework Foundation -o metal_sparse_tail
+```
+
+On the same machine the ordinary textures always read back. The placement sparse 4x4, 4x2 and 2x4 textures fail in
+every run, in both write orders, so the fault is below the driver. 4x8, 4x16, 4x32 and 16x4 fail in some runs and
+not in others (one case in three runs of the default sizes); whether that is the same fault or this test's own
+ordering is not known. 8x8 never failed.
