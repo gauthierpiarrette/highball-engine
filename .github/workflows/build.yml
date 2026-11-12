@@ -118,6 +118,27 @@ jobs:
             | xargs -0 -n 50 x86_64-w64-mingw32-strip --strip-debug 2>/dev/null || true
           find out/engine/lib/wine/x86_64-unix -name '*.so' -type f -print0 | xargs -0 -n 50 strip -x -S 2>/dev/null || true
           strip -x -S out/engine/bin/wine out/engine/bin/wineserver 2>/dev/null || true
+          # No Homebrew paths in the Unix side. winegstreamer.so linked GLib, GStreamer and gettext,
+          # and winedmo.so FFmpeg, by their absolute Homebrew paths, with an rpath into Homebrew's
+          # Cellar. dyld opens an absolute path when it exists, so on a Mac with Intel Homebrew's
+          # glib or gstreamer the process got those beside the frameworks' GStreamer plugins: two
+          # GLib type systems, and Steam's web helper died on "type_data_ref_Wm: assertion failed"
+          # while Wine 10 ran (r8 to r31, highball#698). As in Sikarugir's Wine 10 build they become
+          # @rpath names, which resolve through DYLD_FALLBACK_LIBRARY_PATH to the engine's
+          # frameworks: the copy every Mac without Homebrew already got. The modules are unsigned,
+          # so nothing needs signing again.
+          find out/engine/lib/wine/x86_64-unix -name '*.so' -type f | while read -r f; do
+            for ref in $(otool -L "$f" | tail -n +2 | awk '{print $1}' | grep -E '^/(usr/local|opt/homebrew)/' || true); do
+              install_name_tool -change "$ref" "@rpath/$(basename "$ref")" "$f"
+            done
+            for rp in $(otool -l "$f" | awk '/LC_RPATH/ {getline; getline; print $2}' | grep -E '^/(usr/local|opt/homebrew)/' || true); do
+              install_name_tool -delete_rpath "$rp" "$f"
+            done
+          done
+          left=$(find out/engine/lib/wine/x86_64-unix out/engine/bin -type f -print0 \
+            | xargs -0 otool -l 2>/dev/null | grep -E '^ +(name|path) /(usr/local|opt/homebrew)/' || true)
+          if [ -n "$left" ]; then echo "Homebrew paths left in the engine:"; echo "$left"; exit 1; fi
+          echo "winegstreamer.so links: $(otool -L out/engine/lib/wine/x86_64-unix/winegstreamer.so | awk 'NR > 1 && $1 !~ /^\/(usr\/lib|System)\// {printf "%s ", $1}')"
           echo "engine size: ${before} MB -> $(du -sm out/engine | cut -f1) MB"
           out/engine/bin/wine --version
           name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
