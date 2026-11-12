@@ -330,3 +330,14 @@ roam and normal exit, many sessions between 2026-10-29 and 2026-10-31. The stall
 protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the panel showed 8995 of 8997 frames at an even
 2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
 from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.
+
+### System call writes into the emulator's write trap (0058)
+
+FEX makes a read-write-execute page that holds translated code read-execute, so that a write into it faults into
+its tracking of self-modifying code. A system call that wrote into such a page for the program faulted on the Unix
+side and returned STATUS_ACCESS_VIOLATION, where the Windows kernel writes: a buffer next to code that ran could not
+take a read, a copy or a query. Football Manager 27's copy protection asks for the SMBIOS table that way and stopped
+the game at "Loading game database". `0058` marks the pages the emulator traps (ntdll's ARM64EC side asks
+`GuestProtection` from `0043`), lets a write from inside a system call through to a marked page, and gives the page
+its trap back when the call returns. tests/x64-fidelity `syscallwrite`: 6 of 11 checks passed before, all 11 under
+Rosetta 2 (M5 Pro, macOS 27.2).
