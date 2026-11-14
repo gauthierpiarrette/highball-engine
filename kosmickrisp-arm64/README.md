@@ -23,6 +23,12 @@ with two sets of patches, applied in this order:
     constant buffer reads, 24.4 to 21 ms there, and null constant buffer descriptors then read a buffer of zeros. A read
     past a bound constant buffer returns the memory after it instead of zero. Also 256 command buffer records, so
     `MESA_KK_DEBUG=cbs` logs all of a frame's.
+  - `0008` a sparse block-compressed image whose base level is one block wide (4x4, 4x8) gets an ordinary texture with
+    its own storage: binding it does nothing and unbinding it zeroes it. It cannot share its page's contents with another
+    image bound to the same memory. As a placement sparse texture its first three levels overlapped on a
+    base M5 with macOS 27.3: the smaller mips read zero. Forza Horizon 6 has about 190 such default textures, and one
+    feeds the brightness of painted building walls, which rendered black and glossy close up (highball#636).
+    `HB_KK_SPARSE_SMALL_BC=1` turns it off. Test: `tests/kosmickrisp-sparse`.
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.

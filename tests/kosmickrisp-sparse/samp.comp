@@ -1,0 +1,15 @@
+#version 450
+layout(set=0,binding=0) uniform sampler2D tex;
+layout(set=0,binding=1) buffer Out { vec4 v[32]; } o;
+layout(local_size_x=1) in;
+void main(){
+  int n = textureQueryLevels(tex);
+  for (int i=0;i<8;i++) {
+    o.v[i]    = textureLod(tex, vec2(0.3,0.7), float(i));
+    o.v[8+i]  = i < n ? texelFetch(tex, ivec2(0,0), i) : vec4(-1.0);
+  }
+  o.v[16] = vec4(float(n), vec2(textureSize(tex,0)), 0.0);
+  o.v[17] = texture(tex, vec2(0.3,0.7));
+  o.v[18] = textureLod(tex, vec2(0.3,0.7), -2.0);   // below the view's first mip: must clamp to it
+  o.v[19] = textureLod(tex, vec2(0.3,0.7), -0.5);
+}
