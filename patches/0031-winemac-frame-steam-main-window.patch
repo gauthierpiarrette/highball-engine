@@ -1,0 +1,45 @@
+Give Steam’s main window an AppKit frame
+
+Steam draws its frame within the Win32 client area. Wine currently creates an AppKit window without a frame when the visible and window bounds match. Match only the unowned steamwebhelper.exe SDL_app main window with the expected styles and let Wine use its normal frame handling.
+
+Upstream: not sent.
+
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -110,6 +110,26 @@
+     return wf;
+ }
+ 
++/* Steam draws its own frame across the entire Win32 client area. Give its
++ * main window an AppKit frame so macOS can manage it as a regular window. */
++static BOOL is_main_steam_window(HWND hwnd, DWORD style, DWORD ex_style)
++{
++    static const WCHAR helperW[] = {'s','t','e','a','m','w','e','b','h','e','l','p','e','r','.','e','x','e',0};
++    static const WCHAR sdlW[] = {'S','D','L','_','a','p','p',0};
++    const DWORD frame = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
++    const WCHAR *path, *name;
++    WCHAR class[32];
++    UNICODE_STRING class_name = { .Buffer = class, .MaximumLength = sizeof(class) };
++
++    if ((style & (frame | WS_CHILD)) != frame || !(ex_style & WS_EX_APPWINDOW) ||
++        NtUserGetWindowRelative(hwnd, GW_OWNER)) return FALSE;
++
++    path = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++    name = wcsrchr(path, '\\');
++    if (wcsicmp(name ? name + 1 : path, helperW)) return FALSE;
++    return NtUserGetClassName(hwnd, FALSE, &class_name) && !wcscmp(class, sdlW);
++}
++
+ /***********************************************************************
+  *              get_cocoa_window_features
+  */
+@@ -118,7 +138,8 @@
+     struct macdrv_window_features wf = {0};
+ 
+     if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
+-    if (EqualRect(&data->rects.window, &data->rects.visible)) return wf;
++    if (EqualRect(&data->rects.window, &data->rects.visible) &&
++        !is_main_steam_window(data->hwnd, style, ex_style)) return wf;
+ 
+     /* CrossOver Hack #16933 */
+     if (is_main_quicken_window(data->hwnd))
