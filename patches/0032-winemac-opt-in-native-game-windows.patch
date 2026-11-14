@@ -1,0 +1,167 @@
+Allow opt-in AppKit fullscreen for eligible game windows
+
+Read the per-executable NativeGameWindow setting from Wine AppDefaults. Opted-in ordinary windows get the resizable AppKit style required for fullscreen. The free mode also removes the cursor clip while the game is windowed and releases it after leaving fullscreen.
+
+Upstream: not sent.
+
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -141,6 +141,8 @@
+ extern bool allow_immovable_windows;
+ extern bool use_confinement_cursor_clipping;
+ extern bool cursor_clipping_locks_windows;
++extern bool native_game_window;
++extern bool native_game_window_free_cursor;
+ extern bool use_precise_scrolling;
+ extern int gl_surface_mode;
+ extern CFDictionaryRef localized_strings;
+@@ -509,6 +511,7 @@
+     unsigned int    utility:1;
+     unsigned int    shadow:1;
+     unsigned int    prevents_app_activation:1;
++    unsigned int    native_game_window:1;
+ };
+ 
+ struct macdrv_window_state {
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -56,6 +56,8 @@
+ bool allow_immovable_windows = true;
+ bool use_confinement_cursor_clipping = true;
+ bool cursor_clipping_locks_windows = true;
++bool native_game_window;
++bool native_game_window_free_cursor;
+ bool use_precise_scrolling = true;
+ int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
+ bool retina_enabled = false;
+@@ -368,6 +370,13 @@
+     if (!get_config_key(hkey, appkey, "UseConfinementCursorClipping", buffer, sizeof(buffer)))
+         use_confinement_cursor_clipping = IS_OPTION_TRUE(buffer[0]);
+ 
++    if (!get_config_key(0, appkey, "NativeGameWindow", buffer, sizeof(buffer)))
++    {
++        static const WCHAR freeW[] = {'f','r','e','e',0};
++        native_game_window_free_cursor = !wcsicmp(buffer, freeW);
++        native_game_window = IS_OPTION_TRUE(buffer[0]) || native_game_window_free_cursor;
++    }
++
+     if (!get_config_key(hkey, appkey, "CursorClippingLocksWindows", buffer, sizeof(buffer)))
+         cursor_clipping_locks_windows = IS_OPTION_TRUE(buffer[0]);
+ 
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -136,9 +136,14 @@
+ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win_data *data, DWORD style, DWORD ex_style)
+ {
+     struct macdrv_window_features wf = {0};
++    const DWORD game_frame = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
++    BOOL game_window = native_game_window && !data->shaped &&
++                       (style & (game_frame | WS_CHILD)) == game_frame &&
++                       !(ex_style & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_DLGMODALFRAME)) &&
++                       !NtUserGetWindowRelative(data->hwnd, GW_OWNER);
+ 
+     if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
+-    if (EqualRect(&data->rects.window, &data->rects.visible) &&
++    if (EqualRect(&data->rects.window, &data->rects.visible) && !game_window &&
+         !is_main_steam_window(data->hwnd, style, ex_style)) return wf;
+ 
+     /* CrossOver Hack #16933 */
+@@ -148,7 +153,14 @@
+         return wf;
+     }
+ 
+-    return get_window_features_for_style(style, ex_style, data->shaped);
++    wf = get_window_features_for_style(style, ex_style, data->shaped);
++    /* AppKit requires a resizable style for a full-screen Space. */
++    if (game_window)
++    {
++        wf.resizable = TRUE;
++        wf.native_game_window = TRUE;
++    }
++    return wf;
+ }
+ 
+ 
+--- a/dlls/winemac.drv/cocoa_window.h
++++ b/dlls/winemac.drv/cocoa_window.h
+@@ -32,6 +32,7 @@
+     BOOL preventsAppActivation;
+     BOOL floating;
+     BOOL resizable;
++    BOOL nativeGameWindow;
+     BOOL maximized;
+     BOOL fullscreen;
+     BOOL pendingMinimize;
+@@ -109,6 +110,7 @@
+     - (WineWindow*) ancestorWineWindow;
+ 
+     - (void) updateForCursorClipping;
++    - (BOOL) usesFreeWindowedCursor;
+ 
+     - (void) setRetinaMode:(BOOL)mode;
+ 
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -1197,6 +1197,7 @@
+         window->savedContentMinSize = NSZeroSize;
+         window->savedContentMaxSize = NSMakeSize(FLT_MAX, FLT_MAX);
+         window->resizable = wf->resizable;
++        window->nativeGameWindow = wf->native_game_window;
+         window->_lastDisplayTime = [[NSDate distantPast] timeIntervalSinceReferenceDate];
+ 
+         [window registerForDraggedTypes:@[(NSString*)kUTTypeData, (NSString*)kUTTypeContent]];
+@@ -1376,6 +1377,7 @@
+         }
+ 
+         resizable = wf->resizable;
++        nativeGameWindow = wf->native_game_window;
+         [self adjustFeaturesForState];
+         [self setHasShadow:wf->shadow];
+     }
+@@ -2363,6 +2365,12 @@
+         event->window_frame_changed.skip_size_move_loop = skipSizeMove;
+         [queue postEvent:event];
+         macdrv_release_event(event);
++    }
++
++    - (BOOL) usesFreeWindowedCursor
++    {
++        return nativeGameWindow && native_game_window_free_cursor && !fullscreen &&
++               !enteringFullScreen && !([self styleMask] & NSWindowStyleMaskFullScreen);
+     }
+ 
+     - (void) updateForCursorClipping
+@@ -3250,6 +3258,8 @@
+         exitingFullScreen = FALSE;
+         [self setFrameAndWineFrame:nonFullscreenFrame];
+         [self windowDidResize:nil];
++        if ([self usesFreeWindowedCursor])
++            [[WineApplicationController sharedController] stopClippingCursor];
+         if (pendingOrderOut)
+             [self doOrderOut];
+     }
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -110,6 +110,8 @@
+ @property (nonatomic, copy) NSString *explicitAppUserModelID;  /* CW Hack 22310 */
+ 
+ @property (readonly) BOOL clippingCursor;
++
++    - (BOOL) stopClippingCursor;
+ @property (nonatomic) NSTimeInterval lastSetCursorPositionTime;
+ 
+     + (WineApplicationController*) sharedController;
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -2865,6 +2865,11 @@
+             }
+         }
+ 
++        NSWindow* keyWindow = [NSApp keyWindow];
++        if (clipping && [keyWindow isKindOfClass:[WineWindow class]] &&
++            [(WineWindow*)keyWindow usesFreeWindowedCursor])
++            clipping = FALSE;
++
+         if (clipping)
+             ret = [controller startClippingCursor:rect];
+         else
