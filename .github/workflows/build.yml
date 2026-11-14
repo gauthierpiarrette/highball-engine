@@ -39,6 +39,21 @@ jobs:
           set -euo pipefail
           cd src/sources/wine
           for p in ../../../patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; patch -p1 < "$p"; done
+      # EXPERIMENT (branch exp-no-fiber-mirror, not for merge): the fiber mirror of 0008/0009
+      # neutralised, so %gs:0x20 always holds the pthread QoS value (highball#371).
+      - name: neutralise the fiber mirror
+        run: |
+          set -euo pipefail
+          cd src/sources/wine
+          f=dlls/ntdll/unix/signal_x86_64.c
+          for pat in '0x20(%r13),%rax' '0x20(%r15),%r15' '0x20(%r13),%rdx'; do
+            n=$(grep -cF "movq $pat" "$f" || true); echo "$pat: $n"; [ "$n" = 1 ] || { echo "expected one"; exit 1; }
+          done
+          sed -i '' -e 's/movq 0x20(%r13),%rax/movq 0x340(%r13),%rax/' -e 's/movq 0x20(%r15),%r15/movq 0x340(%r15),%r15/' -e 's/movq 0x20(%r13),%rdx/movq 0x340(%r13),%rdx/' "$f"
+          k=dlls/kernelbase/thread.c
+          n=$(grep -cF '"movq %0,%%gs:%c1" :: "r" (fiber)' "$k" || true); echo "kernelbase store: $n"; [ "$n" = 1 ] || exit 1
+          sed -i '' '/"movq %0,%%gs:%c1" :: "r" (fiber)/d' "$k"
+          grep -n "0x340(%r1[35])" "$f"
       - name: toolchain
         run: |
           set -euo pipefail
