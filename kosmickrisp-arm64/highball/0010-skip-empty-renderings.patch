@@ -1,0 +1,46 @@
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index a380ae68..33aa399d 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -7,6 +7,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include "util/u_debug.h"
+ #include "kk_entrypoints.h"
+ 
+ #include "kk_buffer.h"
+@@ -643,9 +644,30 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+    };
+ 
+    /* A rendering whose render encoder never started still loads or clears,
+-    * stores and resolves its attachments */
+-   if (render->first_start)
+-      cs_get_render(cmd);
++    * stores and resolves its attachments -- unless that changes nothing: with
++    * no draw, no clear and no resolve, a render encoder would only load and
++    * store every tile again (vkd3d-proton's suspend/resume fixups record such
++    * renderings). HB_KK_KEEP_EMPTY_PASSES=1 starts the encoder anyway. */
++   if (render->first_start) {
++      bool noop = !need_meta_resolve &&
++                  !debug_get_bool_option("HB_KK_KEEP_EMPTY_PASSES", false);
++      for (uint32_t i = 0; noop && i < render->color_att_count; i++) {
++         if (render->color_att[i].iview &&
++             (render->color_att[i].load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ||
++              render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE))
++            noop = false;
++      }
++      const struct kk_attachment *ds[2] = {&render->depth_att,
++                                           &render->stencil_att};
++      for (uint32_t i = 0; noop && i < 2; i++) {
++         if (ds[i]->iview &&
++             (ds[i]->load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ||
++              ds[i]->resolve_mode != VK_RESOLVE_MODE_NONE))
++            noop = false;
++      }
++      if (!noop)
++         cs_get_render(cmd);
++   }
+    kk_apply_attachment_store_ops(cmd, false);
+ 
+    /* Clean up previous encoder */

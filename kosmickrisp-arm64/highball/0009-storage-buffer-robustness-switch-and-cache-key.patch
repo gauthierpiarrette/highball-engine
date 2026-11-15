@@ -1,0 +1,48 @@
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 0458290e..0edb7a14 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -21,6 +21,7 @@
+ 
+ #include "util/disk_cache.h"
+ #include "util/mesa-blake3.h"
++#include "util/u_debug.h"
+ #include "git_sha1.h"
+ 
+ #include "vulkan/wsi/wsi_common.h"
+@@ -993,6 +994,12 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
+ 
+    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
+                        sizeof(instance->driver_build_sha));
++   /* The robustness switches change the translated shaders, so a cache written with other values must not be used. */
++   const uint8_t hb_robust[2] = {
++      debug_get_bool_option("HB_KK_NO_UBO_ROBUST", false),
++      debug_get_bool_option("HB_KK_NO_SSBO_ROBUST", false),
++   };
++   _mesa_blake3_update(&blake3_ctx, hb_robust, sizeof(hb_robust));
+ 
+    unsigned char blake3[BLAKE3_KEY_LEN];
+    _mesa_blake3_final(&blake3_ctx, blake3);
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index d3277a2d..7ef7f41a 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -169,6 +169,9 @@ static const struct vk_pipeline_robustness_state rs_all_supported = {
+ };
+ 
+ DEBUG_GET_ONCE_BOOL_OPTION(hb_no_ubo_robust, "HB_KK_NO_UBO_ROBUST", false)
++/* HB_KK_NO_SSBO_ROBUST=1 drops the bounds check on storage buffer access too. A read past the bound range returns the
++ * memory after it instead of zero, and a write past it lands there. */
++DEBUG_GET_ONCE_BOOL_OPTION(hb_no_ssbo_robust, "HB_KK_NO_SSBO_ROBUST", false)
+ 
+ static struct vk_pipeline_robustness_state
+ kk_hb_robustness(const struct vk_pipeline_robustness_state *rs)
+@@ -176,6 +179,8 @@ kk_hb_robustness(const struct vk_pipeline_robustness_state *rs)
+    struct vk_pipeline_robustness_state out = *rs;
+    if (debug_get_option_hb_no_ubo_robust())
+       out.uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
++   if (debug_get_option_hb_no_ssbo_robust())
++      out.storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
+    return out;
+ }
+ 
