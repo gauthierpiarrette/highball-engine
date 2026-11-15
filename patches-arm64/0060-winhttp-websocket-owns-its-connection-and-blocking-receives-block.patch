@@ -1,0 +1,160 @@
+From: TxCsOffc <243226414+TxCsOffc@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:00:00 +0500
+Subject: [PATCH] winhttp: a WebSocket owns its connection, and blocking receives block
+
+Forza Horizon 6's online services (PlayFab lobby, Xbox real-time activity) run over WebSockets. Six threads spun on
+"recv error 10035" (WSAEWOULDBLOCK), about 15,000 calls a second each, from the moment the WebSockets opened until the
+server reset them. Two causes: the connection stayed on the request after the upgrade, so a later read of the empty 101
+response put it back in the keep-alive pool and the next request to that host reused it (netconn_is_alive made it
+non-blocking and consumed its TLS records); and a receive outside netconn_create/netconn_is_alive that got
+WSAEWOULDBLOCK failed at once instead of waiting, which callers treat as a dead connection or a zero-byte read.
+The WebSocket now takes the connection away from the request, and a receive that is meant to block waits for data,
+honouring SO_RCVTIMEO so the keepalive still sees WSAETIMEDOUT.
+
+From the MetalHorizon launcher's Wine patch 0002 (github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher,
+LGPL-2.1). Wine 11.18 moved WinHttpWebSocketCompleteUpgrade to dlls/winhttp/socket.c, so that hunk is ported by hand.
+Checked on an M5 Max, macOS 27.2: the "recv error 10035" warnings Forza Horizon 6 logged before are gone (2026-11-15).
+---
+diff --git a/dlls/winhttp/net.c b/dlls/winhttp/net.c
+index 05922ac..94bb038 100644
+--- a/dlls/winhttp/net.c
++++ b/dlls/winhttp/net.c
+@@ -70,15 +70,38 @@ BOOL netconn_wait_overlapped_result( struct netconn *conn, WSAOVERLAPPED *ovr, D
+     return TRUE;
+ }
+ 
+-static int sock_recv(int fd, void *msg, size_t len, int flags)
++/* Every receive outside netconn_create and netconn_is_alive is meant to block, as on Windows. If the socket
++ * answers WSAEWOULDBLOCK anyway, wait for data instead of failing: callers treat a failed read as a dead
++ * connection (a WebSocket receive then errors out) or, when the error code is lost, as a zero-byte read they
++ * retry at once -- Forza Horizon 6 spun on six WebSockets that way, ~15000 recv calls a second each, starving
++ * its online services. The wait honours SO_RCVTIMEO, so the WebSocket keepalive still sees WSAETIMEDOUT.
++ * The error code is set again after the WARN, which must not be the one to decide it. */
++static int sock_recv( struct netconn *conn, void *msg, size_t len, int flags )
+ {
+-    int ret;
+-    do
++    int ret, err;
++
++    for (;;)
+     {
+-        if ((ret = recv(fd, msg, len, flags)) == -1) WARN( "recv error %d\n", WSAGetLastError() );
++        if ((ret = recv( conn->socket, msg, len, flags )) != -1) return ret;
++        err = WSAGetLastError();
++        if (err == WSAEINTR) continue;
++        if (err == WSAEWOULDBLOCK && !conn->nonblocking)
++        {
++            WSAPOLLFD pfd;
++            DWORD timeout = 0;
++            int optlen = sizeof(timeout), res;
++
++            if (getsockopt( conn->socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, &optlen )) timeout = 0;
++            pfd.fd = conn->socket;
++            pfd.events = POLLRDNORM;
++            pfd.revents = 0;
++            if ((res = WSAPoll( &pfd, 1, timeout ? (int)timeout : -1 )) > 0) continue;
++            err = res ? WSAGetLastError() : WSAETIMEDOUT;
++        }
++        WARN( "recv error %d\n", err );
++        WSASetLastError( err );
++        return -1;
+     }
+-    while(ret == -1 && WSAGetLastError() == WSAEINTR);
+-    return ret;
+ }
+ 
+ static DWORD netconn_verify_cert( PCCERT_CONTEXT cert, WCHAR *server, DWORD security_flags, BOOL check_revocation,
+@@ -205,6 +228,7 @@ static void set_blocking( struct netconn *conn, BOOL blocking )
+ {
+     ULONG state = !blocking;
+     ioctlsocket( conn->socket, FIONBIO, &state );
++    conn->nonblocking = !blocking;
+ }
+ 
+ DWORD netconn_create( struct hostdata *host, const struct sockaddr_storage *sockaddr, int timeout,
+@@ -377,7 +401,7 @@ DWORD netconn_secure_connect( struct netconn *conn, WCHAR *hostname, DWORD secur
+             read_buf_size += 1024;
+         }
+ 
+-        size = sock_recv(conn->socket, read_buf+in_bufs[0].cbBuffer, read_buf_size-in_bufs[0].cbBuffer, 0);
++        size = sock_recv(conn, read_buf+in_bufs[0].cbBuffer, read_buf_size-in_bufs[0].cbBuffer, 0);
+         if(size < 1) {
+             status = ERROR_WINHTTP_SECURE_CHANNEL_ERROR;
+             break;
+@@ -533,7 +557,7 @@ static DWORD read_ssl_chunk( struct netconn *conn, void *buf, SIZE_T buf_size, S
+         free(conn->extra_buf);
+         conn->extra_buf = NULL;
+     }else {
+-        if ((buf_len = sock_recv( conn->socket, conn->ssl_read_buf + conn->extra_len, ssl_buf_size - conn->extra_len, 0)) < 0)
++        if ((buf_len = sock_recv( conn, conn->ssl_read_buf + conn->extra_len, ssl_buf_size - conn->extra_len, 0)) < 0)
+             return WSAGetLastError();
+ 
+         if (!buf_len)
+@@ -569,8 +593,18 @@ static DWORD read_ssl_chunk( struct netconn *conn, void *buf, SIZE_T buf_size, S
+         case SEC_E_INCOMPLETE_MESSAGE:
+             assert(buf_len < ssl_buf_size);
+ 
+-            if ((size = sock_recv( conn->socket, conn->ssl_read_buf + buf_len, ssl_buf_size - buf_len, 0 )) < 1)
++            if ((size = sock_recv( conn, conn->ssl_read_buf + buf_len, ssl_buf_size - buf_len, 0 )) < 1)
++            {
++                /* netconn_is_alive polls without blocking: keep the partial record for the next read
++                 * instead of dropping it, which would desynchronise the TLS stream of a reused connection */
++                if (size < 0 && WSAGetLastError() == WSAEWOULDBLOCK && (conn->extra_buf = malloc( buf_len )))
++                {
++                    memcpy( conn->extra_buf, conn->ssl_read_buf, buf_len );
++                    conn->extra_len = buf_len;
++                    return WSAEWOULDBLOCK;
++                }
+                 return SEC_E_INCOMPLETE_MESSAGE;
++            }
+ 
+             buf_len += size;
+             continue;
+@@ -664,7 +698,7 @@ DWORD netconn_recv( struct netconn *conn, void *buf, size_t len, int flags, int
+         return ERROR_SUCCESS;
+     }
+ 
+-    if ((*recvd = sock_recv( conn->socket, buf, len, flags )) < 0) return WSAGetLastError();
++    if ((*recvd = sock_recv( conn, buf, len, flags )) < 0) return WSAGetLastError();
+     return ERROR_SUCCESS;
+ }
+ 
+@@ -719,7 +753,7 @@ BOOL netconn_is_alive( struct netconn *netconn )
+             return FALSE;
+         }
+     }
+-    len = sock_recv( netconn->socket, &b, 1, MSG_PEEK );
++    len = sock_recv( netconn, &b, 1, MSG_PEEK );
+     err = WSAGetLastError();
+     set_blocking( netconn, TRUE );
+ 
+diff --git a/dlls/winhttp/socket.c b/dlls/winhttp/socket.c
+index 03be9cd..02765d3 100644
+--- a/dlls/winhttp/socket.c
++++ b/dlls/winhttp/socket.c
+@@ -163,8 +163,12 @@ HINTERNET WINAPI WinHttpWebSocketCompleteUpgrade( HINTERNET hrequest, DWORD_PTR
+     InitializeSRWLock( &socket->send_lock );
+     init_queue( &socket->send_q );
+     init_queue( &socket->recv_q );
+-    netconn_addref( request->netconn );
++    /* The connection now belongs to the WebSocket alone. Left on the request, a later read of the (empty) 101
++     * response reaches finished_reading, which puts it back in the keep-alive pool: the next request to that
++     * host then reuses it while the WebSocket is still reading from it (netconn_is_alive makes it non-blocking
++     * and consumes its TLS records). (MetalHorizon patch 0002, ported to Wine 11.18.) */
+     socket->netconn = request->netconn;
++    request->netconn = NULL;
+ 
+     netconn_set_timeout( socket->netconn, FALSE, socket->keepalive_interval );
+ 
+diff --git a/dlls/winhttp/winhttp_private.h b/dlls/winhttp/winhttp_private.h
+index bf94c65..f61acd4 100644
+--- a/dlls/winhttp/winhttp_private.h
++++ b/dlls/winhttp/winhttp_private.h
+@@ -119,6 +119,7 @@ struct netconn
+     char *peek_msg_mem;
+     size_t peek_len;
+     HANDLE port;
++    BOOL nonblocking; /* set only while netconn_create or netconn_is_alive poll the socket on purpose */
+ };
+ 
+ struct header

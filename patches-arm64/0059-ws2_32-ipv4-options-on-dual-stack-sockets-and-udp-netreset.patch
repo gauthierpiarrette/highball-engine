@@ -1,0 +1,277 @@
+From: TxCsOffc <243226414+TxCsOffc@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:00:00 +0500
+Subject: [PATCH] ws2_32: IPv4 options on dual-stack IPv6 sockets and SIO_UDP_NETRESET, as Windows
+
+Forza Horizon 6 opens its UDP game socket as [::] dual-stack (IPV6_V6ONLY=0), binds 3074 and sets IPPROTO_IP
+IP_DONTFRAGMENT=1 and IP_TTL=255. Windows applies those to the socket's IPv4 traffic; macOS refuses IPv4 options on an
+IPv6 socket (EINVAL, WSAEINVAL). The game closed the socket and retried on 5250 and 5002 with the same result, so it
+never sent a QoS ping: Network Diagnostics showed "Region: Failed (0x0)" and every session join failed with 0x8060046B.
+When the host refuses an IPPROTO_IP option on an AF_INET6 socket, the IPv6 counterpart is applied instead
+(IP_DONTFRAGMENT -> IPV6_DONTFRAG, IP_TTL -> IPV6_UNICAST_HOPS, IP_MULTICAST_TTL/LOOP -> IPV6_MULTICAST_HOPS/LOOP;
+IP_TOS keeps the host default) and the call succeeds. SIO_UDP_NETRESET is accepted like SIO_UDP_CONNRESET (Windows
+does; Wine answered WSAEOPNOTSUPP, which the game also sets before matchmaking). A trace channel, udpreq, logs bind,
+setsockopt, WSAIoctl and close on UDP sockets.
+
+From the MetalHorizon launcher's Wine patches 0003, 0005 (the ws2_32 part) and 0006
+(github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher, LGPL-2.1 like Wine), applied to Wine 11.18 unchanged.
+Checked on an M5 Max, macOS 27.2, engine arm64-kk-wine11.18-r5: a probe that repeats the game's calls (dual-stack
+socket, bind 3074, both options, both ioctls, a v4-mapped sendto and its reply) passes every step; Forza Horizon 6
+joins Horizon Life with other players (2026-11-15). With the unpatched ws2_32 the same probe gets -1 from
+IP_DONTFRAGMENT, IP_TTL (WSAEINVAL) and SIO_UDP_NETRESET.
+---
+diff --git a/dlls/ws2_32/socket.c b/dlls/ws2_32/socket.c
+index b2601c6..9a1a373 100644
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -30,7 +30,14 @@
+ 
+ #define FILE_USE_FILE_POINTER_POSITION ((LONGLONG)-2)
+ 
++#ifndef SIO_UDP_NETRESET
++#define SIO_UDP_NETRESET _WSAIOW(IOC_VENDOR, 15)
++#endif
++
+ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
++/* udpreq: what a title does with its UDP sockets (bind, connect, sends, received datagrams), rate-limited so it can
++ * stay on while a game runs. Forza Horizon 6 opened UDP game sockets that never stayed open during matchmaking. */
++WINE_DECLARE_DEBUG_CHANNEL(udpreq);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
+ #define TIMEOUT_INFINITE _I64_MAX
+@@ -1075,6 +1082,17 @@ static void WINAPI socket_apc( void *apc_user, IO_STATUS_BLOCK *io, ULONG reserv
+     func( NtStatusToWSAError( io->Status ), io->Information, (OVERLAPPED *)io, 0 );
+ }
+ 
++static BOOL udpreq_wanted( SOCKET s, LONG *counter )
++{
++    int type = 0, len = sizeof(type);
++    LONG n;
++
++    if (!TRACE_ON(udpreq)) return FALSE;
++    if (getsockopt( s, SOL_SOCKET, SO_TYPE, (char *)&type, &len ) || type != SOCK_DGRAM) return FALSE;
++    n = InterlockedIncrement( counter );
++    return n <= 300 || !(n % 500);  /* the start of every exchange, then a sample */
++}
++
+ static int WS2_recv_base( SOCKET s, WSABUF *buffers, DWORD buffer_count, DWORD *ret_size, DWORD *flags,
+                           struct sockaddr *addr, int *addr_len, OVERLAPPED *overlapped,
+                           LPWSAOVERLAPPED_COMPLETION_ROUTINE completion, WSABUF *control )
+@@ -1128,6 +1146,20 @@ static int WS2_recv_base( SOCKET s, WSABUF *buffers, DWORD buffer_count, DWORD *
+     if (!status && ret_size) *ret_size = piosb->Information;
+     SetLastError( NtStatusToWSAError( status ) );
+     TRACE( "status %#lx.\n", status );
++    if (status != STATUS_PENDING && status != STATUS_DEVICE_NOT_READY)
++    {
++        static LONG recv_count;
++        if (udpreq_wanted( s, &recv_count ))
++            TRACE_(udpreq)( "socket %#Ix recv %Iu bytes from %s, status %#lx\n", s, status ? 0 : piosb->Information,
++                            addr && !status ? debugstr_sockaddr( addr ) : "-", status );
++        SetLastError( NtStatusToWSAError( status ) );
++    }
++    {
++        static LONG send_count;
++        if (udpreq_wanted( s, &send_count ))
++            TRACE_(udpreq)( "socket %#Ix send to %s, status %#lx\n", s, addr ? debugstr_sockaddr( addr ) : "(connected)", status );
++        SetLastError( NtStatusToWSAError( status ) );
++    }
+     return status ? -1 : 0;
+ }
+ 
+@@ -1244,7 +1276,7 @@ static int WINAPI WS2_WSARecvMsg( SOCKET s, LPWSAMSG msg, LPDWORD lpNumberOfByte
+ /***********************************************************************
+  *      bind   (ws2_32.2)
+  */
+-int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
++static int bind_impl( SOCKET s, const struct sockaddr *addr, int len )
+ {
+     struct afd_bind_params *params;
+     struct sockaddr *ret_addr;
+@@ -1253,6 +1285,10 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
+     NTSTATUS status;
+ 
+     TRACE( "socket %#Ix, addr %s, len %d\n", s, debugstr_sockaddr(addr), len );
++    {
++        static LONG bind_count;
++        if (udpreq_wanted( s, &bind_count )) TRACE_(udpreq)( "socket %#Ix bind %s\n", s, debugstr_sockaddr( addr ) );
++    }
+ 
+     if (!addr)
+     {
+@@ -1345,7 +1381,10 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
+  */
+ int WINAPI closesocket( SOCKET s )
+ {
++    static LONG close_count;
++
+     TRACE( "%#Ix\n", s );
++    if (udpreq_wanted( s, &close_count )) TRACE_(udpreq)( "socket %#Ix closed\n", s );
+ 
+     if (!num_startup)
+     {
+@@ -1375,6 +1414,10 @@ int WINAPI connect( SOCKET s, const struct sockaddr *addr, int len )
+     NTSTATUS status;
+ 
+     TRACE( "socket %#Ix, addr %s, len %d\n", s, debugstr_sockaddr(addr), len );
++    {
++        static LONG connect_count;
++        if (udpreq_wanted( s, &connect_count )) TRACE_(udpreq)( "socket %#Ix connect %s\n", s, debugstr_sockaddr( addr ) );
++    }
+ 
+     if (!(sync_event = get_sync_event())) return -1;
+ 
+@@ -2468,7 +2511,7 @@ static DWORD server_ioctl_sock( SOCKET s, DWORD code, LPVOID in_buff, DWORD in_s
+  *              WSAIoctl                (WS2_32.50)
+  *
+  */
+-INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID out_buff,
++static INT WSAIoctl_impl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID out_buff,
+                     DWORD out_size, LPDWORD ret_size, LPWSAOVERLAPPED overlapped,
+                     LPWSAOVERLAPPED_COMPLETION_ROUTINE completion )
+ {
+@@ -2778,12 +2821,15 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID
+         return ret ? -1 : 0;
+     }
+ 
++    /* Windows accepts SIO_UDP_NETRESET (TTL-expired ICMP reporting on UDP) like SIO_UDP_CONNRESET. Forza Horizon 6
++     * sets both on its game sockets right before matchmaking; answered WSAEOPNOTSUPP, it opened no session. */
++    case SIO_UDP_NETRESET:
+     case SIO_UDP_CONNRESET:
+     {
+         NTSTATUS status = STATUS_SUCCESS;
+         DWORD ret;
+ 
+-        FIXME( "SIO_UDP_CONNRESET stub\n" );
++        FIXME( "%s stub\n", debugstr_wsaioctl( code ) );
+         ret = server_ioctl_sock( s, IOCTL_AFD_WINE_COMPLETE_ASYNC, &status, sizeof(status),
+                                  NULL, 0, ret_size, overlapped, completion );
+         SetLastError( ret );
+@@ -3313,7 +3359,42 @@ static int server_setsockopt( SOCKET s, ULONG code, const char *optval, int optl
+ /***********************************************************************
+  *		setsockopt		(WS2_32.21)
+  */
+-int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int optlen )
++/* Windows applies IPPROTO_IP options to the IPv4 traffic of a dual-stack AF_INET6 socket; macOS refuses them on an
++ * IPv6 socket (EINVAL). Forza Horizon 6 sets IP_DONTFRAGMENT and IP_TTL on its [::] game socket, closes the socket
++ * when they fail and tries the next port: it ends up with no UDP socket at all, so no QoS ping, no session and a
++ * matchmaking search that never ends. When the host refuses, apply the IPv6 counterpart and report success. */
++static int setsockopt_impl( SOCKET s, int level, int optname, const char *optval, int optlen );
++
++static int set_ip_option( SOCKET s, int optname, DWORD code, const char *optval, int optlen )
++{
++    WSAPROTOCOL_INFOW info;
++    int ret, ipv6_opt, size = sizeof(info);
++    DWORD err;
++
++    if (!(ret = server_setsockopt( s, code, optval, optlen ))) return 0;
++    err = WSAGetLastError();
++    if (err != WSAEINVAL && err != WSAENOPROTOOPT && err != WSAEOPNOTSUPP) return ret;
++    if (!ws_protocol_info( s, TRUE, &info, &size ) || info.iAddressFamily != AF_INET6)
++    {
++        SetLastError( err );
++        return ret;
++    }
++    switch (optname)
++    {
++    case IP_DONTFRAGMENT:   ipv6_opt = IPV6_DONTFRAG; break;
++    case IP_TTL:            ipv6_opt = IPV6_UNICAST_HOPS; break;
++    case IP_MULTICAST_TTL:  ipv6_opt = IPV6_MULTICAST_HOPS; break;
++    case IP_MULTICAST_LOOP: ipv6_opt = IPV6_MULTICAST_LOOP; break;
++    default:                ipv6_opt = -1; break;  /* IP_TOS: no counterpart we can set; the host default stands */
++    }
++    if (ipv6_opt != -1 && setsockopt_impl( s, IPPROTO_IPV6, ipv6_opt, optval, optlen ))
++        WARN( "socket %#Ix: IPv6 counterpart of IPv4 option %d refused too, keeping the host default\n", s, optname );
++    TRACE( "socket %#Ix: IPv4 option %d applied to dual-stack socket\n", s, optname );
++    SetLastError( ERROR_SUCCESS );
++    return 0;
++}
++
++static int setsockopt_impl( SOCKET s, int level, int optname, const char *optval, int optlen )
+ {
+     DWORD value = 0;
+ 
+@@ -3578,7 +3659,7 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_BLOCK_SOURCE, optval, optlen );
+ 
+         case IP_DONTFRAGMENT:
+-            return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_DONTFRAGMENT, optval, optlen );
++            return set_ip_option( s, IP_DONTFRAGMENT, IOCTL_AFD_WINE_SET_IP_DONTFRAGMENT, optval, optlen );
+ 
+         case IP_DROP_MEMBERSHIP:
+             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_DROP_MEMBERSHIP, optval, optlen );
+@@ -3598,7 +3679,7 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+                 SetLastError( WSAEFAULT );
+                 return -1;
+             }
+-            return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_MULTICAST_LOOP, optval, optlen );
++            return set_ip_option( s, IP_MULTICAST_LOOP, IOCTL_AFD_WINE_SET_IP_MULTICAST_LOOP, optval, optlen );
+ 
+         case IP_MULTICAST_TTL:
+             if (!optlen)
+@@ -3606,7 +3687,7 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+                 SetLastError( WSAEFAULT );
+                 return -1;
+             }
+-            return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_MULTICAST_TTL, optval, optlen );
++            return set_ip_option( s, IP_MULTICAST_TTL, IOCTL_AFD_WINE_SET_IP_MULTICAST_TTL, optval, optlen );
+ 
+         case IP_OPTIONS:
+             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_OPTIONS, optval, optlen );
+@@ -3647,7 +3728,7 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+                 SetLastError(WSAEINVAL);
+                 return SOCKET_ERROR;
+             }
+-            return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_TOS, optval, optlen );
++            return set_ip_option( s, IP_TOS, IOCTL_AFD_WINE_SET_IP_TOS, optval, optlen );
+ 
+         case IP_TTL:
+             if (!optlen)
+@@ -3655,7 +3736,7 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+                 SetLastError( WSAEFAULT );
+                 return -1;
+             }
+-            return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_TTL, optval, optlen );
++            return set_ip_option( s, IP_TTL, IOCTL_AFD_WINE_SET_IP_TTL, optval, optlen );
+ 
+         case IP_UNBLOCK_SOURCE:
+             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_UNBLOCK_SOURCE, optval, optlen );
+@@ -4506,3 +4587,40 @@ int WINAPI WSAEnumProtocolsW( int *filter, WSAPROTOCOL_INFOW *protocols, DWORD *
+     }
+     return count;
+ }
++
++/* udpreq: every call a title makes on a UDP socket and what it got back -- Forza Horizon 6 bound its game socket to
++ * [::]:3074, set two options and closed it again a millisecond later, then did the same on 5250. */
++int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
++{
++    static LONG count;
++    int ret = bind_impl( s, addr, len );
++    DWORD err = ret ? WSAGetLastError() : 0;
++    if (udpreq_wanted( s, &count )) TRACE_(udpreq)( "socket %#Ix bind result %d err %lu\n", s, ret, err );
++    if (ret) SetLastError( err );
++    return ret;
++}
++
++int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int optlen )
++{
++    static LONG count;
++    int ret = setsockopt_impl( s, level, optname, optval, optlen );
++    DWORD err = ret ? WSAGetLastError() : 0;
++    if (udpreq_wanted( s, &count ))
++        TRACE_(udpreq)( "socket %#Ix setsockopt %s value %s -> %d err %lu\n", s, debugstr_sockopt( level, optname ),
++                        debugstr_optval( optval, optlen ), ret, err );
++    if (ret) SetLastError( err );
++    return ret;
++}
++
++INT WINAPI WSAIoctl( SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID out_buff, DWORD out_size,
++                     LPDWORD ret_size, LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion )
++{
++    static LONG count;
++    INT ret = WSAIoctl_impl( s, code, in_buff, in_size, out_buff, out_size, ret_size, overlapped, completion );
++    DWORD err = ret ? WSAGetLastError() : 0;
++    if (udpreq_wanted( s, &count ))
++        TRACE_(udpreq)( "socket %#Ix ioctl %s insize %lu outsize %lu -> %d err %lu\n", s, debugstr_wsaioctl( code ),
++                        in_size, out_size, ret, err );
++    if (ret) SetLastError( err );
++    return ret;
++}
