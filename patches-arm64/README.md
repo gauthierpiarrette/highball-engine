@@ -42,6 +42,9 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0041` ntdll-arm64ec-the-x64-state-on-an-unhandled-exception | A crash log named the instruction but not the x64 registers. | Microsoft Flight Simulator 2024 | diagnostics | |
 | `0042` ntdll-arm64ec-rtliseccode-above-the-user-address-space | A thread could fault in a loop until its stack ran out. | Microsoft Flight Simulator 2024 | general | |
 | `0043` ntdll-arm64ec-a-program-sees-its-own-page-protection | Programs saw the emulator's page protection, so restoring it made their own pages fault. | Microsoft Flight Simulator 2024, copy protections | x86-64 fidelity | pairs with FEX 0022 |
+| `0059` ws2_32-ipv4-options-on-dual-stack-sockets-and-udp-netreset | Forza Horizon 6 could not determine its region or join any online session (0x8060046B): macOS refused IPv4 options on its dual-stack UDP socket. | Forza Horizon 6 online play | macOS | from the MetalHorizon launcher's 0003, 0005 and 0006 |
+| `0060` winhttp-websocket-owns-its-connection-and-blocking-receives-block | WebSocket threads spun on WSAEWOULDBLOCK, about 15,000 receives a second each. | Forza Horizon 6 online services | general | from the MetalHorizon launcher's 0002, ported to 11.18 |
+| `0061` ntdll-server-msync-on-the-arm64-line | The arm64 line had no msync, so a bottle's msync setting did nothing and every wait went to wineserver; Forza Horizon 6 showed Low Streaming Bandwidth above 200 km/h. | every program with WINEMSYNC=1 | macOS (off unless `WINEMSYNC=1`) | CrossOver's msync (Marc-Aurel Zent) via koels-net/mcsoda, ported to inproc sync |
 
 ## Details
 
@@ -330,3 +333,19 @@ roam and normal exit, many sessions between 2026-10-29 and 2026-10-31. The stall
 protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the panel showed 8995 of 8997 frames at an even
 2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
 from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.
+
+### Online play and msync (0059 to 0061)
+
+`0059` and `0060` are the MetalHorizon launcher's Wine fixes for Forza Horizon 6's online play
+(github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher). The game opens its UDP game socket dual-stack, binds 3074
+and sets `IP_DONTFRAGMENT` and `IP_TTL`; macOS refuses IPv4 options on an IPv6 socket, the game closed the socket, never
+sent a QoS ping, showed "Region: Failed (0x0)" and failed every session join with 0x8060046B. `0060` stops the WebSocket
+receive spin of its PlayFab and Xbox real-time activity connections. With both, Forza Horizon 6 joined Horizon Life with
+other players on an M5 Max, macOS 27.2 (2026-11-15).
+
+`0061` brings msync to this line. `dlls/ntdll/unix/msync.[ch]` and `server/msync.[ch]` are CrossOver's as packaged by
+koels-net/mcsoda (`patches/0002-msync-from-crossover-11.0.patch`); the glue is ported to 11.18's inproc sync, and
+`get_inproc_sync_fd` carries the msync slot index (protocol 963). A test program on an M5 Max: event ping-pong 18.0 to 7.2
+us, 8 threads on a semaphore and a mutex 1.24 to 0.089 s, WaitAll, APCs and abandoned mutexes correct. Forza Horizon 6:
+"msync: up and running", 400 km/h through Tokyo with no Low Streaming Bandwidth warning. It applies to every bottle whose
+sync is msync, so other games on this line should be checked before it ships.
