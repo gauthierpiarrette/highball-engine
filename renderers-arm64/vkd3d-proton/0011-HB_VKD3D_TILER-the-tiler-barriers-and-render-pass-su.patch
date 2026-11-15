@@ -1,0 +1,46 @@
+From dbe84c66bc32e85d2f951c632ea897f1d515c4f9 Mon Sep 17 00:00:00 2001
+From: TxCsOffc <243226414+TxCsOffc@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 07:42:54 +0500
+Subject: [PATCH 11/12] HB_VKD3D_TILER: the tiler barriers and render pass
+ suspend/resume as an opt-in switch
+
+vkd3d-proton gives its tiler paths (lighter render pass barriers, render pass suspend/resume across command lists) only to
+the drivers it lists by driver ID; Apple GPUs behind KosmicKrisp and MoltenVK are tile-based too but are not listed.
+HB_VKD3D_TILER=1 turns both on, HB_VKD3D_TILER=2 the barriers only, unset or 0 leaves the list alone.
+
+Measured with Forza Horizon 6 on KosmicKrisp (M5 Max, 2026-11-15): =1 alone is not a win there. KosmicKrisp does not
+merge a suspended rendering with the resumed one, and vkd3d-proton's speculative fixups ("Resume Load", "Suspend
+Store", RESUMING+End) became empty Metal render passes: 46% of all render encoders. KosmicKrisp patch 0010 skips those;
+with it, =1 played slightly better than =2 to the player, at the same render encoder rate (7,400 vs 7,300 a second);
+there is no frame time measurement against unset. Kept as a switch, off by default.
+---
+ libs/vkd3d/device.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index dfb412f8..3049d7e8 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -3842,6 +3842,19 @@ static void d3d12_device_init_workarounds(struct d3d12_device *device)
+             break;
+     }
+ 
++    /* Highball: HB_VKD3D_TILER=1 treats the driver as a tiler (Apple GPUs behind KosmicKrisp and MoltenVK are TBDR):
++     * the tiler barriers plus render pass suspend/resume; HB_VKD3D_TILER=2 the barriers only. Off by default. */
++    {
++        char hb_tiler[16];
++        if (vkd3d_get_env_var("HB_VKD3D_TILER", hb_tiler, sizeof(hb_tiler)) && hb_tiler[0] && hb_tiler[0] != '0')
++        {
++            device->workarounds.tiler_renderpass_barriers = true;
++            device->workarounds.tiler_suspend_resume = hb_tiler[0] == '1';
++            INFO("HB_VKD3D_TILER=%s: tiler barriers on, suspend/resume %s.\n", hb_tiler,
++                    device->workarounds.tiler_suspend_resume ? "on" : "off");
++        }
++    }
++
+     /* For testing purposes, allow us to exercise all code paths on all GPUs. */
+     if (vkd3d_debug_control_get_behavior_flags() & VKD3D_DEBUG_CONTROL_BEHAVIOR_ENABLE_TILER_SYNC)
+         device->workarounds.tiler_renderpass_barriers = true;
+-- 
+2.54.0 (Apple Git-157)
+
