@@ -322,6 +322,23 @@ emulator's code buffers MAP_JIT and lets the emulator flip its own thread betwee
 (ThreadHbJitWrite, class 0x7fe of NtSetInformationThread), with no W^X page flips. `HB_DIRECT_CONTINUE=1` continues
 emulated code straight from the syscall instead of through a signal. Both are off unless set.
 
+`0058` lets a query fill a buffer that sits on a page behind the emulator's write trap. FEX keeps a
+read-write-execute page that holds translated code read-execute; the program's own write faults into FEX and goes
+through, but a system call writes from the Unix side and failed with STATUS_ACCESS_VIOLATION, which Windows never
+returns for a buffer the program can write. When that happens and GuestProtection (`0043`) says every page of the
+buffer is read-write for the program, ntdll touches the pages from the ARM64EC side, FEX untraps them as it does for
+any native write, and the query runs once more. A buffer the program really cannot write keeps its status and no
+exception is raised. Covered: NtQuerySystemInformation, NtQuerySystemInformationEx, NtQueryInformationProcess,
+NtQueryInformationThread, NtQueryObject and NtQueryVirtualMemory. Calls that cannot run twice (NtReadFile,
+NtDeviceIoControlFile) are not covered.
+
+Football Manager 2027 (Microsoft Store, Denuvo) on an M2 Pro with 16 GB, macOS 27.0.1: without `0058` the game died
+on every run while a new career loaded, 12 ms after NtQuerySystemInformation( SystemFirmwareTableInformation, 'RSMB' )
+returned c0000005 for a 0x5bd-byte buffer, on the engines of 2026-10-20 and 2026-11-08. With it (main plus `0058`,
+built 2026-11-16) the query ran again five times in one session, and a career was created, a match played, the game
+saved and closed normally, in several sessions on 2026-11-16. The game ran under a third-party launcher (MACxus) with
+DXVK on MoltenVK, not under Highball itself.
+
 ### Forza Horizon 6
 
 `0044` to `0052` with FEX `0024` to `0033`, vkd3d-proton `0008` to `0010` and KosmicKrisp (`kosmickrisp-arm64/`) play Forza
