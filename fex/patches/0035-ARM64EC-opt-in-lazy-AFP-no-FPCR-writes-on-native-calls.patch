@@ -1,0 +1,197 @@
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index 8986ec4..cde5cef 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -650,9 +650,13 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
+     //
+     // Additional interesting AFP bits:
+     // FIZ(0): Flush Inputs to Zero
+-    orr(ARMEmitter::Size::i64Bit, TmpReg, TmpReg,
+-        (1U << 2) |   // NEP
+-          (1U << 1)); // AH
++    if (FEXCore::Context::HbLazyAFP) {
++      orr(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 1U << 2); // NEP only (Highball HB_FEX_LAZY_AFP)
++    } else {
++      orr(ARMEmitter::Size::i64Bit, TmpReg, TmpReg,
++          (1U << 2) |   // NEP
++            (1U << 1)); // AH
++    }
+ 
+     if (Options.SetFIZ) {
+       // Insert MXCSR.DAZ in to FIZ
+@@ -706,7 +710,18 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
+ 
+ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOptions Options) {
+ #ifndef VIXL_SIMULATOR
+-  if (EmitterCTX->HostFeatures.SupportsAFP) {
++  if (EmitterCTX->HostFeatures.SupportsAFP && FEXCore::Context::HbLazyAFP) {
++    // Highball HB_FEX_LAZY_AFP: keep NEP and FIZ for FEX's helpers (AH is never set); clear the trap enables only when one is armed
++    ARMEmitter::ForwardLabel NoTraps;
++    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++    and_(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0xff00);
++    (void)cbz(ARMEmitter::Size::i64Bit, TmpReg, &NoTraps);
++    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++    bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x1f00);
++    bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x8000);
++    msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
++    (void)Bind(&NoTraps);
++  } else if (EmitterCTX->HostFeatures.SupportsAFP) {
+     // Disable AFP features when spilling registers.
+     //
+     // Disable FPCR.NEP and FPCR.AH and FPCR.FIZ
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 9f04f23..78d3ed6 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -100,6 +100,7 @@ static bool IsWaitingX87Instruction(const FEXCore::X86Tables::X86InstInfo* Info)
+ 
+ namespace FEXCore::Context {
+ void (*HbJitWriteFn)(bool Enable) = nullptr;
++bool HbLazyAFP = false;
+ 
+ #ifdef ARCHITECTURE_arm64ec
+ // Private profiling data, separate from the versioned shared statistics layout.
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index ce79d6c..e3c2aa4 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -700,8 +700,9 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
+   , HostSupportsSVE128 {ctx->HostFeatures.SupportsSVE128 != 0}
+   , HostSupportsSVE256 {ctx->HostFeatures.SupportsSVE256 != 0}
+   , HostSupportsAVX256 {ctx->HostFeatures.SupportsAVX && ctx->HostFeatures.SupportsSVE256}
+-  , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES != 0}
++  , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES != 0 && !FEXCore::Context::HbLazyAFP} // RPRES needs AH
+   , HostSupportsAFP {ctx->HostFeatures.SupportsAFP != 0}
++  , HostSupportsAH {ctx->HostFeatures.SupportsAFP != 0 && !FEXCore::Context::HbLazyAFP}
+   , HostSupportsFloatExceptions {ctx->HostFeatures.SupportsFloatExceptions != 0}
+   , CTX {ctx}
+   , TempCodeBufferAllocator(ctx->CPUBackendAllocator, 0) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 0e7e97c..8f21157 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -78,6 +78,7 @@ private:
+   const bool HostSupportsAVX256 {};
+   const bool HostSupportsRPRES {};
+   const bool HostSupportsAFP {};
++  const bool HostSupportsAH {}; // Highball: AFP's AH in use (not with HB_FEX_LAZY_AFP)
+   const bool HostSupportsFloatExceptions {};
+ 
+   // x86 RCP*/RSQRT* never raise exceptions, but their host lowering (frecpe, frsqrte, fdiv, fsqrt) traps with the
+diff --git a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+index c6d8c28..b5c30a5 100644
+--- a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+@@ -445,7 +445,7 @@ DEF_OP(VFMinScalarInsert) {
+   const auto SubRegSize = ConvertSubRegSizePair248(IROp);
+ 
+   auto ScalarEmit = [this, SubRegSize](ARMEmitter::VRegister Dst, ARMEmitter::VRegister Src1, ARMEmitter::VRegister Src2) {
+-    if (HostSupportsAFP) {
++    if (HostSupportsAH) {
+       // AFP.AH lets fmin behave like x86 min
+       fmin(SubRegSize.Scalar, Dst, Src1, Src2);
+     } else {
+@@ -473,7 +473,7 @@ DEF_OP(VFMaxScalarInsert) {
+ 
+   // AFP can make this more optimal.
+   auto ScalarEmit = [this, SubRegSize](ARMEmitter::VRegister Dst, ARMEmitter::VRegister Src1, ARMEmitter::VRegister Src2) {
+-    if (HostSupportsAFP) {
++    if (HostSupportsAH) {
+       // AFP.AH lets fmax behave like x86 max
+       fmax(SubRegSize.Scalar, Dst, Src1, Src2);
+     } else {
+@@ -1449,7 +1449,7 @@ DEF_OP(VFMin) {
+   } else {
+     LOGMAN_THROW_A_FMT(!IsScalar, "should use VFMinScalarInsert instead");
+ 
+-    if (HostSupportsAFP) {
++    if (HostSupportsAH) {
+       // AFP.AH lets fmin behave like x86 min
+       fmin(SubRegSize, Dst.Q(), Vector1.Q(), Vector2.Q());
+       return;
+@@ -1508,7 +1508,7 @@ DEF_OP(VFMax) {
+   } else {
+     LOGMAN_THROW_A_FMT(!IsScalar, "should use VFMaxScalarInsert instead");
+ 
+-    if (HostSupportsAFP) {
++    if (HostSupportsAH) {
+       // AFP.AH lets fmax behave like x86 max
+       fmax(SubRegSize, Dst.Q(), Vector1.Q(), Vector2.Q());
+       return;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 7f47974..6793f34 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1333,7 +1333,7 @@ protected:
+       /* On AFP platforms, becomes fmin/fmax and preserves NZCV. Otherwise
+        * becomes fcmp and clobbers.
+        */
+-      if (CTX->HostFeatures.SupportsAFP) {
++      if (CTX->HostFeatures.SupportsAFP && !FEXCore::Context::HbLazyAFP) {
+         return;
+       }
+       break;
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index c9757e1..a9215b6 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -39,6 +39,11 @@ namespace FEXCore::Context {
+ // HbJitWriteFn(false) (its own write-or-execute state); null means the pages are plain read-write-execute memory
+ // that Wine flips between read-write and read-execute on every fault.
+ FEX_DEFAULT_VISIBILITY extern void (*HbJitWriteFn)(bool Enable);
++// Highball HB_FEX_LAZY_AFP=1: the JIT sets FPCR.NEP but not FPCR.AH (no AH-dependent code: MIN/MAX and RPRES are
++// emulated), and leaving the JIT keeps NEP and FIZ (only armed trap enables are cleared, and only when one is armed),
++// so neither helper calls nor native calls write FPCR. Read when code is emitted; set by the frontend before the
++// first compile.
++FEX_DEFAULT_VISIBILITY extern bool HbLazyAFP;
+ inline void HbJitWrite(bool Enable) {
+   if (HbJitWriteFn) {
+     HbJitWriteFn(Enable);
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 0cf6831..efab82d 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -56,10 +56,12 @@ BeginSimulation:
+ .global ExitFunctionEC
+ ExitFunctionEC:
+   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
++  // The bits cleared come from HbExitFpcrClearMask: NEP + AH (6), the floating-point trap enables IOE DZE OFE UFE
++  // IXE (0x1f00, armed from MXCSR while in the JIT) and IDE (0x8000). HB_FEX_LAZY_AFP=1 leaves NEP and AH set.
+   mrs x17, fpcr
+-  and x16, x17, #~6 // NEP + AH
+-  and x16, x16, #~0x1f00 // floating-point trap enables IOE DZE OFE UFE IXE (armed from MXCSR while in the JIT)
+-  and x16, x16, #~0x8000 // IDE
++  adrp x16, HbExitFpcrClearMask
++  ldr x16, [x16, :lo12:HbExitFpcrClearMask]
++  bic x16, x17, x16
+   eor x17, x17, x16 // writing FPCR is slow on Apple cores, skip it when nothing changes
+   cbz x17, 1f
+   msr fpcr, x16
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 168669f..0ae4c37 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -79,6 +79,7 @@ extern uint64_t SyscallTable[];
+ extern uint64_t SyscallTableEnd[];
+ 
+ void* X64ReturnInstr; // See Module.S
++uint64_t HbExitFpcrClearMask = 0x9f06; // FPCR bits ExitFunctionEC clears, see Module.S
+ uintptr_t NtDllBase;
+ 
+ // Exports on ARM64EC point to x64 fast forward sequences to allow for redirecting to the JIT if functions are hotpatched. This LUT is from their addresses to the relative addresses of the native code exports.
+@@ -908,6 +909,15 @@ NTSTATUS ProcessInit() {
+   if (const char* Setting = std::getenv("HB_FEX_MAPJIT"); Setting && Setting[0] == '1') {
+     FEXCore::Context::HbJitWriteFn = HbJitWriteToggle;
+   }
++  // Highball HB_FEX_LAZY_AFP=1: the JIT uses FPCR.NEP but not FPCR.AH (x86 MIN/MAX and RCP/RSQRT are emulated as on
++  // hosts without AFP), and NEP stays set while native code and FEX's helpers run, so calls between x64 and ARM64EC
++  // code stop writing FPCR, which serializes the core on Apple chips. NEP only changes the upper lanes of scalar
++  // SIMD&FP results, which compiled code does not read: Wine's CRT math gave bit-identical results over 10,610 calls
++  // with it set (AH, set the same way, changed signs and results). Off unless set.
++  if (const char* Setting = std::getenv("HB_FEX_LAZY_AFP"); Setting && Setting[0] == '1') {
++    HbExitFpcrClearMask = 0x9f02; // AH (never set in this mode) and the trap enables; NEP stays
++    FEXCore::Context::HbLazyAFP = true;
++  }
+   FEX::Windows::SetupThreadHandlers();
+   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
+   AppConfigName = FEX::Windows::BaseName(ExecutablePath);

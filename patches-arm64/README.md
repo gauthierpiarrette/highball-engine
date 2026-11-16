@@ -45,6 +45,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0059` ws2_32-ipv4-options-on-dual-stack-sockets-and-udp-netreset | Forza Horizon 6 could not determine its region or join any online session (0x8060046B): macOS refused IPv4 options on its dual-stack UDP socket. | Forza Horizon 6 online play | macOS | from the MetalHorizon launcher's 0003, 0005 and 0006 |
 | `0060` winhttp-websocket-owns-its-connection-and-blocking-receives-block | WebSocket threads spun on WSAEWOULDBLOCK, about 15,000 receives a second each. | Forza Horizon 6 online services | general | from the MetalHorizon launcher's 0002, ported to 11.18 |
 | `0061` ntdll-server-msync-on-the-arm64-line | The arm64 line had no msync, so a bottle's msync setting did nothing and every wait went to wineserver; Forza Horizon 6 showed Low Streaming Bandwidth above 200 km/h. | every program with WINEMSYNC=1 | macOS (off unless `WINEMSYNC=1`) | CrossOver's msync (Marc-Aurel Zent) via koels-net/mcsoda, ported to inproc sync |
+| `0062` ntdll-wait-on-address-wake-fast-path-and-yielding-spinlock | Forza Horizon 6's job threads spent most of their time spinning on a futex bucket's spinlock in RtlWakeAddressSingle, taken even with nobody waiting. | programs that wake by address from many threads (Forza Horizon 6) | performance | general |
 
 ## Details
 
@@ -349,3 +350,15 @@ koels-net/mcsoda (`patches/0002-msync-from-crossover-11.0.patch`); the glue is p
 us, 8 threads on a semaphore and a mutex 1.24 to 0.089 s, WaitAll, APCs and abandoned mutexes correct. Forza Horizon 6:
 "msync: up and running", 400 km/h through Tokyo with no Low Streaming Bandwidth warning. It applies to every bottle whose
 sync is msync, so other games on this line should be checked before it ships.
+
+### Wake by address (0062)
+
+A live profile of Forza Horizon 6 on an M5 Max (2026-11-17) had six to eight of its job threads in a five-instruction
+loop of `ntdll.dll` most of the time: `spin_lock` in `RtlWakeAddressSingle`. `RtlWaitOnAddress` and the wakes hash an
+address to one of 256 queues, each guarded by a spinlock that only ever spins, and every wake took it, waiters or not.
+`0062` counts the waiters of a queue (incremented before the value comparison, with full barriers on both sides, so a
+wake either sees the waiter or the waiter sees the new value) and returns from a wake when there are none; the spinlock
+tests before it sets and yields the core after 256 spins, so a preempted holder no longer keeps every other thread
+spinning for its time slice. A WaitOnAddress/WakeByAddressSingle producer-consumer test lost no wakeups and went from
+2.5 to 7.6 million items a second with 16 producers and from 1.8 to 7.6 million with 24; a wake with nobody waiting from
+38 to 33 ns. In the game the overlay's CPU time dropped by about 2 ms (GPU 11.0 ms, CPU 8.7 ms afterwards).

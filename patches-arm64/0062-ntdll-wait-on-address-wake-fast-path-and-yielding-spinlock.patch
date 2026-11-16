@@ -1,0 +1,84 @@
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -833,6 +833,7 @@
+ {
+     struct list queue;
+     LONG lock;
++    LONG waiters; /* Highball: threads in RtlWaitOnAddress on this bucket; wakes skip the lock when 0 */
+ };
+ 
+ static struct futex_queue futex_queues[256];
+@@ -846,8 +847,22 @@
+ 
+ static void spin_lock( LONG *lock )
+ {
++    unsigned int spins = 0;
++
++    /* Highball: test before test-and-set, and give the core away after a while: a holder that was preempted
++     * otherwise keeps every other thread spinning for its whole time slice. */
+     while (InterlockedCompareExchange( lock, -1, 0 ))
+-        YieldProcessor();
++    {
++        do
++        {
++            if (++spins >= 256)
++            {
++                NtYieldExecution();
++                spins = 0;
++            }
++            else YieldProcessor();
++        } while (ReadNoFence( lock ));
++    }
+ }
+ 
+ static void spin_unlock( LONG *lock )
+@@ -890,6 +905,11 @@
+     entry.addr = addr;
+     entry.tid = GetCurrentThreadId();
+ 
++    /* Highball: announce the waiter before reading the value; a waker writes the value before reading the count
++     * (both with full barriers), so either the waker sees the count or this thread sees the new value. */
++    InterlockedIncrement( &queue->waiters );
++    MemoryBarrier();
++
+     spin_lock( &queue->lock );
+ 
+     /* Do the comparison inside of the spinlock, to reduce spurious wakeups. */
+@@ -897,6 +917,7 @@
+     if (!compare_addr( addr, cmp, size ))
+     {
+         spin_unlock( &queue->lock );
++        InterlockedDecrement( &queue->waiters );
+         return STATUS_SUCCESS;
+     }
+ 
+@@ -916,6 +937,7 @@
+             list_remove( &entry.entry );
+         spin_unlock( &queue->lock );
+     }
++    InterlockedDecrement( &queue->waiters );
+ 
+     TRACE("returning %#lx\n", ret);
+ 
+@@ -937,6 +959,10 @@
+ 
+     if (!addr) return;
+ 
++    /* Highball: nobody waits on this bucket, nothing to wake (see RtlWaitOnAddress for the ordering) */
++    MemoryBarrier();
++    if (!ReadNoFence( &queue->waiters )) return;
++
+     spin_lock( &queue->lock );
+ 
+     if (!queue->queue.next)
+@@ -977,6 +1003,10 @@
+ 
+     if (!addr) return;
+ 
++    /* Highball: nobody waits on this bucket, nothing to wake (see RtlWaitOnAddress for the ordering) */
++    MemoryBarrier();
++    if (!ReadNoFence( &queue->waiters )) return;
++
+     spin_lock( &queue->lock );
+ 
+     if (!queue->queue.next)
