@@ -1,0 +1,188 @@
+ntdll: a query into a page behind the emulator's write trap runs again.
+
+A system call fills the program's buffer from the Unix side. FEX keeps a read-write-execute page that holds
+translated code read-execute (read-only for a DEP-promoted one) to see writes into that code: the program's own
+write faults into FEX, which lets it through, but the Unix side's write has nobody to do that, so the call returns
+STATUS_ACCESS_VIOLATION for a buffer the program can write. Windows never does. FEX's own note on NtReadFile names
+the gap ("requires coordination between Wine and FEX").
+
+Football Manager 2027 (Microsoft Store, Denuvo), M2 Pro, engine builds of 2026-10-20 and 2026-11-08: while a new
+career loads, its protection calls NtQuerySystemInformation( SystemFirmwareTableInformation, 'RSMB' ) with a
+0x5bd-byte buffer; get_firmware_info reads the header and faults on its first store (buffer + 0xc), the call
+returns c0000005 and 12 ms later the thread dies in game_plugin.dll at an unmapped address, the same RVA on every
+run.
+
+When one of the query calls returns STATUS_ACCESS_VIOLATION and every page of its buffer is read-write for the
+program (GuestProtection, 0043) while at least one is trapped, ntdll touches each page from the ARM64EC side with
+an atomic OR of 0. That faults into FEX like a write of the program's (its handler takes native writes too),
+which untraps the page and drops the translations, and the query runs once more. A buffer the program really
+cannot write keeps its status and raises nothing, so a program that probes with read-only buffers sees what it saw
+before. Covered: NtQuerySystemInformation, NtQuerySystemInformationEx, NtQueryInformationProcess,
+NtQueryInformationThread, NtQueryObject, NtQueryVirtualMemory, all of which can run twice. An emulator without
+GuestProtection changes nothing. WARN lines (seh channel) say when a query ran again and when it was left alone.
+
+Not covered: calls that cannot simply run twice (NtReadFile, NtDeviceIoControlFile); those need the Unix side to
+know the program's protection.
+
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -541,8 +541,8 @@ DEFINE_SYSCALL(NtQueryFullAttributesFile, (const OBJECT_ATTRIBUTES *attr, FILE_N
+ DEFINE_SYSCALL(NtQueryInformationAtom, (RTL_ATOM atom, ATOM_INFORMATION_CLASS class, void *ptr, ULONG size, ULONG *retsize))
+ DEFINE_SYSCALL(NtQueryInformationFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *ptr, ULONG len, FILE_INFORMATION_CLASS class))
+ DEFINE_SYSCALL(NtQueryInformationJobObject, (HANDLE handle, JOBOBJECTINFOCLASS class, void *info, ULONG len, ULONG *ret_len))
+-DEFINE_SYSCALL(NtQueryInformationProcess, (HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size, ULONG *ret_len))
+-DEFINE_SYSCALL(NtQueryInformationThread, (HANDLE handle, THREADINFOCLASS class, void *data, ULONG length, ULONG *ret_len))
++DEFINE_WRAPPED_SYSCALL(NtQueryInformationProcess, (HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size, ULONG *ret_len))
++DEFINE_WRAPPED_SYSCALL(NtQueryInformationThread, (HANDLE handle, THREADINFOCLASS class, void *data, ULONG length, ULONG *ret_len))
+ DEFINE_SYSCALL(NtQueryInformationToken, (HANDLE token, TOKEN_INFORMATION_CLASS class, void *info, ULONG length, ULONG *retlen))
+ DEFINE_SYSCALL(NtQueryInstallUILanguage, (LANGID *lang))
+ DEFINE_SYSCALL(NtQueryIoCompletion, (HANDLE handle, IO_COMPLETION_INFORMATION_CLASS class, void *buffer, ULONG len, ULONG *ret_len))
+@@ -550,7 +550,7 @@ DEFINE_SYSCALL(NtQueryKey, (HANDLE handle, KEY_INFORMATION_CLASS info_class, voi
+ DEFINE_SYSCALL(NtQueryLicenseValue, (const UNICODE_STRING *name, ULONG *type, void *data, ULONG length, ULONG *retlen))
+ DEFINE_SYSCALL(NtQueryMultipleValueKey, (HANDLE key, KEY_MULTIPLE_VALUE_INFORMATION *info, ULONG count, void *buffer, ULONG length, ULONG *retlen))
+ DEFINE_SYSCALL(NtQueryMutant, (HANDLE handle, MUTANT_INFORMATION_CLASS class, void *info, ULONG len, ULONG *ret_len))
+-DEFINE_SYSCALL(NtQueryObject, (HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len))
++DEFINE_WRAPPED_SYSCALL(NtQueryObject, (HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len))
+ DEFINE_SYSCALL(NtQueryPerformanceCounter, (LARGE_INTEGER *counter, LARGE_INTEGER *frequency))
+ DEFINE_SYSCALL(NtQuerySection, (HANDLE handle, SECTION_INFORMATION_CLASS class, void *ptr, SIZE_T size, SIZE_T *ret_size))
+ DEFINE_SYSCALL(NtQuerySecurityObject, (HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR descr, ULONG length, ULONG *retlen))
+@@ -559,7 +559,7 @@ DEFINE_SYSCALL(NtQuerySymbolicLinkObject, (HANDLE handle, UNICODE_STRING *target
+ DEFINE_SYSCALL(NtQuerySystemEnvironmentValue, (UNICODE_STRING *name, WCHAR *buffer, ULONG length, ULONG *retlen))
+ DEFINE_SYSCALL(NtQuerySystemEnvironmentValueEx, (UNICODE_STRING *name, GUID *vendor, void *buffer, ULONG *retlen, ULONG *attrib))
+ DEFINE_WRAPPED_SYSCALL(NtQuerySystemInformation, (SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size))
+-DEFINE_SYSCALL(NtQuerySystemInformationEx, (SYSTEM_INFORMATION_CLASS class, void *query, ULONG query_len, void *info, ULONG size, ULONG *ret_size))
++DEFINE_WRAPPED_SYSCALL(NtQuerySystemInformationEx, (SYSTEM_INFORMATION_CLASS class, void *query, ULONG query_len, void *info, ULONG size, ULONG *ret_size))
+ DEFINE_SYSCALL(NtQuerySystemTime, (LARGE_INTEGER *time))
+ DEFINE_SYSCALL(NtQueryTimer, (HANDLE handle, TIMER_INFORMATION_CLASS class, void *info, ULONG len, ULONG *ret_len))
+ DEFINE_SYSCALL(NtQueryTimerResolution, (ULONG *min_res, ULONG *max_res, ULONG *current_res))
+@@ -654,6 +654,60 @@ DEFINE_SYSCALL(NtWriteRequestData, (HANDLE handle, LPC_MESSAGE *request, ULONG i
+ DEFINE_SYSCALL(NtWriteVirtualMemory, (HANDLE process, void *addr, const void *buffer, SIZE_T size, SIZE_T *bytes_written))
+ DEFINE_SYSCALL(NtYieldExecution, (void))
+ 
++/* Highball: a system call fills a buffer the program gave it from the Unix side. The emulator keeps a
++ * read-write-execute page that holds translated code read-execute, to see writes into that code: a write by the
++ * program faults into the emulator, which lets it through, but a write by the Unix side has no one to do that and
++ * the call fails with STATUS_ACCESS_VIOLATION, which Windows never returns for a buffer the program can write.
++ * Copy protections keep such buffers beside their own code. When a query fails that way and every page of the
++ * buffer is writable for the program (GuestProtection), touch each page from here, so that the emulator takes
++ * its trap away the way it does for the program's own writes, and say that the query can run again. A buffer the
++ * program really cannot write keeps its status, and no exception is raised for it. */
++static BOOL untrap_guest_buffer( void *ptr, SIZE_T size )
++{
++    ULONG_PTR page, start = (ULONG_PTR)ptr, end = start + size;
++    BOOL trapped = FALSE;
++
++    if (!ptr || !size || end < start || size > 0x1000000) return FALSE;
++    for (page = start & ~(ULONG_PTR)0xfff; page < end; page += 0x1000)
++    {
++        MEMORY_BASIC_INFORMATION info;
++        ULONG guest;
++
++        if (syscall_NtQueryVirtualMemory( GetCurrentProcess(), (void *)page, MemoryBasicInformation,
++                                          &info, sizeof(info), NULL )) return FALSE;
++        if (info.State != MEM_COMMIT) return FALSE;
++        guest = pGuestProtection( (void *)page, info.Protect );
++        if (guest != PAGE_READWRITE && guest != PAGE_EXECUTE_READWRITE)
++        {
++            WARN( "buffer %p-%p: page %p has protection %lx (%lx for the program), not retrying\n",
++                  (void *)start, (void *)end, (void *)page, info.Protect, guest );
++            return FALSE;
++        }
++        if (guest != info.Protect) trapped = TRUE;
++    }
++    if (!trapped) return FALSE;
++    for (page = start & ~(ULONG_PTR)0xfff; page < end; page += 0x1000)
++    {
++        volatile char *p = (volatile char *)(page < start ? start : page);
++        __atomic_fetch_or( p, 0, __ATOMIC_SEQ_CST );  /* writes back what is there */
++    }
++    return TRUE;
++}
++
++static BOOL retry_trapped_query( NTSTATUS status, const char *name, void *buffer, SIZE_T size,
++                                 void *ret_len, SIZE_T ret_size )
++{
++    BOOL ret;
++
++    if (status != STATUS_ACCESS_VIOLATION || !pGuestProtection) return FALSE;
++    if (get_arm64ec_cpu_area()->InSyscallCallback) return FALSE;
++    ret = untrap_guest_buffer( buffer, size );
++    if (untrap_guest_buffer( ret_len, ret_size )) ret = TRUE;
++    if (ret) WARN( "%s: buffer %p size %Ix was behind the emulator's write trap, running the query again\n",
++                   name, buffer, size );
++    return ret;
++}
++
+ NTSTATUS SYSCALL_API NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
+                                               SIZE_T *size_ptr, ULONG type, ULONG protect )
+ {
+@@ -918,6 +972,43 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+ 
+ /* Highball: a page the emulator made read-execute to see writes into translated code reads back with the protection
+  * the program set itself, as on Windows, where no such step exists */
++NTSTATUS SYSCALL_API NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size, ULONG *ret_len )
++{
++    NTSTATUS status = syscall_NtQueryInformationProcess( handle, class, info, size, ret_len );
++
++    if (retry_trapped_query( status, "NtQueryInformationProcess", info, size, ret_len, sizeof(*ret_len) ))
++        status = syscall_NtQueryInformationProcess( handle, class, info, size, ret_len );
++    return status;
++}
++
++NTSTATUS SYSCALL_API NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class, void *data, ULONG length, ULONG *ret_len )
++{
++    NTSTATUS status = syscall_NtQueryInformationThread( handle, class, data, length, ret_len );
++
++    if (retry_trapped_query( status, "NtQueryInformationThread", data, length, ret_len, sizeof(*ret_len) ))
++        status = syscall_NtQueryInformationThread( handle, class, data, length, ret_len );
++    return status;
++}
++
++NTSTATUS SYSCALL_API NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len )
++{
++    NTSTATUS status = syscall_NtQueryObject( handle, info_class, ptr, len, used_len );
++
++    if (retry_trapped_query( status, "NtQueryObject", ptr, len, used_len, sizeof(*used_len) ))
++        status = syscall_NtQueryObject( handle, info_class, ptr, len, used_len );
++    return status;
++}
++
++NTSTATUS SYSCALL_API NtQuerySystemInformationEx( SYSTEM_INFORMATION_CLASS class, void *query, ULONG query_len,
++                                                 void *info, ULONG size, ULONG *ret_size )
++{
++    NTSTATUS status = syscall_NtQuerySystemInformationEx( class, query, query_len, info, size, ret_size );
++
++    if (retry_trapped_query( status, "NtQuerySystemInformationEx", info, size, ret_size, sizeof(*ret_size) ))
++        status = syscall_NtQuerySystemInformationEx( class, query, query_len, info, size, ret_size );
++    return status;
++}
++
+ NTSTATUS SYSCALL_API NtQueryVirtualMemory( HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class,
+                                            PVOID buffer, SIZE_T len, SIZE_T *res_len )
+ {
+@@ -927,6 +1018,15 @@ NTSTATUS SYSCALL_API NtQueryVirtualMemory( HANDLE process, LPCVOID addr, MEMORY_
+         return syscall_NtQueryVirtualMemory( process, addr, info_class, buffer, len, res_len );
+ 
+     status = syscall_NtQueryVirtualMemory( process, addr, info_class, buffer, len, res_len );
++    if (status == STATUS_ACCESS_VIOLATION)
++    {
++        BOOL retry;
++
++        get_arm64ec_cpu_area()->InSyscallCallback = 0;  /* the touch may fault into the emulator */
++        retry = retry_trapped_query( status, "NtQueryVirtualMemory", buffer, len, res_len, sizeof(*res_len) );
++        get_arm64ec_cpu_area()->InSyscallCallback = 1;
++        if (retry) status = syscall_NtQueryVirtualMemory( process, addr, info_class, buffer, len, res_len );
++    }
+     if (!status && info_class == MemoryBasicInformation && len >= sizeof(MEMORY_BASIC_INFORMATION) &&
+         pGuestProtection && RtlIsCurrentProcess( process ))
+     {
+@@ -968,6 +1068,8 @@ NTSTATUS SYSCALL_API NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class, v
+ {
+     NTSTATUS status = syscall_NtQuerySystemInformation( class, info, size, ret_size );
+ 
++    if (retry_trapped_query( status, "NtQuerySystemInformation", info, size, ret_size, sizeof(*ret_size) ))
++        status = syscall_NtQuerySystemInformation( class, info, size, ret_size );
+     if (!status && class == SystemCpuInformation && pUpdateProcessorInformation) pUpdateProcessorInformation( info );
+     return status;
+ }
