@@ -337,7 +337,42 @@ FEX makes a read-write-execute page that holds translated code read-execute, so 
 its tracking of self-modifying code. A system call that wrote into such a page for the program faulted on the Unix
 side and returned STATUS_ACCESS_VIOLATION, where the Windows kernel writes: a buffer next to code that ran could not
 take a read, a copy or a query. Football Manager 27's copy protection asks for the SMBIOS table that way and stopped
-the game at "Loading game database". `0058` marks the pages the emulator traps (ntdll's ARM64EC side asks
-`GuestProtection` from `0043`), lets a write from inside a system call through to a marked page, and gives the page
-its trap back when the call returns. tests/x64-fidelity `syscallwrite`: 6 of 11 checks passed before, all 11 under
-Rosetta 2 (M5 Pro, macOS 27.2).
+the game at "Loading game database".
+
+`0058` marks the pages the emulator traps (ntdll's ARM64EC side asks `GuestProtection` from `0043` for each 4 KB
+page). A write from inside a system call into a marked page takes the steps of a write by the program, in FEX's
+order: the signal handler sends the thread to a user callback that calls `BTCpu64NotifyMemoryDirty`, opens the
+page and calls it again, and then the write runs again. FEX traps the page again when it translates code from it
+again. The callback does not run while the system call holds `virtual_mutex`, because FEX calls
+`NtProtectVirtualMemory` while it holds its own lock for code invalidation; there the page opens on the Unix side,
+and the `NtQueryVirtualMemory` wrapper tells FEX when the call returns. macOS only.
+
+A first way, FEX's notice after the marked calls only (as `BTCpu64NotifyReadFile` does for `NtReadFile`), passed
+the other checks but let a second thread run old code: its own write into the open page did not reach FEX before
+the call returned (`thread.no-stale-code`, 2 to 73 stale runs of about 52,000 in 4 of 13 runs).
+
+tests/x64-fidelity `syscallwrite` (M5 Pro, macOS 27.2), 31 checks:
+
+| Engine | Result |
+|---|---|
+| Rosetta 2 (CrossOver 26.3) | 31 of 31 (3 of 3 runs) |
+| r5, without `0058` | 19 of the first 28, then `lock` hangs |
+| r5 with `0058` | 31 of 31 (5 of 5 runs); the first 28 in 13 of 13 runs |
+
+The other x64-fidelity tests give the same results with and without `0058`.
+
+Games on r5 with `0058` (M5 Pro, macOS 27.2, 2026-11-16):
+
+- Football Manager 27 (Game Pass): past "Loading game database", plays, and exits normally. Without `0058` it
+  stops there in 5 of 5 starts.
+- DREDGE: plays as before.
+- Forza Horizon 6 (Game Pass), with the arm64 route of Highball's recipe, at 2560x1440, the Medium preset and
+  V-Sync off, the game's benchmark:
+
+| | r5 | r5 with `0058` |
+|---|---|---|
+| Result | 43 fps | 43 fps |
+| CPU Simulation (average, 1% low, 0.1% low) | 113.5, 62.2, 45.5 | 114.5, 68.0, 43.3 |
+| CPU Render | 62.7, 47.6, 39.9 | 62.3, 46.8, 34.4 |
+| GPU | 44.4, 39.2, 37.3 | 44.6, 39.4, 35.6 |
+| GPU limited | 99.8% | 99.8% |
