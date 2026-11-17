@@ -90,6 +90,10 @@ yet. The paragraphs under the table give the details and the measurements.
 
 ## Age of Empires IV on Rosetta
 
+The [complete standalone engine source](https://github.com/himbeles/highball-engine-aoe4/tree/main)
+and [analysis and measurements](https://github.com/himbeles/highball-engine-aoe4/blob/main/proposals/aoe4/VALIDATION.md)
+are maintained on the engine fork’s `main` branch.
+
 Patch 0032 lets the Wine 11 engine run AoE IV's generated-code decoder on
 Apple Silicon. The game recipe sets `HB_AOE4=1` and selects D3DMetal. Wine also
 requires Rosetta on macOS 26+, `RelicCardinal.exe`, a supported x64 PE layout,
@@ -109,8 +113,10 @@ reader automatically.
 
 ### Build and check
 
-The Intel `build-engine` workflow applies the patch, runs its tests,
-and builds the arm64 helper from the commit pinned in `inputs.json`. The engine
+The Intel `build-engine` workflow applies the patch and runs its tests. It calls
+`build-x87sidecar` to build both pinned helpers, then bundles the AoE IV artifact.
+Each helper reuses its cached archive when its source pin and build configuration
+match; a missing cache entry is rebuilt. The engine
 archive includes the helper and its MIT notice under `share/wine/aoe4`, and the
 HDE notice under `share/wine`. The profiles are compiled into Wine by patch 0032.
 The release also includes corresponding source.

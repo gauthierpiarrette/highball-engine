@@ -1,17 +1,16 @@
-# Builds athei's x87sidecar (MIT) from the commit inputs.json pins, for the Wine 11 engines. Wine
-# re-executes a 32-bit program through it when ROSETTA_X87_PATH names it (patches/0012, cooperative
-# attach, no entitlements), which Highball sets only for games the database opts in. Rebuilds
-# when the workflow or inputs.json changes, or on manual dispatch; nothing published unless asked.
+# Builds the standard and AoE IV helpers from inputs.json. Each pinned source/build
+# configuration is cached independently; releases are published only on manual request.
 name: build-x87sidecar
 on:
   push:
     paths:
       - ".github/workflows/build-x87sidecar.yml"
       - "inputs.json"
+  workflow_call:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish the archive as a GitHub release (tag x87sidecar-<tag>-<date>)"
+        description: "Publish both helper archives as GitHub releases"
         type: boolean
         default: false
 permissions:
@@ -20,46 +19,91 @@ jobs:
   build:
     runs-on: macos-26
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - input: x87sidecar
+            name: x87sidecar
+          - input: aoe4Sidecar
+            name: x87sidecar-aoe4
+    env:
+      SOURCE_INPUT: ${{ matrix.input }}
+      SIDECAR_NAME: ${{ matrix.name }}
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v4
+      - name: source identity
+        id: source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          source = json.load(open("inputs.json"))[os.environ["SOURCE_INPUT"]]
+          identity = {key: source.get(key, "") for key in ("repo", "commit", "tag")}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              print("key=" + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(), file=out)
+          with open(os.environ["GITHUB_ENV"], "a") as out:
+              print("HELPER_REPO=" + source["repo"], file=out)
+              print("HELPER_COMMIT=" + source["commit"], file=out)
+              print("HELPER_VERSION=" + (source.get("tag") or source["commit"][:12]), file=out)
+          PY
+          echo "toolchain=$(xcodebuild -version | shasum -a 256 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: helper
+        with:
+          path: ${{ runner.temp }}/sidecar-out
+          key: sidecar-${{ matrix.name }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.source.outputs.key }}-${{ steps.source.outputs.toolchain }}-${{ hashFiles('.github/workflows/build-x87sidecar.yml') }}
       - name: pinned source
+        if: steps.helper.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          repo=$(python3 -c 'import json;print(json.load(open("inputs.json"))["x87sidecar"]["repo"])')
-          commit=$(python3 -c 'import json;print(json.load(open("inputs.json"))["x87sidecar"]["commit"])')
-          git clone --quiet "$repo" src
-          git -C src checkout --quiet "$commit"
-          git -C src log --oneline -1
+          git clone --quiet --no-checkout "$HELPER_REPO" src
+          git -C src checkout --quiet --detach "$HELPER_COMMIT"
+          [[ "$(git -C src rev-parse HEAD)" == "$HELPER_COMMIT" ]]
       - name: build
+        if: steps.helper.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          cd src
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
           cmake --build build --target x87sidecar -j "$(sysctl -n hw.ncpu)"
-          file build/bin/x87sidecar
+          [[ "$(lipo -archs build/bin/x87sidecar)" == arm64 ]]
       - name: package
+        if: steps.helper.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          tag=$(python3 -c 'import json;print(json.load(open("inputs.json"))["x87sidecar"]["tag"])')
-          name="x87sidecar-$tag-$(date -u +%Y%m%dT%H%M%SZ)"
-          out="$RUNNER_TEMP/out/$name"; mkdir -p "$out/x87sidecar"
-          cp src/build/bin/x87sidecar "$out/x87sidecar/"
+          # A partial cache match must never leave an older archive in this output.
+          rm -rf "$RUNNER_TEMP/sidecar-out"
+          name="$SIDECAR_NAME-$HELPER_VERSION-$(date -u +%Y%m%dT%H%M%SZ)"
+          out="$RUNNER_TEMP/sidecar-package"; mkdir -p "$out/x87sidecar" "$RUNNER_TEMP/sidecar-out"
+          cp build/bin/x87sidecar "$out/x87sidecar/"
           cp src/LICENSE "$out/x87sidecar/LICENSE"
           git -C src rev-parse HEAD > "$out/x87sidecar/SOURCE_COMMIT"
           codesign -f -s - "$out/x87sidecar/x87sidecar"
-          codesign -v "$out/x87sidecar/x87sidecar"
-          tar -C "$out" -cJf "$RUNNER_TEMP/out/$name.tar.xz" x87sidecar
-          (cd "$RUNNER_TEMP/out" && shasum -a 256 "$name.tar.xz" > "$name.tar.xz.sha256")
-          echo "NAME=$name" >> "$GITHUB_ENV"
-          cat "$RUNNER_TEMP/out/$name.tar.xz.sha256"
+          codesign --verify --strict "$out/x87sidecar/x87sidecar"
+          tar -C "$out" -cJf "$RUNNER_TEMP/sidecar-out/$name.tar.xz" x87sidecar
+          git -C src archive --format=tar.gz --output="$RUNNER_TEMP/sidecar-out/$name-source.tar.gz" HEAD
+          (cd "$RUNNER_TEMP/sidecar-out" && shasum -a 256 "$name.tar.xz" > "$name.tar.xz.sha256"
+           shasum -a 256 "$name-source.tar.gz" > "$name-source.tar.gz.sha256")
+      - name: verify archives
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/sidecar-out"
+          shasum -a 256 -c ./*.sha256
+          [[ "$(tar -xOf ./*.tar.xz x87sidecar/SOURCE_COMMIT)" == "$HELPER_COMMIT" ]]
       - uses: actions/upload-artifact@v4
         with:
-          name: x87sidecar
-          path: |
-            ${{ runner.temp }}/out/*.tar.xz
-            ${{ runner.temp }}/out/*.tar.xz.sha256
+          name: ${{ matrix.name }}
+          path: ${{ runner.temp }}/sidecar-out/*
+          if-no-files-found: error
       - name: publish
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$NAME" "$RUNNER_TEMP/out/$NAME.tar.xz" "$RUNNER_TEMP/out/$NAME.tar.xz.sha256" --title "$NAME" --notes "athei's x87sidecar (MIT, github.com/athei/x87sidecar) built from the commit inputs.json pins."
+        run: |
+          set -euo pipefail
+          archive=("$RUNNER_TEMP/sidecar-out/"*.tar.xz)
+          name=$(basename "${archive[0]}" .tar.xz)
+          if ! gh release view "$name" >/dev/null 2>&1; then
+            gh release create "$name" "$RUNNER_TEMP/sidecar-out/"* --title "$name" --notes "$SIDECAR_NAME (MIT, $HELPER_REPO) built from $HELPER_COMMIT, pinned in inputs.json."
+          fi
