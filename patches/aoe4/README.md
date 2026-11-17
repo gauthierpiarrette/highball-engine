@@ -8,7 +8,7 @@ normal Wine behavior.
 
 The arm64 helper combines the software-fault and x87 decoders. Wine caches
 relocated instruction fragments, retaining the original PC for exceptions.
-It finds the code ring using a measured SHA-256 profile or unique allocator/
+It finds the code ring using a built-in measured SHA-256 profile or unique allocator/
 writer references, and validates the live 16 MiB allocation before using it.
 Unsupported fragments use the decoder; inconclusive discovery leaves caching off.
 
@@ -20,8 +20,9 @@ reader automatically.
 ## Build and check
 
 The Intel `build-engine` workflow applies the patch, runs its tests,
-and builds the arm64 helper from the commit pinned in `inputs.json`. The engine archive includes the helper,
-profiles and license notices under `share/wine/aoe4`; the release also includes
+and builds the arm64 helper from the commit pinned in `inputs.json`. The engine archive includes the helper
+and license notices under `share/wine/aoe4`; the profiles are compiled into Wine by
+patch 0032. The release also includes
 corresponding source.
 
 After applying the normal Wine patch series:
@@ -56,6 +57,6 @@ of the final combined PR head. Smaller stutters remain in Late Siege.
 ## Credits
 
 Wine thunks/cache: [Marc Ibrahim's LGPL source, mirrored by NerRobDog](https://github.com/NerRobDog/wine-aoe4/tree/711c6fc7559a565c417aab4d52d84b09767a9c1d).
-MIT helper: [himbeles/x87sidecar](https://github.com/himbeles/x87sidecar/tree/f02887422ec3a671718261e1a31cb0e1c232bbbe), based on [athei/x87sidecar](https://github.com/athei/x87sidecar).
+MIT helper: [himbeles/x87sidecar-aoe4](https://github.com/himbeles/x87sidecar-aoe4/tree/f02887422ec3a671718261e1a31cb0e1c232bbbe), based on [athei/x87sidecar](https://github.com/athei/x87sidecar).
 MIT decoder composition and FBLD fixes: [MacGames](https://github.com/tarikbc/macgames/tree/1579841b15ce569807b92af95b478c752c26df3d/patches/x87sidecar).
 Source pins are in [inputs.json](../../inputs.json); [licenses](licenses/) accompany the engine.

@@ -43,7 +43,19 @@ jobs:
         run: |
           tests/aoe4/run.sh "$PWD/src/sources/wine"
           command -v cmake >/dev/null || brew install cmake
-          .github/scripts/build-aoe4-sidecar.sh "$RUNNER_TEMP/aoe4-helper-build"
+          work="$RUNNER_TEMP/aoe4-helper-build"
+          helper_repo=$(python3 -c 'import json; print(json.load(open("inputs.json"))["aoe4Sidecar"]["repo"])')
+          helper_commit=$(python3 -c 'import json; print(json.load(open("inputs.json"))["aoe4Sidecar"]["commit"])')
+          git clone --no-checkout "$helper_repo" "$work/source"
+          git -C "$work/source" checkout --detach "$helper_commit"
+          [[ "$(git -C "$work/source" rev-parse HEAD)" == "$helper_commit" ]]
+          cmake -S "$work/source" -B "$work/build" -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$work/build" --target x87sidecar --parallel
+          helper="$work/build/bin/x87sidecar"
+          [[ "$(lipo -archs "$helper")" == arm64 ]]
+          codesign --force --sign - "$helper"
+          codesign --verify --strict "$helper"
+          shasum -a 256 "$helper"
       - name: toolchain
         run: |
           set -euo pipefail
@@ -149,9 +161,8 @@ jobs:
           # The helper must ship with Wine: the AoE loader resolves this relative path.
           helper="$RUNNER_TEMP/aoe4-helper-build"
           aoe=out/engine/share/wine/aoe4
-          mkdir -p "$aoe/profiles"
+          mkdir -p "$aoe"
           cp "$helper/build/bin/x87sidecar" "$aoe/"
-          cp patches/aoe4/profiles/*.cache "$aoe/profiles/"
           cp patches/aoe4/licenses/x87sidecar-MIT.txt "$aoe/"
           cp patches/aoe4/licenses/HDE-LICENSE.txt out/engine/share/wine/
           name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
@@ -161,10 +172,9 @@ jobs:
       - name: AoE IV corresponding source
         run: |
           source="$RUNNER_TEMP/aoe4-corresponding-source"
-          mkdir -p "$source/.github/workflows" "$source/.github/scripts" "$source/tests"
+          mkdir -p "$source/.github/workflows" "$source/tests"
           cp -R crossover-sources.tar.gz patches inputs.json LICENSE NOTICE.md "$source/"
           cp .github/workflows/build.yml "$source/.github/workflows/"
-          cp .github/scripts/build-aoe4-sidecar.sh "$source/.github/scripts/"
           cp -R tests/aoe4 "$source/tests/"
           tar --exclude=.git -czf "$source/sidecar-source.tar.gz" -C "$RUNNER_TEMP/aoe4-helper-build/source" .
           echo "$GITHUB_SHA" > "$source/ENGINE_COMMIT"

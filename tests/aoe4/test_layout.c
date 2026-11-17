@@ -4,8 +4,6 @@
 #include "aoe_build_guard.h"
 static void put16(unsigned char *p,unsigned value){p[0]=value;p[1]=value>>8;}
 static void put32(unsigned char *p,uint32_t value){unsigned i;for(i=0;i<4;i++)p[i]=value>>(i*8);}
-static int profile(const char *text,const char *hash,const struct aoe_image_layout *image,uint64_t *pointer)
-{FILE *f=tmpfile();int result;assert(f);fputs(text,f);rewind(f);result=aoe_cache_profile(f,hash,image,pointer);fclose(f);return result;}
 int main(void)
 {
  unsigned char pe[1024]={0}; char name[]="/tmp/aoe4-pe-XXXXXX";
@@ -21,17 +19,24 @@ int main(void)
  assert(write(fd,pe,sizeof(pe))==sizeof(pe));assert(aoe_read_layout(fd,&image));
  assert(image.text_start==0x140001000 && image.text_end==0x14580f45c);
  assert(image.data_start==0x147000000 && image.data_end==0x148000000);
- assert(profile("aoe4-cache-v1 5380c577805565817f528af6eac385263413fa6815553f9a31fa62561cb45e8c 7af7ad0 1000000 20\n",hash,&image,&pointer));
+ assert(aoe_cache_profile(hash,&image,&pointer));
  assert(pointer==0x147af7ad0);
- assert(!profile("aoe4-cache-v1 wrong-hash 7af7ad0 1000000 20",hash,&image,&pointer));
- assert(!profile("aoe4-cache-v1 5380c577805565817f528af6eac385263413fa6815553f9a31fa62561cb45e8c 7af7ad1 1000000 20",hash,&image,&pointer));
- assert(!profile("aoe4-cache-v1 5380c577805565817f528af6eac385263413fa6815553f9a31fa62561cb45e8c 1000 1000000 20",hash,&image,&pointer));
- assert(!profile("aoe4-cache-v1 5380c577805565817f528af6eac385263413fa6815553f9a31fa62561cb45e8c 7af7ad0 2000000 20",hash,&image,&pointer));
- assert(!profile("aoe4-cache-v1 5380c577805565817f528af6eac385263413fa6815553f9a31fa62561cb45e8c 7af7ad0 1000000 20 extra",hash,&image,&pointer));
+ assert(aoe_cache_profile("e047891780ec9a01e39185803288578b8385419e93c97b2216ebd24ee2bc1469",&image,&pointer));
+ assert(pointer==0x147c9f9d8);
+ pointer=0;
+ assert(!aoe_cache_profile("unknown-hash",&image,&pointer));assert(!pointer);
+ assert(!aoe_cache_profile("5380c577805565817f528af6eac385263413fa6815553f9a31fa62561cb45e8d",&image,&pointer));
+ image.image_size=0x7af7ad7;assert(!aoe_cache_profile(hash,&image,&pointer));
+ image.image_size=0x8000000;
+ image.data_start=0x147af7ad1;assert(!aoe_cache_profile(hash,&image,&pointer));
+ image.data_start=0x147000000;
+ image.data_end=0x147af7ad7;assert(!aoe_cache_profile(hash,&image,&pointer));
+ image.data_end=0;assert(!aoe_cache_profile(hash,&image,&pointer));
+ image.data_end=0x148000000;
  put32(pe+400,0x6500000);assert(pwrite(fd,pe,sizeof(pe),0)==sizeof(pe));assert(aoe_read_layout(fd,&image));
  pe[132]=0x4c;assert(pwrite(fd,pe,sizeof(pe),0)==sizeof(pe));assert(!aoe_read_layout(fd,&image));
  pe[132]=0x64;put32(pe+60,0xfffffff0);assert(pwrite(fd,pe,sizeof(pe),0)==sizeof(pe));assert(!aoe_read_layout(fd,&image));
  put32(pe+60,128);put32(pe+400,0xfffffff0);assert(pwrite(fd,pe,sizeof(pe),0)==sizeof(pe));assert(!aoe_read_layout(fd,&image));
  assert(!ftruncate(fd,63));assert(!aoe_read_layout(fd,&image));close(fd);
- puts("PASS: current-layout bounds, profile digest, pointer/data bounds, malformed PE/profile refusals");
+ puts("PASS: current-layout bounds, profile digest, pointer/data bounds, malformed PE and unknown profile refusals");
 }

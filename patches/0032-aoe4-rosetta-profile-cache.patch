@@ -5,7 +5,8 @@ Wine changes recovered from Marc Ibrahim's LGPL sources via NerRobDog/wine-aoe4
 Layout validation and ring discovery are LGPL-2.1-or-later. HDE notices retained.
 
 HB_AOE4=1 enables the path only for RelicCardinal.exe with a verified x64 image
-under Rosetta on macOS 26 or newer. The helper and profiles ship with Wine.
+under Rosetta on macOS 26 or newer. The helper ships with Wine; measured
+profiles are built into ntdll.
 The same-descriptor check verifies the image being mapped. The cache uses a
 SHA-bound profile or validated ring discovery; relocated fragments retain
 their original addresses for exception reporting.
@@ -116,7 +117,7 @@ diff --git a/dlls/ntdll/unix/aoe_build_guard.h b/dlls/ntdll/unix/aoe_build_guard
 new file mode 100644
 --- /dev/null
 +++ b/dlls/ntdll/unix/aoe_build_guard.h
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,171 @@
 +/* AoE IV build eligibility for the experimental Highball engine proposal.
 + * Copyright 2026 Highball engine proposal contributors.
 + * LGPL-2.1-or-later. Hash the same file descriptor Wine will map, not a reopened path. */
@@ -264,21 +265,28 @@ new file mode 100644
 +    for (i=0; i<32; ++i) snprintf(text+2*i,3,"%02x",digest[i]);
 +}
 +
-+/* Profiles are explicit measurements, bound to a digest, never inferred from .text size.
-+ * Format: aoe4-cache-v1 <64 lowercase hex> <pointer RVA hex> <ring bytes hex> <slot bytes hex>
-+ * Version 1 deliberately supports only the recovered 16 MiB / 32-byte ring contract. */
-+static int aoe_cache_profile(FILE *file, const char *digest, const struct aoe_image_layout *image,
++/* Measured profiles for the 16 MiB / 32-byte ring, bound to executable SHA-256. */
++static int aoe_cache_profile(const char *digest, const struct aoe_image_layout *image,
 +                            uint64_t *pointer)
 +{
-+    char version[32], hash[65], extra;
-+    unsigned long long rva, size, slot;
-+    if (fscanf(file,"%31s %64s %llx %llx %llx",version,hash,&rva,&size,&slot)!=5 ||
-+        fscanf(file," %c",&extra)==1 || strcmp(version,"aoe4-cache-v1") || strcmp(hash,digest) ||
-+        strlen(digest)!=64 || rva<0x1000 || (rva&7) || image->image_size<8 ||
-+        rva>image->image_size-8 || image->base+rva<image->data_start ||
-+        image->data_end<8 || image->base+rva>image->data_end-8 || size!=0x1000000 || slot!=32) return 0;
-+    *pointer = image->base+rva;
-+    return 1;
++    static const struct { const char *digest; uint64_t rva; } profiles[] =
++    {
++        { "5380c577805565817f528af6eac385263413fa6815553f9a31fa62561cb45e8c", 0x7af7ad0 },
++        { "e047891780ec9a01e39185803288578b8385419e93c97b2216ebd24ee2bc1469", 0x7c9f9d8 },
++    };
++    unsigned int i;
++    uint64_t rva;
++    for (i=0; i<sizeof(profiles)/sizeof(profiles[0]); ++i)
++    {
++        if (strcmp(profiles[i].digest,digest)) continue;
++        rva=profiles[i].rva;
++        if (rva<0x1000 || (rva&7) || image->image_size<8 || rva>image->image_size-8 ||
++            image->base+rva<image->data_start || image->data_end<8 ||
++            image->base+rva>image->data_end-8) return 0;
++        *pointer=image->base+rva;
++        return 1;
++    }
++    return 0;
 +}
 +#endif
 diff --git a/dlls/ntdll/unix/aoe_code_cache.h b/dlls/ntdll/unix/aoe_code_cache.h
@@ -1512,7 +1520,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
  #include <errno.h>
  #include <fcntl.h>
  #include <stdarg.h>
-@@ -100,6 +102,98 @@
+@@ -100,6 +102,91 @@
 
  WINE_DEFAULT_DEBUG_CHANNEL(module);
  WINE_DECLARE_DEBUG_CHANNEL(syscall);
@@ -1557,10 +1565,9 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 +    struct stat before, after;
 +    uint64_t pointer = 0;
 +    BOOL automatic = FALSE;
-+    char digest[65], path[4096];
++    char digest[65];
 +    const char *expected, *cache;
 +    BOOL cache_requested;
-+    FILE *profile;
 +    if (!aoe_attaching || !aoe_game_name(name)) return STATUS_SUCCESS;
 +    expected=getenv("AOE4_EXPECTED_SHA256");
 +    cache=getenv("AOE4_CACHE");
@@ -1570,13 +1577,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 +        status=STATUS_INVALID_IMAGE_HASH;
 +    else if (cache_requested)
 +    {
-+        if (data_dir &&
-+            snprintf(path,sizeof(path),"%s/aoe4/profiles/%s.cache",data_dir,digest)<(int)sizeof(path) &&
-+            (profile=fopen(path,"r")))
-+        {
-+            aoe_cache_profile(profile,digest,&image,&pointer);
-+            fclose(profile);
-+        }
++        aoe_cache_profile(digest,&image,&pointer);
 +        if (!pointer)
 +        {
 +            pointer=aoe_discover_ring_pointer(fd,&image,before.st_size);
@@ -1611,7 +1612,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 
  #if defined __i386__ || defined __x86_64__
  #define SO_DLLS_SUPPORTED
-@@ -1471,6 +1565,13 @@
+@@ -1471,6 +1558,13 @@
  #endif
 
 
@@ -1625,7 +1626,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
  static const unixlib_entry_t unix_call_funcs[] =
  {
      load_so_dll,
-@@ -1483,6 +1584,7 @@
+@@ -1483,6 +1577,7 @@
      system_time_precise,
  #if defined(__x86_64__)
      pe_module_loaded,
@@ -1633,7 +1634,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
  #endif
  };
 
-@@ -1518,6 +1620,7 @@
+@@ -1518,6 +1613,7 @@
      system_time_precise,
  #if defined(__x86_64__)
      wow64_pe_module_loaded,
@@ -1641,7 +1642,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
  #endif
  };
 
-@@ -1569,6 +1672,14 @@
+@@ -1569,6 +1665,14 @@
          return STATUS_DLL_NOT_FOUND;
      }
 
@@ -1656,7 +1657,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
      size.QuadPart = 0;
      status = NtCreateSection( mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY |
                                SECTION_MAP_READ | SECTION_MAP_EXECUTE,
-@@ -1867,6 +1978,11 @@
+@@ -1867,6 +1971,11 @@
              info->Machine = native_machine;
              status = STATUS_SUCCESS;
          }
@@ -1668,7 +1669,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
          NtClose( mapping );
      }
      else if (status == STATUS_INVALID_IMAGE_NOT_MZ && loadorder != LO_NATIVE)
-@@ -2141,6 +2257,29 @@
+@@ -2141,6 +2250,29 @@
      if (status) fatal_error( "failed to load %s error %x\n", name, status );
      free( name );
      load_ntdll_functions( module );
@@ -1698,7 +1699,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
      if (is_arm64ec()) redirect_ntdll_functions( module );
  }
 
-@@ -2336,6 +2475,17 @@
+@@ -2336,6 +2468,17 @@
      init_thread_stack( teb, 0, 0, 0 );
      NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
      load_ntdll();
@@ -1716,7 +1717,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
      load_wow64_ntdll( main_image_info.Machine );
      load_apiset_dll();
 
-@@ -2816,8 +2966,14 @@
+@@ -2816,8 +2959,14 @@
       * notification to the reply port instead, which has a different id and
       * size. */
      memset( &rep, 0, sizeof(rep) );
@@ -1733,7 +1734,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
      if (verbose) ERR( "x87 coop: handshake reply kr=0x%x id=0x%x size=%u\n", kr,
                        rep.reply.header.msgh_id, rep.reply.header.msgh_size );
 
-@@ -2846,6 +3002,14 @@
+@@ -2846,6 +2995,14 @@
      /* Destroy the reply port, so that a late reply finds no receiver. */
      if (reply != MACH_PORT_NULL) mach_port_mod_refs( mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, -1 );
      if (service != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), service );
@@ -1748,7 +1749,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
      if (reason[0]) x87_coop_unhooked( reason );
      unsetenv( X87_COOP_ENV );
  }
-@@ -2857,18 +3021,123 @@
+@@ -2857,18 +3014,123 @@
   *
   * Main entry point called by the wine loader.
   */
