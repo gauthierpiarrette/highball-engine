@@ -24,10 +24,10 @@
     "license": "MIT",
     "note": "athei's x87sidecar, built from source for the Wine 11 engines; Wine's side (cooperative attach, ROSETTA_X87_PATH) is patches/0012 since r12."
   },
-  "aoe4Sidecar": {
+  "x87sidecar-aoe4": {
     "repo": "https://github.com/himbeles/x87sidecar-aoe4",
     "commit": "f02887422ec3a671718261e1a31cb0e1c232bbbe",
     "license": "MIT",
-    "note": "AoE IV helper based on athei/x87sidecar, built from pinned source in the Wine workflow."
+    "note": "AoE IV helper based on athei/x87sidecar, built separately from pinned source by build-x87sidecar."
   }
 }

@@ -5,8 +5,8 @@ Wine changes recovered from Marc Ibrahim's LGPL sources via NerRobDog/wine-aoe4
 Layout validation and ring discovery are LGPL-2.1-or-later. HDE notices retained.
 
 HB_AOE4=1 enables the path only for RelicCardinal.exe with a verified x64 image
-under Rosetta on macOS 26 or newer. The helper ships with Wine; measured
-profiles are built into ntdll.
+under Rosetta on macOS 26 or newer. AOE4_SIDECAR_PATH names the separately
+installed helper; measured profiles are built into ntdll.
 The same-descriptor check verifies the image being mapped. The cache uses a
 SHA-bound profile or validated ring discovery; relocated fragments retain
 their original addresses for exception reporting.
@@ -1749,7 +1749,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
      if (reason[0]) x87_coop_unhooked( reason );
      unsetenv( X87_COOP_ENV );
  }
-@@ -2857,18 +3014,123 @@
+@@ -2857,18 +3014,122 @@
   *
   * Main entry point called by the wine loader.
   */
@@ -1789,8 +1789,8 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 +
 +static void aoe_reexec_sidecar(int argc, char **argv)
 +{
-+    const char *loader=getenv("WINELOADER");
-+    char digest[65], address[32], sidecar[4096];
++    const char *sidecar=getenv("AOE4_SIDECAR_PATH"), *loader=getenv("WINELOADER");
++    char digest[65], address[32];
 +    struct aoe_image_layout image;
 +    int fd, ok;
 +    if (aoe_attaching || argc<2 || !aoe_game_name(argv[1]) || !aoe_patch_requested()) return;
@@ -1799,10 +1799,9 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 +        WARN("AoE4 hooks require Rosetta on macOS 26 or newer\n");
 +        return;
 +    }
-+    if (!data_dir || snprintf(sidecar,sizeof(sidecar),"%s/aoe4/x87sidecar",data_dir)>=(int)sizeof(sidecar) ||
-+        access(sidecar,X_OK))
++    if (!sidecar || sidecar[0]!='/' || access(sidecar,X_OK))
 +    {
-+        ERR("AoE4 helper is missing from the Wine installation; continuing with stock Wine\n");
++        ERR("AoE4 helper path is missing or not executable; continuing with stock Wine\n");
 +        return;
 +    }
 +    if (!loader) loader=wineloader; /* init_paths resolved the engine's own loader */

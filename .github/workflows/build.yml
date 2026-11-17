@@ -15,10 +15,7 @@ on:
 permissions:
   contents: write   # the optional release step creates a release and uploads the tarball
 jobs:
-  sidecars:
-    uses: ./.github/workflows/build-x87sidecar.yml
   build:
-    needs: sidecars
     # Intel runner on purpose: the Unix side of this tree is x86_64 only (the Mac driver's
     # Metal layer class in d3dmetal_objc.h sits behind #if defined(__x86_64__)), as in
     # CrossOver's and Sikarugir's own builds. It runs under Rosetta on Apple Silicon.
@@ -44,19 +41,6 @@ jobs:
           for p in ../../../patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; patch -p1 < "$p"; done
       - name: AoE IV tests
         run: tests/aoe4/run.sh "$PWD/src/sources/wine"
-      - uses: actions/download-artifact@v4
-        with:
-          name: x87sidecar-aoe4
-          path: ${{ runner.temp }}/aoe4-helper
-      - name: verify AoE IV helper
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/aoe4-helper"
-          shasum -a 256 -c ./*.sha256
-          tar -xJf ./*.tar.xz
-          expected=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aoe4Sidecar"]["commit"])' "$GITHUB_WORKSPACE/inputs.json")
-          [[ "$(cat x87sidecar/SOURCE_COMMIT)" == "$expected" ]]
-          codesign --verify --strict x87sidecar/x87sidecar
       - name: toolchain
         run: |
           set -euo pipefail
@@ -159,12 +143,6 @@ jobs:
           echo "winegstreamer.so links: $(otool -L out/engine/lib/wine/x86_64-unix/winegstreamer.so | awk 'NR > 1 && $1 !~ /^\/(usr\/lib|System)\// {printf "%s ", $1}')"
           echo "engine size: ${before} MB -> $(du -sm out/engine | cut -f1) MB"
           out/engine/bin/wine --version
-          # The helper must ship with Wine: the AoE loader resolves this relative path.
-          helper="$RUNNER_TEMP/aoe4-helper/x87sidecar"
-          aoe=out/engine/share/wine/aoe4
-          mkdir -p "$aoe"
-          cp "$helper/x87sidecar" "$aoe/"
-          cp "$helper/LICENSE" "$aoe/x87sidecar-MIT.txt"
           sed -n '1,/^ \*\//p' src/sources/wine/dlls/ntdll/unix/aoe_hde64.h > out/engine/share/wine/HDE-LICENSE.txt
           name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
           tar -C out -czf "${name}.tar.gz" .
@@ -175,9 +153,8 @@ jobs:
           source="$RUNNER_TEMP/aoe4-corresponding-source"
           mkdir -p "$source/.github/workflows" "$source/tests"
           cp -R crossover-sources.tar.gz patches inputs.json LICENSE NOTICE.md "$source/"
-          cp .github/workflows/build.yml .github/workflows/build-x87sidecar.yml "$source/.github/workflows/"
+          cp .github/workflows/build.yml "$source/.github/workflows/"
           cp -R tests/aoe4 "$source/tests/"
-          cp "$RUNNER_TEMP/aoe4-helper/"*-source.tar.gz "$source/sidecar-source.tar.gz"
           echo "$GITHUB_SHA" > "$source/ENGINE_COMMIT"
           tar -czf aoe4-corresponding-source.tar.gz -C "$source" .
           shasum -a 256 aoe4-corresponding-source.tar.gz > aoe4-corresponding-source.tar.gz.sha256

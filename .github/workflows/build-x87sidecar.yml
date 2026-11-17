@@ -1,12 +1,15 @@
-# Builds the standard and AoE IV helpers from inputs.json. Each pinned source/build
-# configuration is cached independently; releases are published only on manual request.
+# Builds athei's x87sidecar (MIT) from the commit inputs.json pins, for the Wine 11 engines. Wine
+# re-executes a 32-bit program through it when ROSETTA_X87_PATH names it (patches/0012, cooperative
+# attach, no entitlements), which Highball sets only for games the database opts in. Manual
+# dispatch, nothing published unless asked.
+# Also builds the AoE IV variant. Workflow/input changes check both helpers; each
+# pinned source/build configuration has its own cache and separate archive.
 name: build-x87sidecar
 on:
   push:
     paths:
       - ".github/workflows/build-x87sidecar.yml"
       - "inputs.json"
-  workflow_call:
   workflow_dispatch:
     inputs:
       publish:
@@ -25,7 +28,7 @@ jobs:
         include:
           - input: x87sidecar
             name: x87sidecar
-          - input: aoe4Sidecar
+          - input: x87sidecar-aoe4
             name: x87sidecar-aoe4
     env:
       SOURCE_INPUT: ${{ matrix.input }}
@@ -61,6 +64,7 @@ jobs:
           git clone --quiet --no-checkout "$HELPER_REPO" src
           git -C src checkout --quiet --detach "$HELPER_COMMIT"
           [[ "$(git -C src rev-parse HEAD)" == "$HELPER_COMMIT" ]]
+          git -C src log --oneline -1
       - name: build
         if: steps.helper.outputs.cache-hit != 'true'
         run: |
@@ -68,6 +72,7 @@ jobs:
           cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
           cmake --build build --target x87sidecar -j "$(sysctl -n hw.ncpu)"
           [[ "$(lipo -archs build/bin/x87sidecar)" == arm64 ]]
+          file build/bin/x87sidecar
       - name: package
         if: steps.helper.outputs.cache-hit != 'true'
         run: |
