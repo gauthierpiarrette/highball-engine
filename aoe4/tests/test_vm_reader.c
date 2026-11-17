@@ -42,7 +42,7 @@ static void test_read(BOOL fast)
     LONG size;
 
     if (fast) check(snapshot(NULL, NULL, bytes, 3) == 32, "AoE process scope enables VM tracking");
-    printf("Testing %s Wine reader\n", fast ? "r3" : "r2");
+    printf("Testing AoE Wine reader\n");
     GetSystemInfo(&si);
     ring = VirtualAlloc(NULL, ring_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     next = VirtualAlloc(NULL, ring_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
@@ -80,85 +80,6 @@ static void test_read(BOOL fast)
     if (!VirtualFree(pointer, 0, MEM_RELEASE)) ExitProcess(7);
     check(snapshot(pointer, next, bytes, fast) == 0, "refuses a released pointer page");
     VirtualFree(next, 0, MEM_RELEASE);
-}
-
-struct bench {
-    unsigned char *ring;
-    void **pointer;
-    BOOL fast;
-    int reads;
-    unsigned int sum;
-    int errors;
-};
-static DWORD WINAPI bench_thread(LPVOID opaque)
-{
-    struct bench *test = opaque;
-    unsigned char data[32];
-    for (int i = 0; i < test->reads; ++i)
-    {
-        unsigned char *slot = test->ring + ((unsigned)i & 1023) * slot_bytes;
-        LONG len = snapshot(test->pointer, slot, data, test->fast);
-        /* Game-like alternation: the next context resumes ordinary code. */
-        if(snapshot(test->pointer, test->ring + ring_bytes + 4096, data, test->fast)!=0)
-            ++test->errors;
-        if (len != slot_bytes)
-            ++test->errors;
-        else
-            test->sum += data[0] + data[slot_bytes - 1];
-    }
-    return 0;
-}
-static void benchmark(void)
-{
-    LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
-    for (int threads = 1; threads <= 2; ++threads)
-    {
-        for (int iter = 0; iter < 8; ++iter)
-        {
-            LARGE_INTEGER first, last;
-            const BOOL fast = iter % 2;
-            HANDLE worker = NULL;
-            struct bench tests[2] = {0};
-            for (int j = 0; j < threads; ++j)
-            {
-                tests[j].ring = VirtualAlloc(NULL, ring_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-                tests[j].pointer = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-                if (!tests[j].ring || !tests[j].pointer) ExitProcess(2);
-                *tests[j].pointer = tests[j].ring;
-                memset(tests[j].ring, 0xab, 1024 * slot_bytes);
-                tests[j].fast = fast;
-                tests[j].reads = 3000;
-                bench_thread(&tests[j]);
-                tests[j].reads = 80000;
-            }
-            /* Threads use the same process ring, as the game does. */
-            if (threads == 2)
-            {
-                VirtualFree(tests[1].pointer, 0, MEM_RELEASE);
-                VirtualFree(tests[1].ring, 0, MEM_RELEASE);
-                tests[1] = tests[0];
-            }
-            QueryPerformanceCounter(&first);
-            if (threads == 2)
-            {
-                worker = CreateThread(NULL, 0, bench_thread, &tests[1], 0, NULL);
-                if (!worker) ExitProcess(9);
-            }
-            bench_thread(&tests[0]);
-            if (worker)
-            {
-                WaitForSingleObject(worker, INFINITE);
-                CloseHandle(worker);
-            }
-            QueryPerformanceCounter(&last);
-            if (tests[0].errors || tests[1].errors || !tests[0].sum) ExitProcess(10);
-            printf("BENCH %d %s %.1f ns/pair\n", threads, fast ? "candidate" : "r2",
-                   1e9 * (last.QuadPart - first.QuadPart) / freq.QuadPart / (threads * tests[0].reads));
-            VirtualFree(tests[0].pointer, 0, MEM_RELEASE);
-            VirtualFree(tests[0].ring, 0, MEM_RELEASE);
-        }
-    }
 }
 
 static void test_nofault(void)
@@ -251,11 +172,7 @@ int main(int argc, char **argv)
         test_nofault();
     else if (!strcmp(argv[1], "stress"))
         test_mutation(TRUE);
-    else if (!strcmp(argv[1], "stress-r2"))
-        test_mutation(FALSE);
-    else if (!strcmp(argv[1], "bench"))
-        benchmark();
     else
-        test_read(!strcmp(argv[1], "r3"));
+        test_read(TRUE);
     return failures ? 1 : 0;
 }

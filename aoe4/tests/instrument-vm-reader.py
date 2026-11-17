@@ -20,8 +20,7 @@ SIZE_T aoe_test_fragment( const void *pointer, UINT_PTR pc, BYTE *bytes, UINT_PT
     UINT_PTR ring = 0;
     if (mode == 3) return aoe_vm_tracking ? 32 : 0;
     if (mode == 2) return aoe_nofault_copy( bytes, (const void *)pc, 32 ) ? 32 : 0;
-    if (mode) return virtual_read_aoe_fragment( pointer, pc, &ring, bytes );
-    return read_aoe_fragment_locked( pointer, pc, &ring, bytes );
+    return virtual_read_aoe_fragment( pointer, pc, &ring, bytes );
 }
 #endif
 '''

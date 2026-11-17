@@ -140,5 +140,3 @@ comes from one of their checks; the READMEs beside the patches say which, and wh
 ## Releases
 
 A dispatch with `publish_release=true` creates a GitHub release tagged with the artifact's file name (for the Intel line `engine-wine-<version>-<date>-<note>`), with the tarball and its `.sha256`. The arm64 engine, its renderers and its MoltenVK are released by their own workflows the same way. Highball's engine manifests (`spike/engines/<id>.json` in the app repository) name the tarball's URL, size and checksum, and extract its `engine/` subtree; the app never builds anything itself. Nothing is published by a push or a merge.
-
-The Intel workflow also builds the pinned [AoE IV helper](aoe4/README.md) and includes it and the measured profiles in the Wine tarball. It releases the matching source archive and checksum alongside Wine.

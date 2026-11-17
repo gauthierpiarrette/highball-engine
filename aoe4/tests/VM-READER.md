@@ -1,29 +1,18 @@
-# Darwin VM reader regression test
+# Windows VM reader regression tests
 
-This fixture exercises the production r3 reader with real Windows memory APIs.
-It needs an x86-64 Wine build on an Apple Silicon Mac and an isolated test prefix.
-Do not run Steam in that prefix.
+Use a disposable copy of the patched Wine source/build and an isolated prefix.
+Never put the instrumented ntdll in a gameplay or release engine.
 
-1. Prepare Wine with `.github/scripts/prepare-wine.sh`. Copy the prepared tree and out-of-tree
-   build to a disposable directory. Keep the source/build relative layout.
-2. Run `python3 tests/instrument-vm-reader.py /disposable/sources/wine` from this
-   proposal directory. Rebuild and ad-hoc sign `dlls/ntdll/ntdll.so` with the same
-   configure options as the release. Install it only into the isolated test engine.
-3. Build `x86_64-w64-mingw32-gcc -O2 tests/test_vm_reader.c -o RelicCardinal.exe`.
-   The executable name deliberately exercises the production process-name gate.
-4. Set `HB_AOE4=1` and `HIGHBALL_AOE4_VM_READER_TEST=1` in the isolated test bottle and run the
-   fixture with arguments `r3`, `r2`, `nofault`, `stress`, and `bench` separately.
-   Each must exit zero. The `r3` case explicitly checks that tracking was enabled.
-   In Highball, use `highball run TestBottle /path/to/RelicCardinal.exe -- r3`.
-5. Discard the instrumented engine. Package only a separately built, uninstrumented
-   module. Confirm its symbols/strings contain no `aoe_test_fragment` or
-   `HIGHBALL_AOE4_VM_READER_TEST`.
+1. Run `python3 aoe4/tests/instrument-vm-reader.py /disposable/patched/wine`.
+2. Rebuild/sign `dlls/ntdll/ntdll.so` and copy it into the isolated engine.
+3. Compile `x86_64-w64-mingw32-gcc -O2 aoe4/tests/test_vm_reader.c -o RelicCardinal.exe`.
+4. Set `HIGHBALL_AOE4_VM_READER_TEST=1`. Run with `HB_AOE4=1` and arguments
+   `read`, `nofault`, and `stress`. All must exit zero. Without `HB_AOE4`, run
+   `scope-off` to confirm VM tracking stays disabled.
+5. Discard the instrumented engine. A production module must contain neither
+   `aoe_test_fragment` nor `HIGHBALL_AOE4_VM_READER_TEST`.
 
-The test-only bridge intercepts a reserved context flag in `NtSetContextThread`.
-It is not part of the release patch series. It exposes both the old locked reader
-and the new reader, plus the exact no-fault copy used by the fast path. The fixture
-checks guard preservation, stale/freed/no-access mappings, rewritten bytes, pointer
-changes, concurrent protection changes, and same-address remapping/decommit.
-`bench` alternates one ring read and one ordinary resume per iteration; reported
-nanoseconds are **per pair**, not per individual read. Timing is diagnostic, not
-a pass/fail assertion.
+The fixture checks live/rewritten bytes, moved/freed/no-access mappings, guarded
+ring and pointer pages, no-fault copies, concurrent protection changes, and
+same-address release/reallocate/decommit cycles. Its reserved context-flag
+bridge is a test-only addition, outside the release patch series.
