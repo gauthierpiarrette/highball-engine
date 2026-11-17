@@ -27,17 +27,18 @@ diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
 diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
 --- a/dlls/ntdll/signal_x86_64.c
 +++ b/dlls/ntdll/signal_x86_64.c
-@@ -133,6 +133,85 @@
+@@ -133,6 +133,126 @@
  /***********************************************************************
   *		RtlCaptureContext (NTDLL.@)
   */
 +/* Opt-in software delivery thunk; installed only for the verified AoE IV process. */
 +void DECLSPEC_NORETURN aoe_soft_dispatch(ULONG64 *r, BYTE *xs, ULONG fault_length) {
 + BYTE storage[4096];ULONG avx_len=0;CONTEXT *c;CONTEXT_EX *ex;EXCEPTION_RECORD rec={0};ULONG64 mask;void *avx;NTSTATUS status;
-+ memset(storage,0,sizeof(storage));
 + status=RtlInitializeExtendedContext2(storage,CONTEXT_ALL|CONTEXT_XSTATE,&ex,7);
 + if(status)RtlRaiseStatus(status);
 + c=RtlLocateLegacyContext(ex,NULL);
++ /* Extended initialization already clears XState; only the legacy context remains. */
++ memset(c,0,sizeof(*c));
 + status=WINE_UNIX_CALL(unix_aoe_exception_context,c);
 + if(status)RtlRaiseStatus(status);
 + c->ContextFlags=CONTEXT_ALL|CONTEXT_XSTATE;
@@ -47,27 +48,49 @@ diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
 + memcpy(&mask,xs+512,8);if(mask&4)memcpy(avx,xs+576,256);else memset(avx,0,256);
 + RtlSetExtendedFeaturesMask(ex,7);
 + rec.ExceptionCode=EXCEPTION_ILLEGAL_INSTRUCTION;rec.ExceptionAddress=(void *)c->Rip;
-+ status=NtRaiseException(&rec,c,TRUE);for (;;) RtlRaiseStatus(status);
++ /* Match RtlRaiseException: enter Wine's handlers directly unless a debugger
++  * needs first-chance notification. NtContinue still restores the full context. */
++ if(!NtCurrentTeb()->Peb->BeingDebugged)status=dispatch_exception(&rec,c);
++ else status=NtRaiseException(&rec,c,TRUE);
++ for (;;) RtlRaiseStatus(status);
 +}
 +
 +__ASM_GLOBAL_FUNC( __wine_aoe_softfault1,
 +                   "pushfq\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %rax\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %rcx\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %rdx\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %rbx\n\t"
++                   __ASM_SEH(".seh_pushreg %rbx\n\t")
 +                   "push %rbp\n\t"
++                   __ASM_SEH(".seh_pushreg %rbp\n\t")
 +                   "push %rsi\n\t"
++                   __ASM_SEH(".seh_pushreg %rsi\n\t")
 +                   "push %rdi\n\t"
++                   __ASM_SEH(".seh_pushreg %rdi\n\t")
 +                   "push %r8\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %r9\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %r10\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %r11\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %r12\n\t"
++                   __ASM_SEH(".seh_pushreg %r12\n\t")
 +                   "push %r13\n\t"
++                   __ASM_SEH(".seh_pushreg %r13\n\t")
 +                   "push %r14\n\t"
++                   __ASM_SEH(".seh_pushreg %r14\n\t")
 +                   "push %r15\n\t"
++                   __ASM_SEH(".seh_pushreg %r15\n\t")
 +                   "mov %rsp,%r12\n\t"
++                   __ASM_SEH(".seh_setframe %r12,0\n\t")
++                   __ASM_SEH(".seh_endprologue\n\t")
 +                   "cld\n\t"
 +                   "sub $0x400,%rsp\n\t"
 +                   "and $-64,%rsp\n\t"
@@ -81,22 +104,40 @@ diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
 +                   "ud2" );
 +__ASM_GLOBAL_FUNC( __wine_aoe_softfault2,
 +                   "pushfq\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %rax\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %rcx\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %rdx\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %rbx\n\t"
++                   __ASM_SEH(".seh_pushreg %rbx\n\t")
 +                   "push %rbp\n\t"
++                   __ASM_SEH(".seh_pushreg %rbp\n\t")
 +                   "push %rsi\n\t"
++                   __ASM_SEH(".seh_pushreg %rsi\n\t")
 +                   "push %rdi\n\t"
++                   __ASM_SEH(".seh_pushreg %rdi\n\t")
 +                   "push %r8\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %r9\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %r10\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %r11\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
 +                   "push %r12\n\t"
++                   __ASM_SEH(".seh_pushreg %r12\n\t")
 +                   "push %r13\n\t"
++                   __ASM_SEH(".seh_pushreg %r13\n\t")
 +                   "push %r14\n\t"
++                   __ASM_SEH(".seh_pushreg %r14\n\t")
 +                   "push %r15\n\t"
++                   __ASM_SEH(".seh_pushreg %r15\n\t")
 +                   "mov %rsp,%r12\n\t"
++                   __ASM_SEH(".seh_setframe %r12,0\n\t")
++                   __ASM_SEH(".seh_endprologue\n\t")
 +                   "cld\n\t"
 +                   "sub $0x400,%rsp\n\t"
 +                   "and $-64,%rsp\n\t"
