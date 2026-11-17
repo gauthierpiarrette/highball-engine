@@ -60,6 +60,11 @@ with two sets of patches, applied in this order:
     are against `HB_VKD3D_TILER=1` without the skip; what both switches together gain over neither is not measured yet.
     `tests/kosmickrisp/empty-renderings.c` checks colour, depth and stencil clears and loads, suspend/resume, an MSAA
     resolve and an occlusion query inside an empty rendering, with the switch and without it.
+  - `0012` the memory heap's budget is 90% of the Metal device's recommended working set, as its size already is. It
+    was 90% of the memory macOS reported available, which with a game, Steam and a browser open was about 10 GB on a
+    48 GB Mac, and games sized their texture streaming to it: Forza Horizon 6 left tyres and fine detail at low
+    resolution on many cars, and they came back with this patch (M5 Max, 2026-11-17). The working set scales with the
+    Mac, about 9.6 GB on a 16 GB one.
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.
