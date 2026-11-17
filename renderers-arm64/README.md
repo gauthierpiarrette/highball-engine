@@ -25,6 +25,7 @@ vkd3d-proton or DXVK yet.
 | vkd3d-proton `0005` tessellation on MoltenVK | Tessellation pipelines failed to translate to Metal. | Microsoft Flight Simulator 2024 (terrain) | workaround | |
 | vkd3d-proton `0006` SV_ShadingRate dropped | Pipelines writing a shading rate failed to compile on devices that cannot express it. | general | general | |
 | vkd3d-proton `0007` force_native_fp16 | Games lost pipelines using 16-bit shader operations (16 per Microsoft Flight Simulator 2024 run). | Microsoft Flight Simulator 2024 (its recipe sets it) | workaround (opt-in: `VKD3D_CONFIG=force_native_fp16`) | |
+| vkd3d-proton `0013` swapchain color space | HDR games showed a washed-out grey picture: the surface offered sRGB only, so SetColorSpace1 failed. | HDR games (Forza Horizon 6, EA SPORTS FC 27) | general | KosmicKrisp `0011` |
 | DXVK `0001` unshared fallback | A crash at the game's first boot video when a texture could not be shared. | Microsoft Flight Simulator 2024 | general | Wine 0036 made sharing work later |
 | DXVK `0002` video memory budget | Games filled more memory than the GPU may wire, and the GPU stalled. | Microsoft Flight Simulator 2024 (its recipe sets it) | Apple GPU (opt-in: `dxgi.maxVideoMemoryBudget`) | |
 | DXVK `0003` relaxed features | DXVK rejected Apple GPUs for missing features, geometry shaders included. | every DXVK game on this line (the engine's base environment sets it) | workaround (opt-in: `DXVK_RELAX_FEATURES=1`) | from Michael Liendo's work (highball-db#6) |
@@ -59,6 +60,9 @@ vkd3d-proton or DXVK yet.
   the full range; actual typed buffers are unchanged. `tests/vkd3d-reserved/large-raw-buffer.c` reproduces the
   assertion on the control and passes all 35 checks with the patch, including raw and structured GPU reads
   through the last word of 2 GB. Oversized actual typed views and type aliasing beyond the limit remain unsupported.
+- `0013` VK_EXT_swapchain_colorspace is enabled when the driver has it, so HDR10 and scRGB swapchains get their
+  surface formats. Without it KosmicKrisp offered sRGB only, SetColorSpace1 failed and HDR games showed a grey picture
+  (Forza Horizon 6 HDR10, EA SPORTS FC 27 scRGB). Numbered after #48's `0011` and `0012`. Pairs with KosmicKrisp `0011`.
 
 ### DXVK (master of 2026-10-09, 1cad6cd)
 

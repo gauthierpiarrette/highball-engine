@@ -1,0 +1,44 @@
+d3d12core: enable VK_EXT_swapchain_colorspace, so HDR swapchains get HDR surface formats.
+
+vkd3d-proton never asked the instance for VK_EXT_swapchain_colorspace. On drivers that list HDR color spaces only
+when it is enabled (KosmicKrisp, Mesa's common WSI), the surface offered sRGB alone, SetColorSpace1 of
+DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 (HDR10) or G10_NONE_P709 (scRGB) failed with E_INVALIDARG, and a game that
+went on rendering HDR wrote PQ values into an sRGB swapchain: a washed-out grey picture. The extension is optional, so
+nothing changes where it is missing; an unsupported color space is now logged.
+
+Checked on an M5 Max, macOS 27.2, KosmicKrisp (2026-11-17): Forza Horizon 6 sets color space 12 (HDR10) and EA SPORTS
+FC 27 color space 1 (scRGB), both accepted, both shown as HDR. Builds with the renderers' llvm-mingw for x86-64 on top
+of 0001 to 0012.
+
+Upstream: not sent.
+
+diff --git a/libs/d3d12core/main.c b/libs/d3d12core/main.c
+index a8498bca..4ebcdfe7 100644
+--- a/libs/d3d12core/main.c
++++ b/libs/d3d12core/main.c
+@@ -581,6 +581,8 @@ static HRESULT vkd3d_create_instance_global(struct vkd3d_instance **out_instance
+         VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
+         VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
+         VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
++        /* HDR10 and scRGB surface formats for SetColorSpace1 */
++        VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,
+ #ifndef _WIN32
+         /* TODO: We need to attempt to dlopen() native DXVK DXGI and handle this more gracefully. */
+         "VK_KHR_xcb_surface",
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 8dd2cc10..9bb0c786 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1278,7 +1278,10 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetColorSpace(IDXGIVkSwapCha
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p, ColorSpace %u.
+", iface, ColorSpace);
+     if (!dxgi_vk_swap_chain_supports_color_space(chain, ColorSpace))
++    {
++        WARN("Color space %#x is not supported by the surface.
+", ColorSpace);
+         return E_INVALIDARG;
++    }
+ 
+     chain->user.dxgi_color_space_type = ColorSpace;
+     chain->user.modifies_hdr_metadata = true;
