@@ -1,0 +1,48 @@
+From: Highball
+Subject: [PATCH] ntdll: NtWriteVirtualMemory on the current process writes directly
+
+The server writes process memory through the Mach task port, which macOS refuses
+it, so WriteProcessMemory on the process's own code failed with
+ERROR_ACCESS_DENIED. In-process hooks rely on it: the Steam overlay
+(GameOverlayRenderer64.dll) could not hook a single function and never showed.
+NtReadVirtualMemory already reads the current process directly.
+
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index bbcd4b2..100adf1 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -7128,7 +7128,32 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
+ {
+     unsigned int status;
+ 
+-    if (virtual_check_buffer_for_read( buffer, size ))
++    if (process == GetCurrentProcess())
++    {
++        /* Highball: write our own memory directly. The server writes through the Mach task port,
++         * which macOS refuses it, so in-process hooks (WriteProcessMemory on our own code, as the
++         * Steam overlay does) failed with STATUS_ACCESS_DENIED. */
++        if (!virtual_check_buffer_for_read( buffer, size ) || !virtual_check_buffer_for_write( addr, size ))
++        {
++            status = STATUS_PARTIAL_COPY;
++            size = 0;
++        }
++        else
++        {
++            __TRY
++            {
++                memmove( addr, buffer, size );
++                status = STATUS_SUCCESS;
++            }
++            __EXCEPT
++            {
++                status = STATUS_PARTIAL_COPY;
++                size = 0;
++            }
++            __ENDTRY
++        }
++    }
++    else if (virtual_check_buffer_for_read( buffer, size ))
+     {
+         SERVER_START_REQ( write_process_memory )
+         {

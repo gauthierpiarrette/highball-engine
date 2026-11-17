@@ -41,6 +41,129 @@ index c61c574a..a413f0ef 100644
      /// Reports Nvidia GPUs running on the proprietary driver as a different
      /// vendor (usually AMD). Proton will generally disable this option.
      bool hideNvidiaGpu;
+diff --git a/src/dxgi/dxgi_swapchain.h b/src/dxgi/dxgi_swapchain.h
+index c8da01d0..5e453060 100644
+--- a/src/dxgi/dxgi_swapchain.h
++++ b/src/dxgi/dxgi_swapchain.h
+@@ -15,6 +15,14 @@
+ #include "../wsi/wsi_monitor.h"
+ #include "../util/util_hotpatch.h"
+ 
++// Highball: on ARM64EC these get an x64 fast-forward entry, so in-process x64 hookers
++// (the Steam overlay) can detour them; the bodies stay ARM64EC.
++#if defined(_M_ARM64EC) || defined(__arm64ec__)
++#define HB_HOOKABLE __attribute__((hybrid_patchable))
++#else
++#define HB_HOOKABLE
++#endif
++
+ namespace dxvk {
+   
+   class DxgiDevice;
+@@ -95,18 +103,18 @@ namespace dxvk {
+     BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() final;
+ 
+     DXVK_HOTPATCHABLE
+-    HRESULT STDMETHODCALLTYPE Present(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE Present(
+             UINT                      SyncInterval,
+             UINT                      Flags) final;
+     
+     DXVK_HOTPATCHABLE
+-    HRESULT STDMETHODCALLTYPE Present1(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE Present1(
+             UINT                      SyncInterval,
+             UINT                      PresentFlags,
+       const DXGI_PRESENT_PARAMETERS*  pPresentParameters) final;
+ 
+     DXVK_HOTPATCHABLE
+-    HRESULT STDMETHODCALLTYPE ResizeBuffers(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE ResizeBuffers(
+             UINT                      BufferCount,
+             UINT                      Width,
+             UINT                      Height,
+@@ -114,7 +122,7 @@ namespace dxvk {
+             UINT                      SwapChainFlags) final;
+     
+     DXVK_HOTPATCHABLE
+-    HRESULT STDMETHODCALLTYPE ResizeBuffers1(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE ResizeBuffers1(
+             UINT                      BufferCount,
+             UINT                      Width,
+             UINT                      Height,
+@@ -128,7 +136,7 @@ namespace dxvk {
+       const DXGI_MODE_DESC*           pNewTargetParameters) final;
+     
+     DXVK_HOTPATCHABLE
+-    HRESULT STDMETHODCALLTYPE SetFullscreenState(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE SetFullscreenState(
+             BOOL                      Fullscreen,
+             IDXGIOutput*              pTarget) final;
+     
+@@ -164,7 +172,7 @@ namespace dxvk {
+             DXGI_COLOR_SPACE_TYPE     ColorSpace,
+             UINT*                     pColorSpaceSupport) final;
+ 
+-    HRESULT STDMETHODCALLTYPE SetColorSpace1(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE SetColorSpace1(
+             DXGI_COLOR_SPACE_TYPE     ColorSpace) final;
+     
+     HRESULT STDMETHODCALLTYPE SetHDRMetaData(
+diff --git a/src/dxgi/dxgi_swapchain_dispatcher.h b/src/dxgi/dxgi_swapchain_dispatcher.h
+index d5c00cae..4ade3f7f 100644
+--- a/src/dxgi/dxgi_swapchain_dispatcher.h
++++ b/src/dxgi/dxgi_swapchain_dispatcher.h
+@@ -187,20 +187,20 @@ namespace dxvk {
+       return m_dispatch->IsTemporaryMonoSupported();
+     }
+ 
+-    HRESULT STDMETHODCALLTYPE Present(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE Present(
+             UINT                      SyncInterval,
+             UINT                      Flags) final {
+       return m_dispatch->Present(SyncInterval, Flags);
+     }
+ 
+-    HRESULT STDMETHODCALLTYPE Present1(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE Present1(
+             UINT                      SyncInterval,
+             UINT                      PresentFlags,
+       const DXGI_PRESENT_PARAMETERS*  pPresentParameters) final {
+       return m_dispatch->Present1(SyncInterval, PresentFlags, pPresentParameters);
+     }
+ 
+-    HRESULT STDMETHODCALLTYPE ResizeBuffers(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE ResizeBuffers(
+             UINT                      BufferCount,
+             UINT                      Width,
+             UINT                      Height,
+@@ -209,7 +209,7 @@ namespace dxvk {
+       return m_dispatch->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
+     }
+ 
+-    HRESULT STDMETHODCALLTYPE ResizeBuffers1(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE ResizeBuffers1(
+             UINT                      BufferCount,
+             UINT                      Width,
+             UINT                      Height,
+@@ -225,7 +225,7 @@ namespace dxvk {
+       return m_dispatch->ResizeTarget(pNewTargetParameters);
+     }
+ 
+-    HRESULT STDMETHODCALLTYPE SetFullscreenState(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE SetFullscreenState(
+             BOOL                      Fullscreen,
+             IDXGIOutput*              pTarget) final {
+       if (likely(m_dispatch != nullptr))
+@@ -286,7 +286,7 @@ namespace dxvk {
+       return m_dispatch->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport);
+     }
+ 
+-    HRESULT STDMETHODCALLTYPE SetColorSpace1(
++    HB_HOOKABLE HRESULT STDMETHODCALLTYPE SetColorSpace1(
+             DXGI_COLOR_SPACE_TYPE     ColorSpace) final {
+       return m_dispatch->SetColorSpace1(ColorSpace);
+     }
 diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
 index 7e3d16a7..a4f43ac4 100644
 --- a/src/dxvk/dxvk_device_info.cpp
