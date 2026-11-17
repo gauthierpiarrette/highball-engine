@@ -1,12 +1,13 @@
 # Builds athei's x87sidecar (MIT) from the commit inputs.json pins, for the Wine 11 engines. Wine
 # re-executes a 32-bit program through it when ROSETTA_X87_PATH names it (patches/0012, cooperative
-# attach, no entitlements), which Highball sets only for games the database opts in. Manual
-# dispatch, nothing published unless asked.
+# attach, no entitlements), which Highball sets only for games the database opts in. Rebuilds
+# when the workflow or inputs.json changes, or on manual dispatch; nothing published unless asked.
 name: build-x87sidecar
 on:
   push:
     paths:
       - ".github/workflows/build-x87sidecar.yml"
+      - "inputs.json"
   workflow_dispatch:
     inputs:
       publish:
