@@ -68,6 +68,12 @@ with two sets of patches, applied in this order:
     Max, 2026-11-17). The switch ignores memory pressure: on a 16 GB Mac a game would be told it has about 9.6 GB of
     GPU memory out of shared memory whatever else is running, the stall pattern DXVK's `0002` caps, so it is for
     recipes of games that need it on Macs with memory to spare, and has not been tried on a 16 GB Mac.
+  - `0013` MetalFX's temporal scaler, run when a VkHbMetalFXScaleInfo (`src/kosmickrisp/vulkan/kk_hb_metalfx.h`, the
+    same interface as vkd3d-proton's `vkd3d_hb_metalfx.h`) is in the pNext chain of vkCmdPipelineBarrier2, in command
+    order; driverInfo lists "hb-metalfx". One scaler per id and size is kept; it reads the rendered region of the color,
+    depth and motion images and writes the output image, with the encoders around it ending in full barriers. Used by
+    vkd3d-proton `0014` for FSR 3.1; on the base of this series Forza Horizon 6 logged "MetalFX temporal 1280x800 ->
+    1920x1200 ... ok" (M5 Max, 2026-11-17).
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.
