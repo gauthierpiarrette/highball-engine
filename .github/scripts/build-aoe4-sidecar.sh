@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 [[ $(uname -s) == Darwin ]] || { echo "Build the native helper on macOS with Xcode and CMake >=3.27" >&2; exit 1; }
-aoe_dir=$(cd "$(dirname "$0")" && pwd)
-work=${1:?usage: build-sidecar.sh /path/to/new/work-directory}
+repo_root=$(cd "$(dirname "$0")/../.." && pwd)
+work=${1:?usage: build-aoe4-sidecar.sh /path/to/new/work-directory}
 [[ ! -e "$work" ]] || { echo "Work directory must not exist" >&2; exit 1; }
-helper_repo=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aoe4Sidecar"]["repo"])' "$aoe_dir/../inputs.json")
-helper_commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aoe4Sidecar"]["commit"])' "$aoe_dir/../inputs.json")
+helper_repo=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aoe4Sidecar"]["repo"])' "$repo_root/inputs.json")
+helper_commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aoe4Sidecar"]["commit"])' "$repo_root/inputs.json")
 git clone --no-checkout "$helper_repo" "$work/source"
 git -C "$work/source" checkout --detach "$helper_commit"
-python3 "$aoe_dir/verify-sidecar.py" "$work/source"
+python3 "$repo_root/.github/scripts/prepare-aoe4-sidecar.py" "$work/source"
 cmake -S "$work/source" -B "$work/build" -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_BUILD_TYPE=Release
 cmake --build "$work/build" --target x87sidecar --parallel
 helper="$work/build/bin/x87sidecar"

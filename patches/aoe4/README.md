@@ -27,17 +27,17 @@ corresponding source.
 After applying the normal Wine patch series:
 
 ```sh
-aoe4/tests/run.sh /path/to/patched/wine
+tests/aoe4/run.sh /path/to/patched/wine
 ```
 
 Executable relocation/cache tests need x86-64 (use Rosetta on Apple Silicon).
-[Windows VM tests](tests/VM-READER.md) exercise real guard pages, released and
+[Windows VM tests](../../tests/aoe4/VM-READER.md) exercise real guard pages, released and
 relocated mappings, and concurrent protection changes in an isolated prefix.
 The test bridge is never part of the engine patch.
 
 For a game check, apply the recipe and use **Play** in Highball. Acknowledge the
 compatibility-driver warning if shown. `AOELAB_COUNTERS_DIR` optionally records
-cache activity for `cache-stats.py`. Unsupported layouts retain the normal launch.
+cache activity for `tests/aoe4/cache-stats.py`. Unsupported layouts retain the normal launch.
 
 ## Validation
 
@@ -58,4 +58,4 @@ of the final combined PR head. Smaller stutters remain in Late Siege.
 Wine thunks/cache: [Marc Ibrahim's LGPL source, mirrored by NerRobDog](https://github.com/NerRobDog/wine-aoe4/tree/711c6fc7559a565c417aab4d52d84b09767a9c1d).
 MIT helper: [NerRobDog/x87sidecar, based on athei and Lifeisawful](https://github.com/NerRobDog/x87sidecar/tree/c407ddfabbbe6bc5f5d56a258a4866ac89b04d8e).
 MIT decoder composition, GS fallback and FBLD fixes: [MacGames](https://github.com/tarikbc/macgames/tree/1579841b15ce569807b92af95b478c752c26df3d/patches/x87sidecar).
-Source pins and patch hashes are in `inputs.json`; [licenses](Licenses/) accompany the engine.
+Source pins and patch hashes are in [inputs.json](../../inputs.json); [licenses](licenses/) accompany the engine.

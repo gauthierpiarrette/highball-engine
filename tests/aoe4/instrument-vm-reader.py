@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-2.1-or-later
-"""Add a test-only syscall bridge to a DISPOSABLE copy of prepared r3 Wine."""
+"""Add a test-only syscall bridge to a DISPOSABLE copy of patched Wine."""
 from pathlib import Path
 import sys
 if len(sys.argv) != 2:
@@ -13,7 +13,7 @@ if "aoe_test_fragment" in v or "HIGHBALL_AOE4_VM_READER_TEST" in s:
 marker = "#ifdef __APPLE__\n/* Each cached range"
 assert marker in v
 # This bridge cannot be compiled into the packaged module: release preparation
-# applies only proposals/aoe4/patches/*.patch, never this script.
+# applies only patches/*.patch, never this script.
 bridge = r'''#ifdef __APPLE__
 SIZE_T aoe_test_fragment( const void *pointer, UINT_PTR pc, BYTE *bytes, UINT_PTR mode )
 {

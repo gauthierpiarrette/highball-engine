@@ -41,9 +41,9 @@ jobs:
           for p in ../../../patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; patch -p1 < "$p"; done
       - name: AoE IV helper and tests
         run: |
-          aoe4/tests/run.sh "$PWD/src/sources/wine"
+          tests/aoe4/run.sh "$PWD/src/sources/wine"
           command -v cmake >/dev/null || brew install cmake
-          aoe4/build-sidecar.sh "$RUNNER_TEMP/aoe4-helper-build"
+          .github/scripts/build-aoe4-sidecar.sh "$RUNNER_TEMP/aoe4-helper-build"
       - name: toolchain
         run: |
           set -euo pipefail
@@ -151,9 +151,9 @@ jobs:
           aoe=out/engine/share/wine/aoe4
           mkdir -p "$aoe/profiles"
           cp "$helper/build/bin/x87sidecar" "$aoe/"
-          cp aoe4/profiles/*.cache "$aoe/profiles/"
-          cp aoe4/Licenses/x87sidecar-MIT.txt "$aoe/"
-          cp aoe4/Licenses/HDE-LICENSE.txt out/engine/share/wine/
+          cp patches/aoe4/profiles/*.cache "$aoe/profiles/"
+          cp patches/aoe4/licenses/x87sidecar-MIT.txt "$aoe/"
+          cp patches/aoe4/licenses/HDE-LICENSE.txt out/engine/share/wine/
           name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
           tar -C out -czf "${name}.tar.gz" .
           shasum -a 256 "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
@@ -161,9 +161,11 @@ jobs:
       - name: AoE IV corresponding source
         run: |
           source="$RUNNER_TEMP/aoe4-corresponding-source"
-          mkdir -p "$source/.github/workflows"
-          cp -R crossover-sources.tar.gz patches inputs.json LICENSE NOTICE.md aoe4 "$source/"
+          mkdir -p "$source/.github/workflows" "$source/.github/scripts" "$source/tests"
+          cp -R crossover-sources.tar.gz patches inputs.json LICENSE NOTICE.md "$source/"
           cp .github/workflows/build.yml "$source/.github/workflows/"
+          cp .github/scripts/{build-aoe4-sidecar.sh,prepare-aoe4-sidecar.py} "$source/.github/scripts/"
+          cp -R tests/aoe4 "$source/tests/"
           tar --exclude=.git -czf "$source/sidecar-patched.tar.gz" -C "$RUNNER_TEMP/aoe4-helper-build/source" .
           echo "$GITHUB_SHA" > "$source/ENGINE_COMMIT"
           tar -czf aoe4-corresponding-source.tar.gz -C "$source" .
