@@ -24,5 +24,18 @@ with two sets of patches, applied in this order:
     past a bound constant buffer returns the memory after it instead of zero. Also 256 command buffer records, so
     `MESA_KK_DEBUG=cbs` logs all of a frame's.
 
+  - `0009` `HB_KK_NO_SSBO_ROBUST=1`, asked for per game, drops the bounds check on storage buffer access as `0007` does
+    for constant buffers. When either switch is set, both go into the pipeline cache UUID and the disk cache key, which
+    held only the driver build, so toggling `HB_KK_NO_UBO_ROBUST` reused shaders translated with the other setting; with
+    both off (the default) the key is unchanged and no existing cache is rebuilt. A native Vulkan
+    compute test with robustBufferAccess2 (scattered storage and uniform reads, M5 Max): 12.25 ms, 10.44 with
+    `HB_KK_NO_UBO_ROBUST=1`, 8.73 with both. Forza Horizon 6 with both: higher frame rate, no visible artifacts. A read past
+    a bound storage buffer returns the memory after it, and a write past it lands there.
+  - `0010` `HB_KK_SKIP_EMPTY_PASSES=1` (off by default, read once): a rendering with no draw, no clear and no resolve
+    no longer starts a render encoder only to load and store every tile. vkd3d-proton's suspend/resume fixups record such
+    renderings when it is told the GPU is a tiler (renderers-arm64 vkd3d-proton `0011`); in Forza Horizon 6 they were 46%
+    of all render encoders, 1.57 of 4.7 million in a session were skipped, 5 to 10 fps on an M5 Max. Without that switch
+    vkd3d-proton records few of them, so the gain against an engine without `0011` is not measured.
+
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.

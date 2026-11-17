@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) buffer In  { uint data[]; } src;
+layout(std430, set = 0, binding = 1) buffer Out { uint data[]; } dst;
+layout(std140, set = 0, binding = 2) uniform U { uvec4 k[256]; } u;
+layout(push_constant) uniform P { uint n; uint mask; } pc;
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint acc = i;
+  for (uint j = 0; j < 64; j++) {
+    uint idx = (acc * 2654435761u + j) & pc.mask;   /* scattered SSBO reads */
+    acc += src.data[idx] ^ u.k[(acc + j) & 255].x;   /* UBO read too */
+  }
+  dst.data[i & pc.mask] = acc;
+}
