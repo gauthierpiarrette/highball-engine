@@ -47,6 +47,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0060` ws2_32-sio-udp-netreset-from-upstream | `SIO_UDP_NETRESET` failed with 10045, set by the same game socket right before matchmaking. | Forza Horizon 6 (online) | general | backport of Wine 19d5fbd382 (in 11.19); the Intel line's 0035 |
 | `0062` ntdll-wait-on-address-wake-fast-path-and-yielding-spinlock | Forza Horizon 6's job threads spent most of their time spinning on a futex bucket's spinlock in RtlWakeAddressSingle, taken even with nobody waiting. | programs that wake by address from many threads (Forza Horizon 6) | performance | not sent |
 | `0063` ntdll-NtWriteVirtualMemory-on-the-current-process-writes-directly | WriteProcessMemory into the process's own memory failed (the server's Mach task port write is refused), so in-process hooks such as the Steam overlay's could not install. | the Steam overlay, in-process hookers | macOS | pairs with 0064 |
+| `0064` gdi32-d3dkmt-set-process-scheduling-priority-class | Steam's client service ended on an unimplemented import, Steam's main loop stalled and the game froze when its overlay opened. | the Steam overlay | general | the Intel line's 0030 |
 
 ## Details
 
@@ -428,3 +429,10 @@ NtWriteVirtualMemory gives such a page the program's protection back through NtP
 drops its translations of it) and writes again. Every program that patches itself through WriteProcessMemory, DRM,
 anti-cheat and mod loaders included, goes from failing to succeeding. `tests/x64-fidelity/wpmtest.c`: 10/2 with the
 unix part alone, 12/0 with both (M5 Max, macOS 27.2, 2026-11-19); memtest, smcdata and smcretire unchanged.
+### D3DKMTSetProcessSchedulingPriorityClass (0064)
+
+The Intel line's `0030` for this line, unchanged. On the arm64 engine r5 (M5 Max, macOS 27.2, 2026-11-17) the same
+"unimplemented function GDI32.dll.D3DKMTSetProcessSchedulingPriorityClass, aborting" from Steam's 32-bit service came
+right before an `assert_steam.exe` dump ("CSteamEngine::BMainLoop appears to have stalled > 15 seconds") each time the
+overlay opened in Forza Horizon 6; the overlay stayed empty and the game froze. With the patch a 32-bit test finds the
+export and gets STATUS_SUCCESS, and the overlay draws and closes normally.
