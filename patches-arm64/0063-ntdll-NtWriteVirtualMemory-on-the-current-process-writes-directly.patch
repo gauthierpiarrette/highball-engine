@@ -1,0 +1,43 @@
+ntdll: NtWriteVirtualMemory on the current process writes directly.
+
+Wine writes another process's memory through wineserver, which on macOS writes through the Mach task port. macOS
+refuses the server that port, so WriteProcessMemory failed with ERROR_ACCESS_DENIED even when a process wrote its own
+code. In-process hookers do exactly that: the Steam overlay (GameOverlayRenderer64.dll) logged "WriteProcessMemory()
+call failed trying to overwrite first 5 bytes of function body during hook" for every function and never showed.
+NtWriteVirtualMemory now writes the current process itself with virtual_uninterrupted_write_memory (write access
+checked and write watches updated under the virtual lock, then one memcpy; no probing write into the target), as
+NtReadVirtualMemory already reads it. An x64 test that rewrites the first five bytes of XInputGetState, GetCursorPos,
+CreateDXGIFactory1 and Sleep through WriteProcessMemory got ERROR_ACCESS_DENIED before and succeeds after (M5 Max,
+macOS 27.2, 2026-11-17). The overlay also needs 0064, and its swap chain hooks need DXVK's methods to be detourable
+on ARM64EC, which is a separate change.
+
+Upstream: not sent.
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index bbcd4b2..b4f5359 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -7128,7 +7128,22 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
+ {
+     unsigned int status;
+ 
+-    if (virtual_check_buffer_for_read( buffer, size ))
++    if (process == GetCurrentProcess())
++    {
++        /* The server writes through the Mach task port on macOS, which it is refused for
++         * our own process; write our own memory here, as NtReadVirtualMemory reads it. */
++        if (!virtual_check_buffer_for_read( buffer, size ))
++        {
++            status = STATUS_PARTIAL_COPY;
++            size = 0;
++        }
++        else if ((status = virtual_uninterrupted_write_memory( addr, buffer, size )))
++        {
++            status = STATUS_PARTIAL_COPY;
++            size = 0;
++        }
++    }
++    else if (virtual_check_buffer_for_read( buffer, size ))
+     {
+         SERVER_START_REQ( write_process_memory )
+         {

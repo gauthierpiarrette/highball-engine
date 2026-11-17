@@ -42,6 +42,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0041` ntdll-arm64ec-the-x64-state-on-an-unhandled-exception | A crash log named the instruction but not the x64 registers. | Microsoft Flight Simulator 2024 | diagnostics | |
 | `0042` ntdll-arm64ec-rtliseccode-above-the-user-address-space | A thread could fault in a loop until its stack ran out. | Microsoft Flight Simulator 2024 | general | |
 | `0043` ntdll-arm64ec-a-program-sees-its-own-page-protection | Programs saw the emulator's page protection, so restoring it made their own pages fault. | Microsoft Flight Simulator 2024, copy protections | x86-64 fidelity | pairs with FEX 0022 |
+| `0063` ntdll-NtWriteVirtualMemory-on-the-current-process-writes-directly | WriteProcessMemory into the process's own memory failed (the server's Mach task port write is refused), so in-process hooks such as the Steam overlay's could not install. | the Steam overlay, in-process hookers | macOS | pairs with 0064 |
 
 ## Details
 
@@ -330,3 +331,16 @@ roam and normal exit, many sessions between 2026-10-29 and 2026-10-31. The stall
 protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the panel showed 8995 of 8997 frames at an even
 2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
 from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.
+
+### WriteProcessMemory on the own process (0063)
+
+Wine writes another process's memory through wineserver, which on macOS writes through the Mach task port. macOS
+refuses the server that port, so WriteProcessMemory failed with ERROR_ACCESS_DENIED even when a process wrote its own
+code. In-process hookers do exactly that: the Steam overlay (GameOverlayRenderer64.dll) logged "WriteProcessMemory()
+call failed trying to overwrite first 5 bytes of function body during hook" for every function and never showed.
+NtWriteVirtualMemory now writes the current process itself with virtual_uninterrupted_write_memory (write access
+checked and write watches updated under the virtual lock, then one memcpy; no probing write into the target), as
+NtReadVirtualMemory already reads it. An x64 test that rewrites the first five bytes of XInputGetState, GetCursorPos,
+CreateDXGIFactory1 and Sleep through WriteProcessMemory got ERROR_ACCESS_DENIED before and succeeds after (M5 Max,
+macOS 27.2, 2026-11-17). The overlay also needs 0064, and its swap chain hooks need DXVK's methods to be detourable
+on ARM64EC, which is a separate change.
