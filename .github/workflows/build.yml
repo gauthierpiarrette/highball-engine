@@ -163,8 +163,8 @@ jobs:
           aoe=out/engine/share/wine/aoe4
           mkdir -p "$aoe"
           cp "$helper/build/bin/x87sidecar" "$aoe/"
-          cp patches/aoe4/licenses/x87sidecar-MIT.txt "$aoe/"
-          cp patches/aoe4/licenses/HDE-LICENSE.txt out/engine/share/wine/
+          cp "$helper/source/LICENSE" "$aoe/x87sidecar-MIT.txt"
+          sed -n '1,/^ \*\//p' src/sources/wine/dlls/ntdll/unix/aoe_hde64.h > out/engine/share/wine/HDE-LICENSE.txt
           name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
           tar -C out -czf "${name}.tar.gz" .
           shasum -a 256 "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
