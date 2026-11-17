@@ -86,18 +86,4 @@ yet. The paragraphs under the table give the details and the measurements.
 - `0028-ntdll-crash-on-faults-in-foreign-threads.patch`: on macOS, segv_handler, trap_handler and fpe_handler first check NtCurrentTeb(). A thread Wine didn't create (a libdispatch worker running Metal or D3DMetal code) has none, and save_context would fault reading it at 0x2f0 and be retried forever; such a fault now restores the signal's default action and returns, so the process ends with SIGSEGV, SIGTRAP or SIGFPE and the crash report names the first fault. Threads with a TEB are unchanged.
 - `0030-gdi32-d3dkmt-set-process-scheduling-priority-class.patch`: gdi32 exports D3DKMTSetProcessSchedulingPriorityClass and answers success. Steam's client service (bin/SteamService.dll, client of 2026-10-31) imports it by name, and Wine (CrossOver 26.3 and upstream master) has no such export, so the loader bound it to a stub that aborts the process. GetProcAddress for the name returned NULL on r31 and on the Wine 10 engine r28. In highball#699 the abort came while Satisfactory's overlay opened on r31, then Steam's main loop stalled and the game froze; that the abort caused the freeze is read from the log, not measured.
 
-- `0032-aoe4-rosetta-profile-cache.patch`: `HB_AOE4=1` opts Age of Empires IV into the combined Rosetta software-fault and x87 decoder and a guarded generated-code cache. Requires `RelicCardinal.exe` with a verified x64 PE layout, Rosetta and macOS 26+. The pinned arm64 helper is distributed separately; measured profiles are built into the patch; see [AoE IV notes and tests](#age-of-empires-iv-on-rosetta).
-
-## Age of Empires IV on Rosetta
-
-Patch 0032 adds opt-in decoder/cache support (`HB_AOE4=1`) with built-in measured
-profiles and validated ring discovery. The AoE helper is a separate component,
-built alongside the standard helper by `build-x87sidecar.yml`; each pinned build
-is cached independently. `AOE4_SIDECAR_PATH` names its installed executable.
-Run `tests/aoe4/run.sh /path/to/patched/wine` for the patch checks.
-
-See the engine fork's [main README](https://github.com/himbeles/highball-engine-aoe4/blob/main/README.md),
-[analysis and measurements](https://github.com/himbeles/highball-engine-aoe4/blob/main/proposals/aoe4/VALIDATION.md),
-and [complete standalone source](https://github.com/himbeles/highball-engine-aoe4/tree/main)
-for implementation details, validation and source credits. HDE license notices
-remain in patch 0032; the helper archive includes its own MIT license.
+- `0032-aoe4-rosetta-profile-cache.patch`: opt-in AoE IV decoder and generated-code cache on Rosetta/macOS 26+ (`HB_AOE4=1`), using the separately installed helper at `AOE4_SIDECAR_PATH`. See the [standalone engine README](https://github.com/himbeles/highball-engine-aoe4/blob/main/README.md) and [analysis](https://github.com/himbeles/highball-engine-aoe4/blob/main/proposals/aoe4/VALIDATION.md).
