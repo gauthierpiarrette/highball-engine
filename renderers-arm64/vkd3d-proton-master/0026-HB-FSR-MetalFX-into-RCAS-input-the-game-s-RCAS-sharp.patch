@@ -1,0 +1,47 @@
+From ca0cd87baec6bb19852c5088bee42bde0d0142ff Mon Sep 17 00:00:00 2001
+From: hb <hb@local>
+Date: Tue, 17 Nov 2026 08:03:43 +0500
+Subject: [PATCH 26/27] HB FSR: MetalFX into RCAS input, the game's RCAS
+ sharpens
+
+---
+ libs/vkd3d/command.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 7b84e3de..8fe50423 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -9534,6 +9534,7 @@ static bool hb_fsr_dispatch(struct d3d12_command_list *list)
+     const float *f;
+     const int32_t *i32;
+     VkImage output;
++    bool sharpen;
+     bool hires_mv;
+     float target_w, target_h;
+ 
+@@ -9590,6 +9591,12 @@ static bool hb_fsr_dispatch(struct d3d12_command_list *list)
+         return false;
+     if (!output)
+         return pass == HB_FSR_PASS_ACCUMULATE; /* accumulate with sharpening: RCAS writes the output */
++    /* RCAS t1 is the upscaled color it sharpens, in the input color's space: MetalFX writes there, then the game's
++     * RCAS runs with the game's sharpness */
++    sharpen = pass == HB_FSR_PASS_RCAS && hb_fsr_env_float("HB_FSR_MFX_SHARPEN", 1.0f) != 0.0f &&
++            hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 1);
++    if (sharpen)
++        output = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 1);
+ 
+     i32 = (const int32_t *)list->hb_fsr.cb;
+     f = (const float *)list->hb_fsr.cb;
+@@ -9623,7 +9630,7 @@ static bool hb_fsr_dispatch(struct d3d12_command_list *list)
+     info.preExposure = 1.0f;
+     d3d12_command_list_metalfx_scale(list, &info, NULL, 0);
+     list->hb_fsr.have_inputs = false;
+-    return true;
++    return !sharpen;
+ }
+ 
+ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_iface *iface,
+-- 
+2.54.0 (Apple Git-157)
+

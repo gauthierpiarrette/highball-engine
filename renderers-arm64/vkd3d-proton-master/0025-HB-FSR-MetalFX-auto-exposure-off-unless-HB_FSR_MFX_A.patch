@@ -1,0 +1,26 @@
+From 09db98652946346306e9e0d949902923d474a278 Mon Sep 17 00:00:00 2001
+From: hb <hb@local>
+Date: Tue, 17 Nov 2026 07:42:45 +0500
+Subject: [PATCH 25/27] HB FSR: MetalFX auto exposure off unless
+ HB_FSR_MFX_AUTO_EXPOSURE=1
+
+---
+ libs/vkd3d/command.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 7beff687..7b84e3de 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -9601,7 +9601,7 @@ static bool hb_fsr_dispatch(struct d3d12_command_list *list)
+     info.sType = VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK;
+     info.scalerId = 0x48424653; /* "HBFS" */
+     info.scalerType = VK_METALFX_SCALER_TYPE_TEMPORAL_MVK;
+-    info.flags = VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK;
++    info.flags = hb_fsr_env_float("HB_FSR_MFX_AUTO_EXPOSURE", 0.0f) != 0.0f ? VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK : 0;
+     if (f[31] == 0.0f)
+         info.flags |= VK_METALFX_SCALE_RESET_BIT_MVK;
+     if (hb_fsr_env_float("HB_FSR_MFX_DEPTH_REVERSED", 1.0f) != 0.0f)
+-- 
+2.54.0 (Apple Git-157)
+

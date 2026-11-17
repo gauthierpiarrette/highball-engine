@@ -1,0 +1,272 @@
+From 0a79fe4af4c8f3a6f31d4da05f3e87501c2472e5 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 14:39:28 +0200
+Subject: [PATCH 03/27] resource: null descriptors emulated with dummy
+ resources when the device has no nullDescriptor
+
+D3D12 lets a descriptor heap hold null descriptors. Without VK_EXT_robustness2 nullDescriptor (MoltenVK) they become
+a 1x1 image, a small buffer and a buffer view created with the device. Known limit: the dummy resources are shared
+and writable, so a write through one null UAV is visible through another (a standalone null-UAV probe fails 4 of
+5 checks on MoltenVK). A driver with real null descriptors never takes this path.
+---
+ libs/vkd3d/device.c        | 159 +++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/resource.c      |  13 ++-
+ libs/vkd3d/vkd3d_private.h |  16 ++++
+ 3 files changed, 187 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index f0d612b7..7350da3a 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -3920,6 +3920,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
+     vkd3d_sampler_state_cleanup(&device->sampler_state, device);
+     vkd3d_view_map_destroy(&device->sampler_map.map, device);
+     vkd3d_meta_ops_cleanup(&device->meta_ops, device);
++    vkd3d_null_resources_cleanup(device);
+     vkd3d_bindless_state_cleanup(&device->bindless_state, device);
+     d3d12_device_destroy_vkd3d_queues(device);
+     VK_CALL(vkDestroySemaphore(device->vk_device, device->sparse_init_timeline, NULL));
+@@ -10643,6 +10644,9 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+     if (FAILED(hr = vkd3d_bindless_state_init(&device->bindless_state, device)))
+         goto out_cleanup_global_descriptor_buffer;
+ 
++    if (FAILED(hr = vkd3d_null_resources_init(device)))
++        goto out_cleanup_bindless_state;
++
+     if (FAILED(hr = vkd3d_view_map_init(&device->sampler_map.map)))
+         goto out_cleanup_bindless_state;
+ 
+@@ -10746,6 +10750,7 @@ out_cleanup_sampler_state:
+ out_cleanup_view_map:
+     vkd3d_view_map_destroy(&device->sampler_map.map, device);
+ out_cleanup_bindless_state:
++    vkd3d_null_resources_cleanup(device);
+     vkd3d_bindless_state_cleanup(&device->bindless_state, device);
+ out_cleanup_global_descriptor_buffer:
+     vkd3d_global_descriptor_buffer_cleanup(&device->global_descriptor_buffer, device);
+@@ -11356,3 +11361,157 @@ struct vkd3d_instance *vkd3d_instance_from_device(ID3D12Device *device)
+ 
+     return d3d12_device->vkd3d_instance;
+ }
++
++/* Null descriptor emulation (Highball msfs trial): MoltenVK has no VK_EXT_robustness2 nullDescriptor, and a
++ * VK_NULL_HANDLE written into a descriptor set ends in a Metal "Invalid Resource" GPU fault the first time a
++ * shader touches it. A zeroed dummy buffer and a 1x1 image stand in for every null descriptor instead. */
++#define VKD3D_NULL_DESC_BUFFER_SIZE (64 * 1024)
++
++HRESULT vkd3d_null_resources_init(struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_null_resources *null = &device->null_resources;
++    VkBufferDeviceAddressInfo address_info;
++    VkImageViewCreateInfo image_view_info;
++    VkBufferViewCreateInfo view_info;
++    VkMemoryAllocateInfo alloc_info;
++    VkImageCreateInfo image_info;
++    VkBindImageMemoryInfo bind_info;
++    VkMemoryRequirements reqs;
++    uint32_t i, type_index;
++    void *mapped;
++    VkResult vr;
++    HRESULT hr;
++
++    memset(null, 0, sizeof(*null));
++    if (device->device_info.robustness2_features.nullDescriptor)
++        return S_OK;
++
++    if (FAILED(hr = vkd3d_create_buffer_explicit_usage(device,
++            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++            VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
++            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++            VKD3D_NULL_DESC_BUFFER_SIZE, "null-descriptor-buffer", &null->vk_buffer)))
++        goto fail;
++    if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, null->vk_buffer,
++            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &null->buffer_allocation)))
++        goto fail;
++    if (VK_CALL(vkMapMemory(device->vk_device, null->buffer_allocation.vk_memory, 0, VK_WHOLE_SIZE, 0, &mapped)) == VK_SUCCESS)
++    {
++        memset(mapped, 0, VKD3D_NULL_DESC_BUFFER_SIZE);
++        VK_CALL(vkUnmapMemory(device->vk_device, null->buffer_allocation.vk_memory));
++    }
++
++    view_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
++    view_info.pNext = NULL;
++    view_info.flags = 0;
++    view_info.buffer = null->vk_buffer;
++    view_info.format = VK_FORMAT_R32_UINT;
++    view_info.offset = 0;
++    view_info.range = VK_WHOLE_SIZE;
++    if ((vr = VK_CALL(vkCreateBufferView(device->vk_device, &view_info, NULL, &null->vk_buffer_view))) < 0)
++    {
++        hr = hresult_from_vk_result(vr);
++        goto fail;
++    }
++
++    address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
++    address_info.pNext = NULL;
++    address_info.buffer = null->vk_buffer;
++    null->buffer_va = VK_CALL(vkGetBufferDeviceAddress(device->vk_device, &address_info));
++
++    memset(&image_info, 0, sizeof(image_info));
++    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    image_info.imageType = VK_IMAGE_TYPE_2D;
++    image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++    image_info.extent.width = 1;
++    image_info.extent.height = 1;
++    image_info.extent.depth = 1;
++    image_info.mipLevels = 1;
++    image_info.arrayLayers = 1;
++    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if ((vr = VK_CALL(vkCreateImage(device->vk_device, &image_info, NULL, &null->vk_image_2d))) < 0)
++    {
++        hr = hresult_from_vk_result(vr);
++        goto fail;
++    }
++    VK_CALL(vkGetImageMemoryRequirements(device->vk_device, null->vk_image_2d, &reqs));
++    type_index = UINT32_MAX;
++    for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
++    {
++        if (!(reqs.memoryTypeBits & (1u << i)))
++            continue;
++        if (type_index == UINT32_MAX ||
++                (device->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++            type_index = i;
++        if (device->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
++            break;
++    }
++    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    alloc_info.pNext = NULL;
++    alloc_info.allocationSize = reqs.size;
++    alloc_info.memoryTypeIndex = type_index;
++    if ((vr = VK_CALL(vkAllocateMemory(device->vk_device, &alloc_info, NULL, &null->vk_image_memory))) < 0)
++    {
++        hr = hresult_from_vk_result(vr);
++        goto fail;
++    }
++    bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
++    bind_info.pNext = NULL;
++    bind_info.image = null->vk_image_2d;
++    bind_info.memory = null->vk_image_memory;
++    bind_info.memoryOffset = 0;
++    if ((vr = VK_CALL(vkBindImageMemory2(device->vk_device, 1, &bind_info))) < 0)
++    {
++        hr = hresult_from_vk_result(vr);
++        goto fail;
++    }
++
++    memset(&image_view_info, 0, sizeof(image_view_info));
++    image_view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    image_view_info.image = null->vk_image_2d;
++    image_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    image_view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++    image_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    image_view_info.subresourceRange.levelCount = 1;
++    image_view_info.subresourceRange.layerCount = 1;
++    if ((vr = VK_CALL(vkCreateImageView(device->vk_device, &image_view_info, NULL, &null->vk_image_view_2d))) < 0)
++    {
++        hr = hresult_from_vk_result(vr);
++        goto fail;
++    }
++
++    null->active = true;
++    WARN("nullDescriptor is not supported: emulating null descriptors with dummy resources (buffer va %#llx).\n",
++            (unsigned long long)null->buffer_va);
++    return S_OK;
++
++fail:
++    ERR("Failed to create null descriptor resources, hr %#x.\n", hr);
++    vkd3d_null_resources_cleanup(device);
++    return hr;
++}
++
++void vkd3d_null_resources_cleanup(struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_null_resources *null = &device->null_resources;
++
++    if (null->vk_image_view_2d)
++        VK_CALL(vkDestroyImageView(device->vk_device, null->vk_image_view_2d, NULL));
++    if (null->vk_image_2d)
++        VK_CALL(vkDestroyImage(device->vk_device, null->vk_image_2d, NULL));
++    if (null->vk_image_memory)
++        VK_CALL(vkFreeMemory(device->vk_device, null->vk_image_memory, NULL));
++    if (null->vk_buffer_view)
++        VK_CALL(vkDestroyBufferView(device->vk_device, null->vk_buffer_view, NULL));
++    if (null->vk_buffer)
++        VK_CALL(vkDestroyBuffer(device->vk_device, null->vk_buffer, NULL));
++    if (null->buffer_allocation.vk_memory)
++        vkd3d_free_device_memory(device, &null->buffer_allocation);
++    memset(null, 0, sizeof(*null));
++}
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 39e4b0b6..fdb80053 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -6024,7 +6024,7 @@ static void d3d12_descriptor_heap_write_null_descriptor_template(vkd3d_cpu_descr
+ 
+     va = desc.heap->raw_va_aux_buffer.host_ptr;
+     if (va)
+-        va[offset] = 0;
++        va[offset] = desc.heap->device->null_resources.active ? desc.heap->device->null_resources.buffer_va : 0;
+ 
+     /* Notify descriptor QA that we have a universal null descriptor. */
+     vkd3d_descriptor_debug_write_descriptor(desc.heap->descriptor_heap_info.host_ptr,
+@@ -10124,6 +10124,17 @@ static void d3d12_descriptor_heap_add_null_descriptor_template_descriptors(
+         descriptor_heap->null_descriptor_template.writes.descriptors.image.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+         descriptor_heap->null_descriptor_template.writes.descriptors.image.imageView = VK_NULL_HANDLE;
+         descriptor_heap->null_descriptor_template.writes.descriptors.buffer_view = VK_NULL_HANDLE;
++        if (descriptor_heap->device->null_resources.active)
++        {
++            /* No nullDescriptor: point every null descriptor at the dummy resources instead. */
++            descriptor_heap->null_descriptor_template.writes.descriptors.buffer.buffer =
++                    descriptor_heap->device->null_resources.vk_buffer;
++            descriptor_heap->null_descriptor_template.writes.descriptors.image.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++            descriptor_heap->null_descriptor_template.writes.descriptors.image.imageView =
++                    descriptor_heap->device->null_resources.vk_image_view_2d;
++            descriptor_heap->null_descriptor_template.writes.descriptors.buffer_view =
++                    descriptor_heap->device->null_resources.vk_buffer_view;
++        }
+         descriptor_heap->null_descriptor_template.has_mutable_descriptors =
+                 descriptor_heap->device->device_info.mutable_descriptor_features.mutableDescriptorType;
+         descriptor_heap->null_descriptor_template.has_descriptor_buffer = false;
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index b0ebd552..af851796 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -5862,6 +5862,21 @@ int vkd3d_nv_shader_init(struct d3d12_device *device);
+ void vkd3d_nv_shader_cleanup(struct d3d12_device *device);
+ struct vkd3d_nv_shader_extn d3d12_device_get_nv_shader_extn(struct d3d12_device *device);
+ 
++struct vkd3d_null_resources
++{
++    bool active;
++    VkBuffer vk_buffer;
++    struct vkd3d_device_memory_allocation buffer_allocation;
++    VkBufferView vk_buffer_view;
++    VkDeviceAddress buffer_va;
++    VkImage vk_image_2d;
++    VkDeviceMemory vk_image_memory;
++    VkImageView vk_image_view_2d;
++};
++
++HRESULT vkd3d_null_resources_init(struct d3d12_device *device);
++void vkd3d_null_resources_cleanup(struct d3d12_device *device);
++
+ struct d3d12_device
+ {
+     d3d12_device_iface ID3D12Device_iface;
+@@ -5932,6 +5947,7 @@ struct d3d12_device
+     unsigned int format_compatibility_list_count;
+     const struct vkd3d_format_compatibility_list *format_compatibility_lists;
+     struct vkd3d_bindless_state bindless_state;
++    struct vkd3d_null_resources null_resources;
+     struct vkd3d_queue_timeline_trace queue_timeline_trace;
+     struct vkd3d_memory_info memory_info;
+     struct vkd3d_meta_ops meta_ops;
+-- 
+2.54.0 (Apple Git-157)
+

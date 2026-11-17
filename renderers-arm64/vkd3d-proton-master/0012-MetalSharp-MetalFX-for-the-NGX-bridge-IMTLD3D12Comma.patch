@@ -1,0 +1,811 @@
+From a543b930c1b581e9fc4f20bbf431708171a469a9 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Sun, 1 Nov 2026 16:33:54 -0700
+Subject: [PATCH 12/27] MetalSharp: MetalFX for the NGX bridge
+ (IMTLD3D12CommandListExt) and MetalFX spatial upscaling at present
+ (vkd3d.conf)
+
+Command lists answer Mullion's IMTLD3D12CommandListExt (same IID and methods), so Mullion's nvngx.dll runs DLSS
+Super Resolution and Ray Reconstruction on MetalFX's temporal and denoised scalers through MoltenVK (a scale chained
+to a barrier, mvk_metalfx.h). vkd3d.conf (VKD3D_CONFIG_FILE, else ./vkd3d.conf; dxvk.conf's form) with
+d3d12.metalSpatialUpscale (or d3d11's) = True keeps the swapchain at the back buffers' size and has MoltenVK upscale it
+to the display with MetalFX's spatial scaler.
+---
+ include/private/mvk_metalfx.h   | 105 +++++++++
+ include/private/vkd3d_metalfx.h | 112 +++++++++
+ libs/vkd3d/command.c            |  46 ++++
+ libs/vkd3d/meson.build          |   1 +
+ libs/vkd3d/metalfx.c            | 391 ++++++++++++++++++++++++++++++++
+ libs/vkd3d/swapchain.c          |  17 ++
+ libs/vkd3d/vkd3d_private.h      |   7 +
+ 7 files changed, 679 insertions(+)
+ create mode 100644 include/private/mvk_metalfx.h
+ create mode 100644 include/private/vkd3d_metalfx.h
+ create mode 100644 libs/vkd3d/metalfx.c
+
+diff --git a/include/private/mvk_metalfx.h b/include/private/mvk_metalfx.h
+new file mode 100644
+index 00000000..9d1aa0d3
+--- /dev/null
++++ b/include/private/mvk_metalfx.h
+@@ -0,0 +1,105 @@
++/*
++ * mvk_metalfx.h
++ *
++ * MetalSharp: Apple's MetalFX upscalers through Vulkan, for D3D layers (VKD3D-Proton, DXVK) on MoltenVK.
++ *
++ * Wine's Vulkan layer forwards only the functions and structures of known Vulkan extensions, but on 64-bit it hands
++ * a VkDependencyInfo and a VkSwapchainCreateInfoKHR to the driver as they are, extension chain included. So:
++ *
++ * - a VkMetalFXScaleInfoMVK in the pNext chain of vkCmdPipelineBarrier2's VkDependencyInfo runs a MetalFX temporal
++ *   or denoised scaler after the barrier, in the command buffer's order;
++ * - a VkSwapchainMetalFXSpatialCreateInfoMVK in the pNext chain of VkSwapchainCreateInfoKHR has the swapchain's
++ *   images upscaled with MetalFX's spatial scaler to the surface's native size when they are presented.
++ *
++ * A MoltenVK that supports them says so in VkPhysicalDeviceDriverProperties::driverInfo: the words "metalfx"
++ * (temporal and spatial scalers) and "metalfx-denoised" (MetalFX's denoised scaler, macOS 26).
++ *
++ * This file is copied as it is into the D3D layers that use it.
++ */
++
++#ifndef __mvk_metalfx_h_
++#define __mvk_metalfx_h_ 1
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK ((VkStructureType)1000999100)
++#define VK_STRUCTURE_TYPE_SWAPCHAIN_METALFX_SPATIAL_CREATE_INFO_MVK ((VkStructureType)1000999101)
++
++#define VK_MVK_METALFX_DRIVER_INFO "metalfx"
++#define VK_MVK_METALFX_DENOISED_DRIVER_INFO "metalfx-denoised"
++
++typedef enum VkMetalFXScalerTypeMVK {
++	VK_METALFX_SCALER_TYPE_NONE_MVK = 0,		/* only releases pReleaseScalerIds */
++	VK_METALFX_SCALER_TYPE_TEMPORAL_MVK = 1,	/* MTLFXTemporalScaler (DLSS Super Resolution) */
++	VK_METALFX_SCALER_TYPE_DENOISED_MVK = 2,	/* MTLFXTemporalDenoisedScaler (DLSS Ray Reconstruction) */
++} VkMetalFXScalerTypeMVK;
++
++/* The textures of a scale, by their index in images and formats */
++typedef enum VkMetalFXImageMVK {
++	VK_METALFX_IMAGE_COLOR_MVK = 0,
++	VK_METALFX_IMAGE_DEPTH_MVK = 1,
++	VK_METALFX_IMAGE_MOTION_MVK = 2,
++	VK_METALFX_IMAGE_OUTPUT_MVK = 3,
++	VK_METALFX_IMAGE_EXPOSURE_MVK = 4,				/* optional */
++	VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK = 5,		/* denoised */
++	VK_METALFX_IMAGE_SPECULAR_ALBEDO_MVK = 6,		/* denoised */
++	VK_METALFX_IMAGE_NORMALS_MVK = 7,				/* denoised */
++	VK_METALFX_IMAGE_ROUGHNESS_MVK = 8,				/* denoised */
++	VK_METALFX_IMAGE_SPECULAR_HIT_DISTANCE_MVK = 9,	/* denoised, optional */
++	VK_METALFX_IMAGE_COUNT_MVK = 10,
++} VkMetalFXImageMVK;
++
++typedef enum VkMetalFXScaleFlagBitsMVK {
++	VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK = 0x1,
++	VK_METALFX_SCALE_RESET_BIT_MVK = 0x2,
++	VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK = 0x4,
++} VkMetalFXScaleFlagBitsMVK;
++
++/*
++ * One scale. The scaler is MoltenVK's, kept under scalerId (any nonzero value the caller picks, one per upscaling
++ * feature, since a temporal scaler keeps the history of its earlier frames) and made again when the images' sizes or
++ * formats change. Its caller releases it by naming its id in pReleaseScalerIds of a later scale (of any type,
++ * VK_METALFX_SCALER_TYPE_NONE_MVK included); MoltenVK releases the rest with the device.
++ *
++ * formats[i] is the format images[i] is read or written as (VK_FORMAT_UNDEFINED: the image's own), such as a float
++ * format for an integer-typed depth; a different format needs an image made with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
++ * The images are read in the general layout, and their contents must be available to the barrier's second scope;
++ * the output is written for a later barrier to make visible.
++ */
++typedef struct VkMetalFXScaleInfoMVK {
++	VkStructureType sType;
++	const void* pNext;
++	uint64_t scalerId;
++	uint32_t scalerType;					/* VkMetalFXScalerTypeMVK */
++	uint32_t flags;							/* VkMetalFXScaleFlagBitsMVK */
++	VkImage images[VK_METALFX_IMAGE_COUNT_MVK];
++	VkFormat formats[VK_METALFX_IMAGE_COUNT_MVK];
++	uint32_t inputContentWidth;				/* 0: the color image's width */
++	uint32_t inputContentHeight;			/* 0: the color image's height */
++	float motionVectorScaleX;
++	float motionVectorScaleY;
++	float jitterOffsetX;
++	float jitterOffsetY;
++	float preExposure;
++	float worldToViewMatrix[16];			/* denoised: row-major, of row vectors (D3D's) */
++	float viewToClipMatrix[16];				/* denoised */
++	uint32_t releaseScalerIdCount;
++	const uint64_t* pReleaseScalerIds;
++} VkMetalFXScaleInfoMVK;
++
++/* MetalFX spatial upscaling at present, to the surface's native size, where that is larger than the images' */
++typedef struct VkSwapchainMetalFXSpatialCreateInfoMVK {
++	VkStructureType sType;
++	const void* pNext;
++	uint32_t enable;
++} VkSwapchainMetalFXSpatialCreateInfoMVK;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/include/private/vkd3d_metalfx.h b/include/private/vkd3d_metalfx.h
+new file mode 100644
+index 00000000..28aea6f3
+--- /dev/null
++++ b/include/private/vkd3d_metalfx.h
+@@ -0,0 +1,112 @@
++/*
++ * MetalSharp: MetalFX upscaling recorded in a D3D12 command list, for the NGX bridge (Mullion's nvngx.dll).
++ *
++ * The interface is Mullion's IMTLD3D12CommandListExt (src/d3d12/d3d12_interfaces.hpp in Mullion), with the same IID,
++ * methods and descriptions, so that Mullion's NGX core drives DLSS Super Resolution and Ray Reconstruction with
++ * VKD3D-Proton's command lists as it does with Mullion's. MoltenVK runs the scalers (mvk_metalfx.h).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __VKD3D_METALFX_H
++#define __VKD3D_METALFX_H
++
++#include "mvk_metalfx.h"
++
++typedef struct MTL_TEMPORAL_UPSCALE_D3D12_DESC
++{
++    UINT InputContentWidth;  /* 0: the color's width */
++    UINT InputContentHeight; /* 0: the color's height */
++    BOOL AutoExposure;
++    BOOL InReset;
++    BOOL DepthReversed;
++    BOOL MotionVectorInDisplayRes;
++    ID3D12Resource *Color;
++    ID3D12Resource *Depth;
++    ID3D12Resource *MotionVector;
++    ID3D12Resource *Output;
++    ID3D12Resource *ExposureTexture; /* optional */
++    FLOAT MotionVectorScaleX;
++    FLOAT MotionVectorScaleY;
++    FLOAT PreExposure;
++    FLOAT JitterOffsetX;
++    FLOAT JitterOffsetY;
++} MTL_TEMPORAL_UPSCALE_D3D12_DESC;
++
++typedef struct MTL_DENOISED_UPSCALE_D3D12_DESC
++{
++    BOOL AutoExposure;
++    BOOL InReset;
++    BOOL DepthReversed;
++    BOOL RoughnessInNormalAlpha; /* roughness is the normals' alpha (DLSS.Roughness.Mode packed) */
++    ID3D12Resource *Color;
++    ID3D12Resource *Depth;
++    ID3D12Resource *MotionVector;
++    ID3D12Resource *DiffuseAlbedo;
++    ID3D12Resource *SpecularAlbedo;
++    ID3D12Resource *Normals;
++    ID3D12Resource *Roughness;           /* unused when RoughnessInNormalAlpha */
++    ID3D12Resource *SpecularHitDistance; /* optional */
++    ID3D12Resource *ExposureTexture;     /* optional */
++    ID3D12Resource *Output;
++    FLOAT MotionVectorScaleX;
++    FLOAT MotionVectorScaleY;
++    FLOAT PreExposure;
++    FLOAT JitterOffsetX;
++    FLOAT JitterOffsetY;
++    /* row-major, of row vectors (D3D's) */
++    FLOAT WorldToView[16];
++    FLOAT ViewToClip[16];
++} MTL_DENOISED_UPSCALE_D3D12_DESC;
++
++/* A feature's scaler (a C++ class with one virtual method in Mullion), which its owner destroys when done with it. */
++typedef struct IMTLD3D12Upscaler IMTLD3D12Upscaler;
++
++typedef struct IMTLD3D12UpscalerVtbl
++{
++    void (STDMETHODCALLTYPE *Destroy)(IMTLD3D12Upscaler *This);
++} IMTLD3D12UpscalerVtbl;
++
++struct IMTLD3D12Upscaler
++{
++    const IMTLD3D12UpscalerVtbl *lpVtbl;
++};
++
++typedef struct IMTLD3D12CommandListExt IMTLD3D12CommandListExt;
++
++typedef struct IMTLD3D12CommandListExtVtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IMTLD3D12CommandListExt *This, REFIID riid, void **object);
++    ULONG (STDMETHODCALLTYPE *AddRef)(IMTLD3D12CommandListExt *This);
++    ULONG (STDMETHODCALLTYPE *Release)(IMTLD3D12CommandListExt *This);
++    BOOL (STDMETHODCALLTYPE *SupportsTemporalUpscale)(IMTLD3D12CommandListExt *This);
++    BOOL (STDMETHODCALLTYPE *SupportsDenoisedUpscale)(IMTLD3D12CommandListExt *This);
++    /* *upscaler is a feature's scaler, made at its first upscale */
++    HRESULT (STDMETHODCALLTYPE *TemporalUpscale)(IMTLD3D12CommandListExt *This,
++            const MTL_TEMPORAL_UPSCALE_D3D12_DESC *desc, IMTLD3D12Upscaler **upscaler);
++    HRESULT (STDMETHODCALLTYPE *DenoisedUpscale)(IMTLD3D12CommandListExt *This,
++            const MTL_DENOISED_UPSCALE_D3D12_DESC *desc, IMTLD3D12Upscaler **upscaler);
++} IMTLD3D12CommandListExtVtbl;
++
++struct IMTLD3D12CommandListExt
++{
++    const IMTLD3D12CommandListExtVtbl *lpVtbl;
++};
++
++/* 987426c0-bca1-4bfb-8e8a-1da3257f8467 */
++static const GUID IID_IMTLD3D12CommandListExt =
++        {0x987426c0, 0xbca1, 0x4bfb, {0x8e, 0x8a, 0x1d, 0xa3, 0x25, 0x7f, 0x84, 0x67}};
++
++#endif
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index b4d0976b..b41f1533 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -6571,6 +6571,13 @@ HRESULT STDMETHODCALLTYPE d3d12_command_list_QueryInterface(d3d12_command_list_i
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID(iid, &IID_IMTLD3D12CommandListExt))
++    {
++        d3d12_command_list_metalfx_AddRef(&command_list->IMTLD3D12CommandListExt_iface);
++        *object = &command_list->IMTLD3D12CommandListExt_iface;
++        return S_OK;
++    }
++
+     if (IsEqualGUID(iid, &IID_ID3DDestructionNotifier))
+     {
+         ID3DDestructionNotifier_AddRef(&command_list->destruction_notifier.ID3DDestructionNotifier_iface);
+@@ -9457,6 +9464,43 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
+     d3d12_command_list_check_compute_barrier(list);
+ }
+ 
++/* MetalSharp: a MetalFX scale (metalfx.c), chained to a barrier after everything recorded before it, and followed
++ * by one before everything after it. */
++void d3d12_command_list_metalfx_scale(struct d3d12_command_list *list, const VkMetalFXScaleInfoMVK *info,
++        struct d3d12_resource **resources, unsigned int resource_count)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkDependencyInfo dependency_info;
++    VkMemoryBarrier2 barrier;
++    unsigned int i;
++
++    d3d12_command_list_flush_dgc_batch(list);
++    d3d12_command_list_end_current_render_pass(list, false);
++    d3d12_command_list_end_transfer_batch(list, false);
++    for (i = 0; i < resource_count; i++)
++    {
++        if (resources[i])
++            d3d12_command_list_track_resource_usage(list, resources[i], true);
++    }
++
++    memset(&barrier, 0, sizeof(barrier));
++    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    memset(&dependency_info, 0, sizeof(dependency_info));
++    dependency_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dependency_info.pNext = info;
++    dependency_info.memoryBarrierCount = 1;
++    dependency_info.pMemoryBarriers = &barrier;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dependency_info));
++    dependency_info.pNext = NULL;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dependency_info));
++
++    list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
++}
++
+ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_list_iface *iface,
+         ID3D12Resource *dst, UINT64 dst_offset, ID3D12Resource *src, UINT64 src_offset, UINT64 byte_count)
+ {
+@@ -23300,6 +23344,7 @@ static struct d3d12_command_list *unsafe_impl_from_ID3D12CommandList(ID3D12Comma
+ }
+ 
+ extern CONST_VTBL struct ID3D12GraphicsCommandListExt2Vtbl d3d12_command_list_vkd3d_ext_vtbl;
++extern CONST_VTBL struct IMTLD3D12CommandListExtVtbl d3d12_command_list_metalfx_vtbl;
+ 
+ static void d3d12_command_list_init_attachment_info(VkRenderingAttachmentInfo *attachment_info)
+ {
+@@ -23401,6 +23446,7 @@ static HRESULT d3d12_command_list_init(struct d3d12_command_list *list, struct d
+     list->type = type;
+ 
+     list->ID3D12GraphicsCommandListExt_iface.lpVtbl = &d3d12_command_list_vkd3d_ext_vtbl;
++    list->IMTLD3D12CommandListExt_iface.lpVtbl = &d3d12_command_list_metalfx_vtbl;
+ 
+     hash_map_init(&list->query_resolve_lut,
+             vkd3d_query_lookup_entry_hash,
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index e24d61e4..634a0bae 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -69,6 +69,7 @@ vkd3d_src = [
+   'cache.c',
+   'command.c',
+   'command_list_vkd3d_ext.c',
++  'metalfx.c',
+   'command_queue_vkd3d_ext.c',
+   'd3dkmt.c',
+   'device.c',
+diff --git a/libs/vkd3d/metalfx.c b/libs/vkd3d/metalfx.c
+new file mode 100644
+index 00000000..48609eaf
+--- /dev/null
++++ b/libs/vkd3d/metalfx.c
+@@ -0,0 +1,391 @@
++/*
++ * MetalSharp: MetalFX upscaling recorded in a D3D12 command list (IMTLD3D12CommandListExt, vkd3d_metalfx.h), which
++ * Mullion's NGX core uses for DLSS Super Resolution (MetalFX's temporal scaler) and Ray Reconstruction (its denoised
++ * scaler). The scales go to MoltenVK chained to a barrier (mvk_metalfx.h).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "vkd3d_private.h"
++#include "vkd3d_metalfx.h"
++
++/* A feature's scaler is MoltenVK's, under an id of ours. Destroy() can come after the device is gone, so the ids it
++ * releases wait here, for any device's next scale to pass on (an id a device does not have is nothing to it). */
++struct vkd3d_metalfx_upscaler
++{
++    IMTLD3D12Upscaler IMTLD3D12Upscaler_iface;
++    uint64_t id;
++};
++
++static spinlock_t vkd3d_metalfx_release_lock;
++static uint64_t vkd3d_metalfx_released_ids[64];
++static uint32_t vkd3d_metalfx_released_count;
++static uint64_t vkd3d_metalfx_next_id;
++
++static void STDMETHODCALLTYPE vkd3d_metalfx_upscaler_Destroy(IMTLD3D12Upscaler *iface)
++{
++    struct vkd3d_metalfx_upscaler *upscaler = CONTAINING_RECORD(iface, struct vkd3d_metalfx_upscaler, IMTLD3D12Upscaler_iface);
++
++    spinlock_acquire(&vkd3d_metalfx_release_lock);
++    if (vkd3d_metalfx_released_count < ARRAY_SIZE(vkd3d_metalfx_released_ids))
++        vkd3d_metalfx_released_ids[vkd3d_metalfx_released_count++] = upscaler->id;
++    spinlock_release(&vkd3d_metalfx_release_lock);
++    vkd3d_free(upscaler);
++}
++
++static const IMTLD3D12UpscalerVtbl vkd3d_metalfx_upscaler_vtbl =
++{
++    vkd3d_metalfx_upscaler_Destroy,
++};
++
++/* The id of the feature's scaler, made at its first scale. */
++static uint64_t vkd3d_metalfx_upscaler_id(IMTLD3D12Upscaler **iface)
++{
++    struct vkd3d_metalfx_upscaler *upscaler;
++
++    if (*iface)
++    {
++        if ((*iface)->lpVtbl != &vkd3d_metalfx_upscaler_vtbl)
++            return 0;
++        return CONTAINING_RECORD(*iface, struct vkd3d_metalfx_upscaler, IMTLD3D12Upscaler_iface)->id;
++    }
++    if (!(upscaler = vkd3d_malloc(sizeof(*upscaler))))
++        return 0;
++    upscaler->IMTLD3D12Upscaler_iface.lpVtbl = &vkd3d_metalfx_upscaler_vtbl;
++    upscaler->id = vkd3d_atomic_uint64_increment(&vkd3d_metalfx_next_id, vkd3d_memory_order_relaxed);
++    *iface = &upscaler->IMTLD3D12Upscaler_iface;
++    return upscaler->id;
++}
++
++/* Whether MoltenVK's driverInfo has the word (mvk_metalfx.h). */
++bool vkd3d_metalfx_driver_has(const struct d3d12_device *device, const char *word)
++{
++    const char *info = device->device_info.vulkan_1_2_properties.driverInfo, *found;
++    size_t length = strlen(word);
++
++    if (device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MOLTENVK)
++        return false;
++    for (found = strstr(info, word); found; found = strstr(found + 1, word))
++    {
++        if ((found == info || found[-1] == ' ') && (!found[length] || found[length] == ' '))
++            return true;
++    }
++    return false;
++}
++
++/* The format MetalFX reads an image as: a float for an integer-typed one (a typeless depth or exposure), and a float
++ * pair or quad for motion vectors; VK_FORMAT_UNDEFINED for the image's own. */
++static VkFormat vkd3d_metalfx_read_format(const struct d3d12_resource *resource, bool motion)
++{
++    switch (resource->format->vk_format)
++    {
++        case VK_FORMAT_R32_UINT:
++        case VK_FORMAT_R32_SINT:
++            return VK_FORMAT_R32_SFLOAT;
++        case VK_FORMAT_R16_UINT:
++        case VK_FORMAT_R16_SINT:
++            return VK_FORMAT_R16_SFLOAT;
++        case VK_FORMAT_R32G32_UINT:
++        case VK_FORMAT_R32G32_SINT:
++            return VK_FORMAT_R32G32_SFLOAT;
++        case VK_FORMAT_R16G16_UINT:
++        case VK_FORMAT_R16G16_SINT:
++        case VK_FORMAT_R16G16_UNORM:
++        case VK_FORMAT_R16G16_SNORM:
++            return motion ? VK_FORMAT_R16G16_SFLOAT : VK_FORMAT_UNDEFINED;
++        case VK_FORMAT_R16G16B16A16_UINT:
++        case VK_FORMAT_R16G16B16A16_SINT:
++        case VK_FORMAT_R16G16B16A16_UNORM:
++        case VK_FORMAT_R16G16B16A16_SNORM:
++            return motion ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_UNDEFINED;
++        default:
++            return VK_FORMAT_UNDEFINED;
++    }
++}
++
++static inline struct d3d12_command_list *impl_from_IMTLD3D12CommandListExt(IMTLD3D12CommandListExt *iface)
++{
++    return CONTAINING_RECORD(iface, struct d3d12_command_list, IMTLD3D12CommandListExt_iface);
++}
++
++extern HRESULT STDMETHODCALLTYPE d3d12_command_list_QueryInterface(d3d12_command_list_iface *iface,
++        REFIID iid, void **object);
++extern ULONG STDMETHODCALLTYPE d3d12_command_list_AddRef(d3d12_command_list_iface *iface);
++extern ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *iface);
++
++static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_QueryInterface(IMTLD3D12CommandListExt *iface,
++        REFIID iid, void **object)
++{
++    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    return d3d12_command_list_QueryInterface(&list->ID3D12GraphicsCommandList_iface, iid, object);
++}
++
++ULONG STDMETHODCALLTYPE d3d12_command_list_metalfx_AddRef(IMTLD3D12CommandListExt *iface)
++{
++    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    return d3d12_command_list_AddRef(&list->ID3D12GraphicsCommandList_iface);
++}
++
++static ULONG STDMETHODCALLTYPE d3d12_command_list_metalfx_Release(IMTLD3D12CommandListExt *iface)
++{
++    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    return d3d12_command_list_Release(&list->ID3D12GraphicsCommandList_iface);
++}
++
++static BOOL STDMETHODCALLTYPE d3d12_command_list_metalfx_SupportsTemporalUpscale(IMTLD3D12CommandListExt *iface)
++{
++    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    return vkd3d_metalfx_driver_has(list->device, VK_MVK_METALFX_DRIVER_INFO);
++}
++
++static BOOL STDMETHODCALLTYPE d3d12_command_list_metalfx_SupportsDenoisedUpscale(IMTLD3D12CommandListExt *iface)
++{
++    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    return vkd3d_metalfx_driver_has(list->device, VK_MVK_METALFX_DENOISED_DRIVER_INFO);
++}
++
++/* Puts the resource at `index` in the scale; false for one that is not a texture of this device's. */
++static bool vkd3d_metalfx_set_image(VkMetalFXScaleInfoMVK *info, struct d3d12_resource **resources,
++        VkMetalFXImageMVK index, ID3D12Resource *iface, bool motion)
++{
++    struct d3d12_resource *resource;
++
++    if (!iface)
++        return true;
++    resource = impl_from_ID3D12Resource(iface);
++    if (d3d12_resource_is_buffer(resource))
++        return false;
++    resources[index] = resource;
++    info->images[index] = resource->res.vk_image;
++    info->formats[index] = vkd3d_metalfx_read_format(resource, motion);
++    return true;
++}
++
++/* Records the scale, passing on the scalers released since the last one. */
++static void vkd3d_metalfx_record(struct d3d12_command_list *list, VkMetalFXScaleInfoMVK *info,
++        struct d3d12_resource **resources)
++{
++    uint64_t released[ARRAY_SIZE(vkd3d_metalfx_released_ids)];
++
++    spinlock_acquire(&vkd3d_metalfx_release_lock);
++    memcpy(released, vkd3d_metalfx_released_ids, vkd3d_metalfx_released_count * sizeof(*released));
++    info->releaseScalerIdCount = vkd3d_metalfx_released_count;
++    vkd3d_metalfx_released_count = 0;
++    spinlock_release(&vkd3d_metalfx_release_lock);
++    info->pReleaseScalerIds = released;
++
++    d3d12_command_list_metalfx_scale(list, info, resources, VK_METALFX_IMAGE_COUNT_MVK);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_TemporalUpscale(IMTLD3D12CommandListExt *iface,
++        const MTL_TEMPORAL_UPSCALE_D3D12_DESC *desc, IMTLD3D12Upscaler **upscaler)
++{
++    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    struct d3d12_resource *resources[VK_METALFX_IMAGE_COUNT_MVK] = {0};
++    VkMetalFXScaleInfoMVK info;
++    static bool warned;
++
++    TRACE("iface %p, desc %p, upscaler %p.\n", iface, desc, upscaler);
++
++    if (!desc || !upscaler || !desc->Color || !desc->Depth || !desc->MotionVector || !desc->Output)
++        return E_INVALIDARG;
++    if (!vkd3d_metalfx_driver_has(list->device, VK_MVK_METALFX_DRIVER_INFO))
++        return E_NOTIMPL;
++    if (desc->MotionVectorInDisplayRes && !warned)
++    {
++        warned = true;
++        WARN("MetalFX: motion vectors at the output resolution are not supported yet.\n");
++    }
++
++    memset(&info, 0, sizeof(info));
++    info.sType = VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK;
++    if (!vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_COLOR_MVK, desc->Color, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_DEPTH_MVK, desc->Depth, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_MOTION_MVK, desc->MotionVector, true) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_OUTPUT_MVK, desc->Output, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_EXPOSURE_MVK, desc->ExposureTexture, false))
++        return E_INVALIDARG;
++    if (!(info.scalerId = vkd3d_metalfx_upscaler_id(upscaler)))
++        return E_OUTOFMEMORY;
++
++    info.scalerType = VK_METALFX_SCALER_TYPE_TEMPORAL_MVK;
++    info.flags = (desc->AutoExposure ? VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK : 0) |
++            (desc->InReset ? VK_METALFX_SCALE_RESET_BIT_MVK : 0) |
++            (desc->DepthReversed ? VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK : 0);
++    info.inputContentWidth = desc->InputContentWidth;
++    info.inputContentHeight = desc->InputContentHeight;
++    info.motionVectorScaleX = desc->MotionVectorScaleX;
++    info.motionVectorScaleY = desc->MotionVectorScaleY;
++    info.jitterOffsetX = desc->JitterOffsetX;
++    info.jitterOffsetY = desc->JitterOffsetY;
++    info.preExposure = desc->PreExposure;
++    vkd3d_metalfx_record(list, &info, resources);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_DenoisedUpscale(IMTLD3D12CommandListExt *iface,
++        const MTL_DENOISED_UPSCALE_D3D12_DESC *desc, IMTLD3D12Upscaler **upscaler)
++{
++    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    struct d3d12_resource *resources[VK_METALFX_IMAGE_COUNT_MVK] = {0};
++    ID3D12Resource *roughness;
++    VkMetalFXScaleInfoMVK info;
++    static bool warned;
++
++    TRACE("iface %p, desc %p, upscaler %p.\n", iface, desc, upscaler);
++
++    roughness = desc && desc->RoughnessInNormalAlpha ? desc->Normals : desc ? desc->Roughness : NULL;
++    if (!desc || !upscaler || !desc->Color || !desc->Depth || !desc->MotionVector || !desc->Output ||
++            !desc->DiffuseAlbedo || !desc->SpecularAlbedo || !desc->Normals || !roughness)
++        return E_INVALIDARG;
++    if (!vkd3d_metalfx_driver_has(list->device, VK_MVK_METALFX_DENOISED_DRIVER_INFO))
++        return E_NOTIMPL;
++    if (desc->RoughnessInNormalAlpha && !warned)
++    {
++        warned = true;
++        WARN("MetalFX: roughness in the normals' alpha is read from their first channel.\n");
++    }
++
++    memset(&info, 0, sizeof(info));
++    info.sType = VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK;
++    if (!vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_COLOR_MVK, desc->Color, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_DEPTH_MVK, desc->Depth, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_MOTION_MVK, desc->MotionVector, true) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_OUTPUT_MVK, desc->Output, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_EXPOSURE_MVK, desc->ExposureTexture, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK, desc->DiffuseAlbedo, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_SPECULAR_ALBEDO_MVK, desc->SpecularAlbedo, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_NORMALS_MVK, desc->Normals, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_ROUGHNESS_MVK, roughness, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_SPECULAR_HIT_DISTANCE_MVK,
++                    desc->SpecularHitDistance, false))
++        return E_INVALIDARG;
++    if (!(info.scalerId = vkd3d_metalfx_upscaler_id(upscaler)))
++        return E_OUTOFMEMORY;
++
++    info.scalerType = VK_METALFX_SCALER_TYPE_DENOISED_MVK;
++    info.flags = (desc->AutoExposure ? VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK : 0) |
++            (desc->InReset ? VK_METALFX_SCALE_RESET_BIT_MVK : 0) |
++            (desc->DepthReversed ? VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK : 0);
++    info.motionVectorScaleX = desc->MotionVectorScaleX;
++    info.motionVectorScaleY = desc->MotionVectorScaleY;
++    info.jitterOffsetX = desc->JitterOffsetX;
++    info.jitterOffsetY = desc->JitterOffsetY;
++    info.preExposure = desc->PreExposure;
++    memcpy(info.worldToViewMatrix, desc->WorldToView, sizeof(info.worldToViewMatrix));
++    memcpy(info.viewToClipMatrix, desc->ViewToClip, sizeof(info.viewToClipMatrix));
++    vkd3d_metalfx_record(list, &info, resources);
++    return S_OK;
++}
++
++CONST_VTBL struct IMTLD3D12CommandListExtVtbl d3d12_command_list_metalfx_vtbl =
++{
++    /* IUnknown methods */
++    d3d12_command_list_metalfx_QueryInterface,
++    d3d12_command_list_metalfx_AddRef,
++    d3d12_command_list_metalfx_Release,
++
++    /* IMTLD3D12CommandListExt methods */
++    d3d12_command_list_metalfx_SupportsTemporalUpscale,
++    d3d12_command_list_metalfx_SupportsDenoisedUpscale,
++    d3d12_command_list_metalfx_TemporalUpscale,
++    d3d12_command_list_metalfx_DenoisedUpscale,
++};
++
++/* vkd3d.conf: the file VKD3D_CONFIG_FILE names, else vkd3d.conf in the working directory, in dxvk.conf's form:
++ * "key = value" lines, those after a "[program.exe]" line for that program only. MetalSharp writes the same MetalFX
++ * lines there as in mullion.conf. Returns the value of the first key found (program lines over global ones). */
++static bool vkd3d_metalfx_conf_value(const char * const *keys, unsigned int key_count, char *value, size_t value_size)
++{
++    char path[VKD3D_PATH_MAX], program[VKD3D_PATH_MAX], line[512], found[2][128];
++    unsigned int best[2] = {~0u, ~0u}, scope = 0, i;
++    bool in_section = true;
++    char *key, *val, *end;
++    FILE *file;
++
++    if (!vkd3d_get_env_var("VKD3D_CONFIG_FILE", path, sizeof(path)) || !*path)
++        strcpy(path, "vkd3d.conf");
++    if (!(file = fopen(path, "r")))
++        return false;
++    if (!vkd3d_get_program_name(program))
++        program[0] = '\0';
++
++    /* scope 0: lines before any section, 1: lines of this program's section */
++    while (fgets(line, sizeof(line), file))
++    {
++        for (key = line; *key == ' ' || *key == '\t'; key++);
++        for (end = key + strlen(key); end > key && strchr("\r\n \t", end[-1]); end--);
++        *end = '\0';
++        if (!*key || *key == '#')
++            continue;
++        if (*key == '[')
++        {
++            if (end > key + 1 && end[-1] == ']')
++                end[-1] = '\0';
++            in_section = program[0] && !strcasecmp(key + 1, program);
++            scope = 1;
++            continue;
++        }
++        if (!in_section || !(val = strchr(key, '=')))
++            continue;
++        for (end = val; end > key && (end[-1] == ' ' || end[-1] == '\t'); end--);
++        *end = '\0';
++        for (val++; *val == ' ' || *val == '\t'; val++);
++        if (*val == '"' && strlen(val) >= 2 && val[strlen(val) - 1] == '"')
++        {
++            val[strlen(val) - 1] = '\0';
++            val++;
++        }
++        for (i = 0; i < key_count && i < best[scope]; i++)
++        {
++            if (!strcmp(key, keys[i]))
++            {
++                best[scope] = i;
++                vkd3d_strlcpy(found[scope], sizeof(found[scope]), val);
++                break;
++            }
++        }
++    }
++    fclose(file);
++
++    for (scope = 2; scope-- > 0;)
++    {
++        if (best[scope] != ~0u)
++        {
++            vkd3d_strlcpy(value, value_size, found[scope]);
++            return true;
++        }
++    }
++    return false;
++}
++
++/* MetalFX spatial upscaling of the swapchain to the display (d3d12.metalSpatialUpscale, or d3d11's, in vkd3d.conf) */
++bool vkd3d_metalfx_spatial_requested(void)
++{
++    static const char * const keys[] = {"d3d12.metalSpatialUpscale", "d3d11.metalSpatialUpscale"};
++    static int requested = -1;
++    char value[32];
++
++    if (requested < 0)
++    {
++        requested = vkd3d_metalfx_conf_value(keys, ARRAY_SIZE(keys), value, sizeof(value)) &&
++                (!strcasecmp(value, "true") || !strcmp(value, "1") || !strcasecmp(value, "yes"));
++        if (requested)
++            INFO("MetalFX spatial upscaling requested by vkd3d.conf.\n");
++    }
++    return requested;
++}
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 2c6e9c7e..ac03e6c1 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -2090,6 +2090,7 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+     VkPhysicalDevice vk_physical_device = chain->queue->device->vk_physical_device;
+     VkSwapchainLatencyCreateInfoNV swapchain_latency_create_info;
++    VkSwapchainMetalFXSpatialCreateInfoMVK metalfx_create_info;
+     VkSwapchainPresentModesCreateInfoKHR present_modes_info;
+     VkDevice vk_device = chain->queue->device->vk_device;
+     VkCommandPoolCreateInfo command_pool_create_info;
+@@ -2243,6 +2244,22 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
+     swapchain_create_info.imageExtent.height = max(swapchain_create_info.imageExtent.height, surface_caps.minImageExtent.height);
+     swapchain_create_info.imageExtent.height = min(swapchain_create_info.imageExtent.height, surface_caps.maxImageExtent.height);
+ 
++    /* MetalSharp: MetalFX spatial upscaling (vkd3d.conf). The swapchain keeps the back buffers' size, which MoltenVK
++     * upscales to the display's at present, instead of the window's, which the blit would stretch to. */
++    if (vkd3d_metalfx_spatial_requested() && vkd3d_metalfx_driver_has(chain->queue->device, VK_MVK_METALFX_DRIVER_INFO) &&
++            chain->desc.Width <= swapchain_create_info.imageExtent.width &&
++            chain->desc.Height <= swapchain_create_info.imageExtent.height &&
++            chain->desc.Width >= surface_caps.minImageExtent.width &&
++            chain->desc.Height >= surface_caps.minImageExtent.height)
++    {
++        swapchain_create_info.imageExtent.width = chain->desc.Width;
++        swapchain_create_info.imageExtent.height = chain->desc.Height;
++        memset(&metalfx_create_info, 0, sizeof(metalfx_create_info));
++        metalfx_create_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_METALFX_SPATIAL_CREATE_INFO_MVK;
++        metalfx_create_info.enable = VK_TRUE;
++        vk_prepend_struct(&swapchain_create_info, &metalfx_create_info);
++    }
++
+     if (chain->queue->device->vk_info.NV_low_latency2)
+     {
+         memset(&swapchain_latency_create_info, 0, sizeof(swapchain_latency_create_info));
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index bc2f5c19..c950c8d9 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -39,6 +39,7 @@
+ #include "vkd3d_command_list_vkd3d_ext.h"
+ #include "vkd3d_command_queue_vkd3d_ext.h"
+ #include "vkd3d_device_vkd3d_ext.h"
++#include "vkd3d_metalfx.h"
+ #include "vkd3d_string.h"
+ #include "vkd3d_file_utils.h"
+ #include "vkd3d_native_sync_handle.h"
+@@ -3438,6 +3439,7 @@ struct d3d12_command_list
+ {
+     d3d12_command_list_iface ID3D12GraphicsCommandList_iface;
+     d3d12_command_list_vkd3d_ext_iface ID3D12GraphicsCommandListExt_iface;
++    IMTLD3D12CommandListExt IMTLD3D12CommandListExt_iface; /* MetalSharp: MetalFX for the NGX bridge (metalfx.c) */
+     LONG refcount;
+ 
+     D3D12_COMMAND_LIST_TYPE type;
+@@ -3605,6 +3607,11 @@ void d3d12_command_list_invalidate_root_parameters(struct d3d12_command_list *li
+ void d3d12_command_list_invalidate_descriptor_heap(struct d3d12_command_list *list);
+ void d3d12_command_list_update_global_descriptor_heap(struct d3d12_command_list *list);
+ void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list);
++void d3d12_command_list_metalfx_scale(struct d3d12_command_list *list, const VkMetalFXScaleInfoMVK *info,
++        struct d3d12_resource **resources, unsigned int resource_count);
++ULONG STDMETHODCALLTYPE d3d12_command_list_metalfx_AddRef(IMTLD3D12CommandListExt *iface);
++bool vkd3d_metalfx_driver_has(const struct d3d12_device *device, const char *word);
++bool vkd3d_metalfx_spatial_requested(void);
+ void d3d12_command_list_meta_push_data(struct d3d12_command_list *list,
+         VkCommandBuffer vk_command_buffer,
+         VkPipelineLayout vk_pipeline_layout, VkShaderStageFlags stages,
+-- 
+2.54.0 (Apple Git-157)
+

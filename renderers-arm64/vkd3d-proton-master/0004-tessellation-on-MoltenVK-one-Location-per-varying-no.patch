@@ -1,0 +1,210 @@
+From b8fe24f2e1c5b3ae169888a58064ca3026b2dfc4 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 14:39:28 +0200
+Subject: [PATCH 04/27] tessellation on MoltenVK: one Location per varying, no
+ Component decorations
+
+SPIRV-Cross, which MoltenVK uses to translate SPIR-V to Metal, throws "Component decoration is not supported in
+tessellation shaders", and dxil-spirv packs D3D signature elements that share a register into one Location with
+different Components (Microsoft Flight Simulator 2024 terrain). On MoltenVK (driver ID check) the stage IO map of a
+tessellation pipeline hands out dense Locations instead, the same on both sides of every link.
+---
+ include/vkd3d_shader.h     |  4 +++
+ libs/vkd3d-shader/dxil.c   | 35 +++++++++++++++++++++--
+ libs/vkd3d/state.c         | 57 ++++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/vkd3d_private.h |  2 ++
+ 4 files changed, 96 insertions(+), 2 deletions(-)
+
+diff --git a/include/vkd3d_shader.h b/include/vkd3d_shader.h
+index 892a33f2..0525a43d 100644
+--- a/include/vkd3d_shader.h
++++ b/include/vkd3d_shader.h
+@@ -284,6 +284,10 @@ struct vkd3d_shader_stage_io_map
+     struct vkd3d_shader_stage_io_entry *entries;
+     size_t entries_size;
+     size_t entry_count;
++    /* Highball: when set, the producing stage gives every user varying its own Location and no Component
++     * (MoltenVK cannot translate Component decorations in tessellation stages). */
++    unsigned int flatten_components;
++    unsigned int next_location;
+ };
+ 
+ struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,
+diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
+index 02beb74d..1b08e3be 100644
+--- a/libs/vkd3d-shader/dxil.c
++++ b/libs/vkd3d-shader/dxil.c
+@@ -475,18 +475,39 @@ static dxil_spv_bool dxil_output_remap(void *userdata, const dxil_spv_d3d_stream
+     return DXIL_SPV_TRUE;
+ }
+ 
++/* Highball: in a flattened tessellation chain, patch constants and control points can share a semantic. */
++static const char *dxil_shader_stage_io_key(const struct vkd3d_shader_stage_io_map *io_map,
++        const dxil_spv_d3d_shader_stage_io *d3d_io, const dxil_spv_vulkan_shader_stage_io *vk_io,
++        char *buffer, size_t size)
++{
++    if (!io_map->flatten_components || !(vk_io->flags & DXIL_SPV_SHADER_STAGE_IO_PER_PRIMITIVE))
++        return d3d_io->semantic;
++    snprintf(buffer, size, "@patch@%s", d3d_io->semantic);
++    return buffer;
++}
++
+ static dxil_spv_bool dxil_shader_stage_output_capture(void *userdata, const dxil_spv_d3d_shader_stage_io *d3d_input,
+                                                       dxil_spv_vulkan_shader_stage_io *vk_input)
+ {
+     struct vkd3d_shader_stage_io_map *io_map = userdata;
+     struct vkd3d_shader_stage_io_entry *e;
++    char key[256];
+ 
+-    if (!(e = vkd3d_shader_stage_io_map_append(io_map, d3d_input->semantic, d3d_input->semantic_index)))
++    if (!(e = vkd3d_shader_stage_io_map_append(io_map,
++            dxil_shader_stage_io_key(io_map, d3d_input, vk_input, key, sizeof(key)), d3d_input->semantic_index)))
+     {
+         ERR("Duplicate semantic %s (%u).\n", d3d_input->semantic, d3d_input->semantic_index);
+         return false;
+     }
+ 
++    if (io_map->flatten_components)
++    {
++        /* Every element gets Locations of its own, no Component decoration. */
++        vk_input->location = io_map->next_location;
++        vk_input->component = 0;
++        io_map->next_location += d3d_input->rows ? d3d_input->rows : 1;
++    }
++
+     e->vk_location = vk_input->location;
+     e->vk_component = vk_input->component;
+     e->vk_flags = vk_input->flags;
+@@ -498,9 +519,19 @@ static dxil_spv_bool dxil_shader_stage_input_remap(void *userdata, const dxil_sp
+ {
+     const struct vkd3d_shader_stage_io_map *io_map = userdata;
+     const struct vkd3d_shader_stage_io_entry *e;
++    char key[256];
+ 
+-    if (!(e = vkd3d_shader_stage_io_map_find(io_map, d3d_input->semantic, d3d_input->semantic_index)))
++    if (!(e = vkd3d_shader_stage_io_map_find(io_map,
++            dxil_shader_stage_io_key(io_map, d3d_input, vk_input, key, sizeof(key)), d3d_input->semantic_index)))
+     {
++        if (io_map->flatten_components)
++        {
++            /* Not written by the previous stage: a Location nobody writes, the value is undefined as in D3D. */
++            WARN("Semantic %s (%u) not written by the previous stage.\n", d3d_input->semantic, d3d_input->semantic_index);
++            vk_input->location = io_map->next_location;
++            vk_input->component = 0;
++            return true;
++        }
+         ERR("Undefined semantic %s (%u).\n", d3d_input->semantic, d3d_input->semantic_index);
+         return false;
+     }
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index b640fb76..4c3e8e2f 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -2832,6 +2832,8 @@ static void d3d12_pipeline_state_free_cached_desc(struct d3d12_graphics_pipeline
+     unsigned int i;
+     vkd3d_shader_transform_feedback_info_free(cached_desc->xfb_info);
+     vkd3d_shader_stage_io_map_free(&cached_desc->stage_io_map_ms_ps);
++    for (i = 0; i < ARRAY_SIZE(cached_desc->stage_io_map_tess); i++)
++        vkd3d_shader_stage_io_map_free(&cached_desc->stage_io_map_tess[i]);
+     while (cached_desc->bytecode_duped_mask)
+     {
+         i = vkd3d_bitmask_iter32(&cached_desc->bytecode_duped_mask);
+@@ -3071,6 +3073,23 @@ static HRESULT vkd3d_load_spirv_from_cached_state(struct d3d12_device *device,
+     return hr;
+ }
+ 
++/* Highball: MoltenVK's SPIRV-Cross throws on Component decorations in tessellation stages. */
++static bool d3d12_pipeline_state_flattens_tess_io(const struct d3d12_pipeline_state *state,
++        const struct d3d12_device *device)
++{
++    return state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS &&
++            (state->graphics.stage_flags & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT) &&
++            device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK;
++}
++
++static void d3d12_pipeline_state_free_tess_io_maps(struct d3d12_pipeline_state *state)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(state->graphics.cached_desc.stage_io_map_tess); i++)
++        vkd3d_shader_stage_io_map_free(&state->graphics.cached_desc.stage_io_map_tess[i]);
++}
++
+ static void d3d12_pipeline_state_init_shader_interface(struct d3d12_pipeline_state *state,
+         struct d3d12_device *device,
+         VkShaderStageFlagBits stage,
+@@ -3116,6 +3135,39 @@ static void d3d12_pipeline_state_init_shader_interface(struct d3d12_pipeline_sta
+         shader_interface->patch_location_offset = state->graphics.cached_desc.patch_location_offset;
+     }
+ 
++    if (d3d12_pipeline_state_flattens_tess_io(state, device))
++    {
++        struct vkd3d_shader_stage_io_map *maps = state->graphics.cached_desc.stage_io_map_tess;
++        bool has_gs = !!(state->graphics.stage_flags & VK_SHADER_STAGE_GEOMETRY_BIT);
++
++        switch (stage)
++        {
++            case VK_SHADER_STAGE_VERTEX_BIT:
++                shader_interface->stage_output_map = &maps[0];
++                break;
++            case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
++                shader_interface->stage_input_map = &maps[0];
++                shader_interface->stage_output_map = &maps[1];
++                break;
++            case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
++                shader_interface->stage_input_map = &maps[1];
++                shader_interface->stage_output_map = &maps[2];
++                break;
++            case VK_SHADER_STAGE_GEOMETRY_BIT:
++                shader_interface->stage_input_map = &maps[2];
++                shader_interface->stage_output_map = &maps[3];
++                break;
++            case VK_SHADER_STAGE_FRAGMENT_BIT:
++                shader_interface->stage_input_map = &maps[has_gs ? 3 : 2];
++                break;
++            default:
++                break;
++        }
++
++        if (shader_interface->stage_output_map)
++            shader_interface->stage_output_map->flatten_components = 1;
++    }
++
+ #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+     shader_interface->descriptor_qa_payload_binding = &root_signature->descriptor_qa_payload_binding;
+     shader_interface->descriptor_qa_control_binding = &root_signature->descriptor_qa_control_binding;
+@@ -3316,6 +3368,9 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
+     {
+         TRACE("Calling vkd3d_shader_compile_dxbc.\n");
+ 
++        if (stage == VK_SHADER_STAGE_VERTEX_BIT && d3d12_pipeline_state_flattens_tess_io(state, device))
++            d3d12_pipeline_state_free_tess_io_maps(state);
++
+         d3d12_pipeline_state_init_shader_interface(state, device, stage, &shader_interface);
+         shader_interface.flags |= vkd3d_descriptor_debug_get_shader_interface_flags(
+                 device->descriptor_qa_global_info, dxbc.code, dxbc.size);
+@@ -3333,6 +3388,8 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
+         {
+             /* At this point we don't need the map anymore. */
+             vkd3d_shader_stage_io_map_free(&state->graphics.cached_desc.stage_io_map_ms_ps);
++            if (d3d12_pipeline_state_flattens_tess_io(state, device))
++                d3d12_pipeline_state_free_tess_io_maps(state);
+         }
+         else if (stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)
+         {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index af851796..c8371ebd 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2304,6 +2304,8 @@ struct d3d12_graphics_pipeline_state_cached_desc
+     VkShaderStageFlagBits xfb_stage;
+     struct vkd3d_shader_transform_feedback_info *xfb_info;
+     struct vkd3d_shader_stage_io_map stage_io_map_ms_ps;
++    /* Highball: VS->HS, HS->DS, DS->GS, (GS or DS)->PS links of a tessellation pipeline on MoltenVK. */
++    struct vkd3d_shader_stage_io_map stage_io_map_tess[4];
+ 
+     D3D12_SHADER_BYTECODE bytecode[VKD3D_MAX_SHADER_STAGES];
+     VkShaderStageFlagBits bytecode_stages[VKD3D_MAX_SHADER_STAGES];
+-- 
+2.54.0 (Apple Git-157)
+

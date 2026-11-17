@@ -1,0 +1,364 @@
+From 4c02ebcacf95478ee62ab4993533ffb8a75e5d9e Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Sun, 1 Nov 2026 17:04:01 -0700
+Subject: [PATCH 13/27] MetalSharp: the MetalFX interface is VKD3D-Proton's own
+ (ID3D12GraphicsCommandListMetalFX), for this lane's NGX core
+
+---
+ include/private/vkd3d_metalfx.h | 66 ++++++++++++++++-----------------
+ libs/vkd3d/command.c            | 10 ++---
+ libs/vkd3d/metalfx.c            | 62 +++++++++++++++----------------
+ libs/vkd3d/vkd3d_private.h      |  5 ++-
+ 4 files changed, 71 insertions(+), 72 deletions(-)
+
+diff --git a/include/private/vkd3d_metalfx.h b/include/private/vkd3d_metalfx.h
+index 28aea6f3..9cddedf7 100644
+--- a/include/private/vkd3d_metalfx.h
++++ b/include/private/vkd3d_metalfx.h
+@@ -1,9 +1,9 @@
+ /*
+- * MetalSharp: MetalFX upscaling recorded in a D3D12 command list, for the NGX bridge (Mullion's nvngx.dll).
++ * MetalSharp: MetalFX upscaling recorded in a D3D12 command list (ID3D12GraphicsCommandListMetalFX), for
++ * VKD3D-Proton-MacOS's NGX core (ngx/nvngx), which runs DLSS Super Resolution on MetalFX's temporal scaler and Ray
++ * Reconstruction on its denoised scaler. MoltenVK runs the scalers (mvk_metalfx.h).
+  *
+- * The interface is Mullion's IMTLD3D12CommandListExt (src/d3d12/d3d12_interfaces.hpp in Mullion), with the same IID,
+- * methods and descriptions, so that Mullion's NGX core drives DLSS Super Resolution and Ray Reconstruction with
+- * VKD3D-Proton's command lists as it does with Mullion's. MoltenVK runs the scalers (mvk_metalfx.h).
++ * This header is C, and the NGX core (C++) includes it as it is.
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -23,9 +23,7 @@
+ #ifndef __VKD3D_METALFX_H
+ #define __VKD3D_METALFX_H
+ 
+-#include "mvk_metalfx.h"
+-
+-typedef struct MTL_TEMPORAL_UPSCALE_D3D12_DESC
++typedef struct VKD3D_METALFX_TEMPORAL_DESC
+ {
+     UINT InputContentWidth;  /* 0: the color's width */
+     UINT InputContentHeight; /* 0: the color's height */
+@@ -43,9 +41,9 @@ typedef struct MTL_TEMPORAL_UPSCALE_D3D12_DESC
+     FLOAT PreExposure;
+     FLOAT JitterOffsetX;
+     FLOAT JitterOffsetY;
+-} MTL_TEMPORAL_UPSCALE_D3D12_DESC;
++} VKD3D_METALFX_TEMPORAL_DESC;
+ 
+-typedef struct MTL_DENOISED_UPSCALE_D3D12_DESC
++typedef struct VKD3D_METALFX_DENOISED_DESC
+ {
+     BOOL AutoExposure;
+     BOOL InReset;
+@@ -69,44 +67,44 @@ typedef struct MTL_DENOISED_UPSCALE_D3D12_DESC
+     /* row-major, of row vectors (D3D's) */
+     FLOAT WorldToView[16];
+     FLOAT ViewToClip[16];
+-} MTL_DENOISED_UPSCALE_D3D12_DESC;
++} VKD3D_METALFX_DENOISED_DESC;
+ 
+-/* A feature's scaler (a C++ class with one virtual method in Mullion), which its owner destroys when done with it. */
+-typedef struct IMTLD3D12Upscaler IMTLD3D12Upscaler;
++/* A feature's scaler, which its owner destroys when it is done with the feature. */
++typedef struct ID3D12MetalFXScaler ID3D12MetalFXScaler;
+ 
+-typedef struct IMTLD3D12UpscalerVtbl
++typedef struct ID3D12MetalFXScalerVtbl
+ {
+-    void (STDMETHODCALLTYPE *Destroy)(IMTLD3D12Upscaler *This);
+-} IMTLD3D12UpscalerVtbl;
++    void (STDMETHODCALLTYPE *Destroy)(ID3D12MetalFXScaler *This);
++} ID3D12MetalFXScalerVtbl;
+ 
+-struct IMTLD3D12Upscaler
++struct ID3D12MetalFXScaler
+ {
+-    const IMTLD3D12UpscalerVtbl *lpVtbl;
++    const ID3D12MetalFXScalerVtbl *lpVtbl;
+ };
+ 
+-typedef struct IMTLD3D12CommandListExt IMTLD3D12CommandListExt;
++typedef struct ID3D12GraphicsCommandListMetalFX ID3D12GraphicsCommandListMetalFX;
+ 
+-typedef struct IMTLD3D12CommandListExtVtbl
++typedef struct ID3D12GraphicsCommandListMetalFXVtbl
+ {
+-    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IMTLD3D12CommandListExt *This, REFIID riid, void **object);
+-    ULONG (STDMETHODCALLTYPE *AddRef)(IMTLD3D12CommandListExt *This);
+-    ULONG (STDMETHODCALLTYPE *Release)(IMTLD3D12CommandListExt *This);
+-    BOOL (STDMETHODCALLTYPE *SupportsTemporalUpscale)(IMTLD3D12CommandListExt *This);
+-    BOOL (STDMETHODCALLTYPE *SupportsDenoisedUpscale)(IMTLD3D12CommandListExt *This);
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ID3D12GraphicsCommandListMetalFX *This, REFIID riid, void **object);
++    ULONG (STDMETHODCALLTYPE *AddRef)(ID3D12GraphicsCommandListMetalFX *This);
++    ULONG (STDMETHODCALLTYPE *Release)(ID3D12GraphicsCommandListMetalFX *This);
++    BOOL (STDMETHODCALLTYPE *SupportsTemporalUpscale)(ID3D12GraphicsCommandListMetalFX *This);
++    BOOL (STDMETHODCALLTYPE *SupportsDenoisedUpscale)(ID3D12GraphicsCommandListMetalFX *This);
+     /* *upscaler is a feature's scaler, made at its first upscale */
+-    HRESULT (STDMETHODCALLTYPE *TemporalUpscale)(IMTLD3D12CommandListExt *This,
+-            const MTL_TEMPORAL_UPSCALE_D3D12_DESC *desc, IMTLD3D12Upscaler **upscaler);
+-    HRESULT (STDMETHODCALLTYPE *DenoisedUpscale)(IMTLD3D12CommandListExt *This,
+-            const MTL_DENOISED_UPSCALE_D3D12_DESC *desc, IMTLD3D12Upscaler **upscaler);
+-} IMTLD3D12CommandListExtVtbl;
++    HRESULT (STDMETHODCALLTYPE *TemporalUpscale)(ID3D12GraphicsCommandListMetalFX *This,
++            const VKD3D_METALFX_TEMPORAL_DESC *desc, ID3D12MetalFXScaler **upscaler);
++    HRESULT (STDMETHODCALLTYPE *DenoisedUpscale)(ID3D12GraphicsCommandListMetalFX *This,
++            const VKD3D_METALFX_DENOISED_DESC *desc, ID3D12MetalFXScaler **upscaler);
++} ID3D12GraphicsCommandListMetalFXVtbl;
+ 
+-struct IMTLD3D12CommandListExt
++struct ID3D12GraphicsCommandListMetalFX
+ {
+-    const IMTLD3D12CommandListExtVtbl *lpVtbl;
++    const ID3D12GraphicsCommandListMetalFXVtbl *lpVtbl;
+ };
+ 
+-/* 987426c0-bca1-4bfb-8e8a-1da3257f8467 */
+-static const GUID IID_IMTLD3D12CommandListExt =
+-        {0x987426c0, 0xbca1, 0x4bfb, {0x8e, 0x8a, 0x1d, 0xa3, 0x25, 0x7f, 0x84, 0x67}};
++/* b2697de8-21af-4406-91f8-73a2fdd27029 */
++static const GUID IID_ID3D12GraphicsCommandListMetalFX =
++        {0xb2697de8, 0x21af, 0x4406, {0x91, 0xf8, 0x73, 0xa2, 0xfd, 0xd2, 0x70, 0x29}};
+ 
+ #endif
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index b41f1533..42bbd5e9 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -6571,10 +6571,10 @@ HRESULT STDMETHODCALLTYPE d3d12_command_list_QueryInterface(d3d12_command_list_i
+         return S_OK;
+     }
+ 
+-    if (IsEqualGUID(iid, &IID_IMTLD3D12CommandListExt))
++    if (IsEqualGUID(iid, &IID_ID3D12GraphicsCommandListMetalFX))
+     {
+-        d3d12_command_list_metalfx_AddRef(&command_list->IMTLD3D12CommandListExt_iface);
+-        *object = &command_list->IMTLD3D12CommandListExt_iface;
++        d3d12_command_list_metalfx_AddRef(&command_list->ID3D12GraphicsCommandListMetalFX_iface);
++        *object = &command_list->ID3D12GraphicsCommandListMetalFX_iface;
+         return S_OK;
+     }
+ 
+@@ -23344,7 +23344,7 @@ static struct d3d12_command_list *unsafe_impl_from_ID3D12CommandList(ID3D12Comma
+ }
+ 
+ extern CONST_VTBL struct ID3D12GraphicsCommandListExt2Vtbl d3d12_command_list_vkd3d_ext_vtbl;
+-extern CONST_VTBL struct IMTLD3D12CommandListExtVtbl d3d12_command_list_metalfx_vtbl;
++extern CONST_VTBL struct ID3D12GraphicsCommandListMetalFXVtbl d3d12_command_list_metalfx_vtbl;
+ 
+ static void d3d12_command_list_init_attachment_info(VkRenderingAttachmentInfo *attachment_info)
+ {
+@@ -23446,7 +23446,7 @@ static HRESULT d3d12_command_list_init(struct d3d12_command_list *list, struct d
+     list->type = type;
+ 
+     list->ID3D12GraphicsCommandListExt_iface.lpVtbl = &d3d12_command_list_vkd3d_ext_vtbl;
+-    list->IMTLD3D12CommandListExt_iface.lpVtbl = &d3d12_command_list_metalfx_vtbl;
++    list->ID3D12GraphicsCommandListMetalFX_iface.lpVtbl = &d3d12_command_list_metalfx_vtbl;
+ 
+     hash_map_init(&list->query_resolve_lut,
+             vkd3d_query_lookup_entry_hash,
+diff --git a/libs/vkd3d/metalfx.c b/libs/vkd3d/metalfx.c
+index 48609eaf..ac7a4e38 100644
+--- a/libs/vkd3d/metalfx.c
++++ b/libs/vkd3d/metalfx.c
+@@ -1,7 +1,7 @@
+ /*
+- * MetalSharp: MetalFX upscaling recorded in a D3D12 command list (IMTLD3D12CommandListExt, vkd3d_metalfx.h), which
+- * Mullion's NGX core uses for DLSS Super Resolution (MetalFX's temporal scaler) and Ray Reconstruction (its denoised
+- * scaler). The scales go to MoltenVK chained to a barrier (mvk_metalfx.h).
++ * MetalSharp: MetalFX upscaling recorded in a D3D12 command list (ID3D12GraphicsCommandListMetalFX, vkd3d_metalfx.h),
++ * which VKD3D-Proton-MacOS's NGX core uses for DLSS Super Resolution (MetalFX's temporal scaler) and Ray
++ * Reconstruction (its denoised scaler). The scales go to MoltenVK chained to a barrier (mvk_metalfx.h).
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -27,7 +27,7 @@
+  * releases wait here, for any device's next scale to pass on (an id a device does not have is nothing to it). */
+ struct vkd3d_metalfx_upscaler
+ {
+-    IMTLD3D12Upscaler IMTLD3D12Upscaler_iface;
++    ID3D12MetalFXScaler ID3D12MetalFXScaler_iface;
+     uint64_t id;
+ };
+ 
+@@ -36,9 +36,9 @@ static uint64_t vkd3d_metalfx_released_ids[64];
+ static uint32_t vkd3d_metalfx_released_count;
+ static uint64_t vkd3d_metalfx_next_id;
+ 
+-static void STDMETHODCALLTYPE vkd3d_metalfx_upscaler_Destroy(IMTLD3D12Upscaler *iface)
++static void STDMETHODCALLTYPE vkd3d_metalfx_upscaler_Destroy(ID3D12MetalFXScaler *iface)
+ {
+-    struct vkd3d_metalfx_upscaler *upscaler = CONTAINING_RECORD(iface, struct vkd3d_metalfx_upscaler, IMTLD3D12Upscaler_iface);
++    struct vkd3d_metalfx_upscaler *upscaler = CONTAINING_RECORD(iface, struct vkd3d_metalfx_upscaler, ID3D12MetalFXScaler_iface);
+ 
+     spinlock_acquire(&vkd3d_metalfx_release_lock);
+     if (vkd3d_metalfx_released_count < ARRAY_SIZE(vkd3d_metalfx_released_ids))
+@@ -47,13 +47,13 @@ static void STDMETHODCALLTYPE vkd3d_metalfx_upscaler_Destroy(IMTLD3D12Upscaler *
+     vkd3d_free(upscaler);
+ }
+ 
+-static const IMTLD3D12UpscalerVtbl vkd3d_metalfx_upscaler_vtbl =
++static const ID3D12MetalFXScalerVtbl vkd3d_metalfx_upscaler_vtbl =
+ {
+     vkd3d_metalfx_upscaler_Destroy,
+ };
+ 
+ /* The id of the feature's scaler, made at its first scale. */
+-static uint64_t vkd3d_metalfx_upscaler_id(IMTLD3D12Upscaler **iface)
++static uint64_t vkd3d_metalfx_upscaler_id(ID3D12MetalFXScaler **iface)
+ {
+     struct vkd3d_metalfx_upscaler *upscaler;
+ 
+@@ -61,13 +61,13 @@ static uint64_t vkd3d_metalfx_upscaler_id(IMTLD3D12Upscaler **iface)
+     {
+         if ((*iface)->lpVtbl != &vkd3d_metalfx_upscaler_vtbl)
+             return 0;
+-        return CONTAINING_RECORD(*iface, struct vkd3d_metalfx_upscaler, IMTLD3D12Upscaler_iface)->id;
++        return CONTAINING_RECORD(*iface, struct vkd3d_metalfx_upscaler, ID3D12MetalFXScaler_iface)->id;
+     }
+     if (!(upscaler = vkd3d_malloc(sizeof(*upscaler))))
+         return 0;
+-    upscaler->IMTLD3D12Upscaler_iface.lpVtbl = &vkd3d_metalfx_upscaler_vtbl;
++    upscaler->ID3D12MetalFXScaler_iface.lpVtbl = &vkd3d_metalfx_upscaler_vtbl;
+     upscaler->id = vkd3d_atomic_uint64_increment(&vkd3d_metalfx_next_id, vkd3d_memory_order_relaxed);
+-    *iface = &upscaler->IMTLD3D12Upscaler_iface;
++    *iface = &upscaler->ID3D12MetalFXScaler_iface;
+     return upscaler->id;
+ }
+ 
+@@ -117,9 +117,9 @@ static VkFormat vkd3d_metalfx_read_format(const struct d3d12_resource *resource,
+     }
+ }
+ 
+-static inline struct d3d12_command_list *impl_from_IMTLD3D12CommandListExt(IMTLD3D12CommandListExt *iface)
++static inline struct d3d12_command_list *impl_from_ID3D12GraphicsCommandListMetalFX(ID3D12GraphicsCommandListMetalFX *iface)
+ {
+-    return CONTAINING_RECORD(iface, struct d3d12_command_list, IMTLD3D12CommandListExt_iface);
++    return CONTAINING_RECORD(iface, struct d3d12_command_list, ID3D12GraphicsCommandListMetalFX_iface);
+ }
+ 
+ extern HRESULT STDMETHODCALLTYPE d3d12_command_list_QueryInterface(d3d12_command_list_iface *iface,
+@@ -127,34 +127,34 @@ extern HRESULT STDMETHODCALLTYPE d3d12_command_list_QueryInterface(d3d12_command
+ extern ULONG STDMETHODCALLTYPE d3d12_command_list_AddRef(d3d12_command_list_iface *iface);
+ extern ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *iface);
+ 
+-static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_QueryInterface(IMTLD3D12CommandListExt *iface,
++static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_QueryInterface(ID3D12GraphicsCommandListMetalFX *iface,
+         REFIID iid, void **object)
+ {
+-    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
+     return d3d12_command_list_QueryInterface(&list->ID3D12GraphicsCommandList_iface, iid, object);
+ }
+ 
+-ULONG STDMETHODCALLTYPE d3d12_command_list_metalfx_AddRef(IMTLD3D12CommandListExt *iface)
++ULONG STDMETHODCALLTYPE d3d12_command_list_metalfx_AddRef(ID3D12GraphicsCommandListMetalFX *iface)
+ {
+-    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
+     return d3d12_command_list_AddRef(&list->ID3D12GraphicsCommandList_iface);
+ }
+ 
+-static ULONG STDMETHODCALLTYPE d3d12_command_list_metalfx_Release(IMTLD3D12CommandListExt *iface)
++static ULONG STDMETHODCALLTYPE d3d12_command_list_metalfx_Release(ID3D12GraphicsCommandListMetalFX *iface)
+ {
+-    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
+     return d3d12_command_list_Release(&list->ID3D12GraphicsCommandList_iface);
+ }
+ 
+-static BOOL STDMETHODCALLTYPE d3d12_command_list_metalfx_SupportsTemporalUpscale(IMTLD3D12CommandListExt *iface)
++static BOOL STDMETHODCALLTYPE d3d12_command_list_metalfx_SupportsTemporalUpscale(ID3D12GraphicsCommandListMetalFX *iface)
+ {
+-    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
+     return vkd3d_metalfx_driver_has(list->device, VK_MVK_METALFX_DRIVER_INFO);
+ }
+ 
+-static BOOL STDMETHODCALLTYPE d3d12_command_list_metalfx_SupportsDenoisedUpscale(IMTLD3D12CommandListExt *iface)
++static BOOL STDMETHODCALLTYPE d3d12_command_list_metalfx_SupportsDenoisedUpscale(ID3D12GraphicsCommandListMetalFX *iface)
+ {
+-    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
+     return vkd3d_metalfx_driver_has(list->device, VK_MVK_METALFX_DENOISED_DRIVER_INFO);
+ }
+ 
+@@ -191,10 +191,10 @@ static void vkd3d_metalfx_record(struct d3d12_command_list *list, VkMetalFXScale
+     d3d12_command_list_metalfx_scale(list, info, resources, VK_METALFX_IMAGE_COUNT_MVK);
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_TemporalUpscale(IMTLD3D12CommandListExt *iface,
+-        const MTL_TEMPORAL_UPSCALE_D3D12_DESC *desc, IMTLD3D12Upscaler **upscaler)
++static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_TemporalUpscale(ID3D12GraphicsCommandListMetalFX *iface,
++        const VKD3D_METALFX_TEMPORAL_DESC *desc, ID3D12MetalFXScaler **upscaler)
+ {
+-    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
+     struct d3d12_resource *resources[VK_METALFX_IMAGE_COUNT_MVK] = {0};
+     VkMetalFXScaleInfoMVK info;
+     static bool warned;
+@@ -237,10 +237,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_TemporalUpscale(IMTL
+     return S_OK;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_DenoisedUpscale(IMTLD3D12CommandListExt *iface,
+-        const MTL_DENOISED_UPSCALE_D3D12_DESC *desc, IMTLD3D12Upscaler **upscaler)
++static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_DenoisedUpscale(ID3D12GraphicsCommandListMetalFX *iface,
++        const VKD3D_METALFX_DENOISED_DESC *desc, ID3D12MetalFXScaler **upscaler)
+ {
+-    struct d3d12_command_list *list = impl_from_IMTLD3D12CommandListExt(iface);
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
+     struct d3d12_resource *resources[VK_METALFX_IMAGE_COUNT_MVK] = {0};
+     ID3D12Resource *roughness;
+     VkMetalFXScaleInfoMVK info;
+@@ -292,14 +292,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_DenoisedUpscale(IMTL
+     return S_OK;
+ }
+ 
+-CONST_VTBL struct IMTLD3D12CommandListExtVtbl d3d12_command_list_metalfx_vtbl =
++CONST_VTBL struct ID3D12GraphicsCommandListMetalFXVtbl d3d12_command_list_metalfx_vtbl =
+ {
+     /* IUnknown methods */
+     d3d12_command_list_metalfx_QueryInterface,
+     d3d12_command_list_metalfx_AddRef,
+     d3d12_command_list_metalfx_Release,
+ 
+-    /* IMTLD3D12CommandListExt methods */
++    /* ID3D12GraphicsCommandListMetalFX methods */
+     d3d12_command_list_metalfx_SupportsTemporalUpscale,
+     d3d12_command_list_metalfx_SupportsDenoisedUpscale,
+     d3d12_command_list_metalfx_TemporalUpscale,
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index c950c8d9..2b0495e0 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -39,6 +39,7 @@
+ #include "vkd3d_command_list_vkd3d_ext.h"
+ #include "vkd3d_command_queue_vkd3d_ext.h"
+ #include "vkd3d_device_vkd3d_ext.h"
++#include "mvk_metalfx.h"
+ #include "vkd3d_metalfx.h"
+ #include "vkd3d_string.h"
+ #include "vkd3d_file_utils.h"
+@@ -3439,7 +3440,7 @@ struct d3d12_command_list
+ {
+     d3d12_command_list_iface ID3D12GraphicsCommandList_iface;
+     d3d12_command_list_vkd3d_ext_iface ID3D12GraphicsCommandListExt_iface;
+-    IMTLD3D12CommandListExt IMTLD3D12CommandListExt_iface; /* MetalSharp: MetalFX for the NGX bridge (metalfx.c) */
++    ID3D12GraphicsCommandListMetalFX ID3D12GraphicsCommandListMetalFX_iface; /* MetalSharp: MetalFX for the NGX core (metalfx.c) */
+     LONG refcount;
+ 
+     D3D12_COMMAND_LIST_TYPE type;
+@@ -3609,7 +3610,7 @@ void d3d12_command_list_update_global_descriptor_heap(struct d3d12_command_list
+ void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list);
+ void d3d12_command_list_metalfx_scale(struct d3d12_command_list *list, const VkMetalFXScaleInfoMVK *info,
+         struct d3d12_resource **resources, unsigned int resource_count);
+-ULONG STDMETHODCALLTYPE d3d12_command_list_metalfx_AddRef(IMTLD3D12CommandListExt *iface);
++ULONG STDMETHODCALLTYPE d3d12_command_list_metalfx_AddRef(ID3D12GraphicsCommandListMetalFX *iface);
+ bool vkd3d_metalfx_driver_has(const struct d3d12_device *device, const char *word);
+ bool vkd3d_metalfx_spatial_requested(void);
+ void d3d12_command_list_meta_push_data(struct d3d12_command_list *list,
+-- 
+2.54.0 (Apple Git-157)
+

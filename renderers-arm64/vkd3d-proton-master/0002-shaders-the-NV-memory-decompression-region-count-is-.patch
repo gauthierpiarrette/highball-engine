@@ -1,0 +1,59 @@
+From d052050e41e1caeedc9e7514f425190e86c3abb8 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 14:39:28 +0200
+Subject: [PATCH 02/27] shaders: the NV memory decompression region count is an
+ array, not a uvec3
+
+Metal refuses an atomic on a vector element, so these two compute shaders failed to translate on MoltenVK.
+---
+ .../shaders/cs_emit_nv_memory_decompression_regions.comp      | 4 ++--
+ .../shaders/cs_emit_nv_memory_decompression_workgroups.comp   | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp
+index 2978f0bb..192b5859 100644
+--- a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp
++++ b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_regions.comp
+@@ -43,7 +43,7 @@ struct memory_region_t {
+ 
+ layout(buffer_reference, scalar)
+ buffer memory_regions_t {
+-  uvec3 region_count;
++  uint region_count[3]; /* was uvec3: Metal refuses an atomic on a vector element (Highball msfs trial) */
+   uint  reserved;
+   memory_region_t memory_regions[];
+ };
+@@ -102,7 +102,7 @@ void main() {
+ 
+   // Allocate an output region structure from the scratch buffer
+   memory_regions_t region_buffer = memory_regions_t(scratch_buffer);
+-  uint out_index = atomicAdd(region_buffer.region_count.x, 1);
++  uint out_index = atomicAdd(region_buffer.region_count[0], 1);
+ 
+   // Compute absolute VAs for vkCmdDecompressMemoryIndirectCountNV
+   region_buffer.memory_regions[out_index] = memory_region_t(
+diff --git a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp
+index aea1124c..cb889294 100644
+--- a/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp
++++ b/libs/vkd3d/shaders/cs_emit_nv_memory_decompression_workgroups.comp
+@@ -48,7 +48,7 @@ struct memory_region_t {
+ 
+ layout(buffer_reference, scalar)
+ writeonly buffer memory_regions_t {
+-  uvec3 region_count;
++  uint region_count[3]; /* was uvec3: Metal refuses an atomic on a vector element (Highball msfs trial) */
+   uint  reserved;
+   memory_region_t memory_regions[];
+ };
+@@ -70,7 +70,7 @@ void main() {
+   // Reset memory region count that is later passed the decompression command.
+   if (stream_index == 0u) {
+     memory_regions_t region_buffer = memory_regions_t(scratch_buffer);
+-    region_buffer.region_count = uvec3(0u, 1u, 1u);
++    region_buffer.region_count[0] = 0u; region_buffer.region_count[1] = 1u; region_buffer.region_count[2] = 1u;
+   }
+ 
+   if (stream_index >= stream_count)
+-- 
+2.54.0 (Apple Git-157)
+

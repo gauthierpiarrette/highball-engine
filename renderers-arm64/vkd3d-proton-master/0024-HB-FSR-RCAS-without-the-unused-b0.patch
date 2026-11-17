@@ -1,0 +1,26 @@
+From b68b42acbf6fd68c3c6ac59ff0ddb856108291de Mon Sep 17 00:00:00 2001
+From: hb <hb@local>
+Date: Tue, 17 Nov 2026 07:29:22 +0500
+Subject: [PATCH 24/27] HB FSR: RCAS without the unused b0
+
+---
+ libs/vkd3d/state.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 20a171d7..4be945c0 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3810,7 +3810,8 @@ static uint32_t hb_fsr_pass_from_psv0(const uint8_t *p, uint32_t size)
+         return HB_FSR_PASS_PREPARE_INPUTS;
+     if ((b & 1) && (smp & 2) && (t & (1ull << 8)) && (u & 1) && (u & 4) && !(u & ~0x7ull))
+         return HB_FSR_PASS_ACCUMULATE;
+-    if (b == 0x3 && t == 0x3 && u == 0x1 && !smp)
++    /* RCAS: b1 (cbRCAS), t0 exposure, t1 input, u0 output; the compiler may drop the unused b0 */
++    if ((b & 0x2) && !(b & ~0x3ull) && t == 0x3 && u == 0x1 && !smp)
+         return HB_FSR_PASS_RCAS;
+     return b ? HB_FSR_PASS_OTHER : HB_FSR_PASS_NONE;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,57 @@
+From 3b339e046884a39a5aac069826af3cf7c412f796 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 14:39:28 +0200
+Subject: [PATCH 01/27] device: transform feedback queries, single texel
+ alignment and robustness2 are warnings
+
+MoltenVK lacks transform feedback, single texel alignment for storage and uniform texel buffers, robustBufferAccess2
+and nullDescriptor, and each of them stopped device creation. Games that do not use transform feedback run. The null
+descriptor gap is covered by the emulation patch.
+---
+ libs/vkd3d/device.c | 12 ++++--------
+ 1 file changed, 4 insertions(+), 8 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index b580de5b..f0d612b7 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2501,8 +2501,7 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!physical_device_info->xfb_properties.transformFeedbackQueries)
+     {
+-        ERR("Lacking support for transform feedback.\n");
+-        return E_INVALIDARG;
++        WARN("Lacking support for transform feedback.\n"); /* relaxed for MoltenVK (Highball msfs trial) */
+     }
+ 
+     single_storage_texel =
+@@ -2516,8 +2515,7 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (!single_storage_texel || !single_uniform_texel)
+     {
+-        ERR("Lacking support for single texel alignment.\n");
+-        return E_INVALIDARG;
++        WARN("Lacking support for single texel alignment.\n"); /* relaxed for MoltenVK (Highball msfs trial) */
+     }
+ 
+     /* Disable unused Vulkan features. The following features need to remain enabled
+@@ -2625,14 +2623,12 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+     if (!physical_device_info->robustness2_features.robustBufferAccess2 ||
+             !physical_device_info->robustness2_features.robustImageAccess2)
+     {
+-        ERR("Robustness2 features not supported. This is required.\n");
+-        return E_INVALIDARG;
++        WARN("Robustness2 features not supported. This is required.\n"); /* relaxed for MoltenVK (Highball msfs trial) */
+     }
+ 
+     if (!physical_device_info->robustness2_features.nullDescriptor)
+     {
+-        ERR("Null descriptor in VK_EXT_robustness2 is not supported by this implementation. This is required for correct operation.\n");
+-        return E_INVALIDARG;
++        WARN("Null descriptor in VK_EXT_robustness2 is not supported by this implementation. This is required for correct operation.\n"); /* relaxed for MoltenVK (Highball msfs trial) */
+     }
+ 
+     if (vulkan_info->KHR_fragment_shading_rate)
+-- 
+2.54.0 (Apple Git-157)
+

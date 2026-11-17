@@ -1,0 +1,213 @@
+From a71d20ec6c24fb7e55be4aeb09e53c26e8491ac1 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 2 Nov 2026 23:28:14 -0700
+Subject: [PATCH 15/27] MetalSharp:
+ ID3D12GraphicsCommandListMetalFX::FrameInterpolate, on MoltenVK's MetalFX
+ frame interpolator
+
+---
+ include/private/mvk_metalfx.h   | 25 +++++++++++++--
+ include/private/vkd3d_metalfx.h | 32 +++++++++++++++++--
+ libs/vkd3d/metalfx.c            | 54 +++++++++++++++++++++++++++++++++
+ 3 files changed, 107 insertions(+), 4 deletions(-)
+
+diff --git a/include/private/mvk_metalfx.h b/include/private/mvk_metalfx.h
+index a2e4d4d7..cc9a9eaa 100644
+--- a/include/private/mvk_metalfx.h
++++ b/include/private/mvk_metalfx.h
+@@ -7,12 +7,13 @@
+  * a VkDependencyInfo and a VkSwapchainCreateInfoKHR to the driver as they are, extension chain included. So:
+  *
+  * - a VkMetalFXScaleInfoMVK in the pNext chain of vkCmdPipelineBarrier2's VkDependencyInfo runs a MetalFX temporal
+- *   or denoised scaler after the barrier, in the command buffer's order;
++ *   or denoised scaler, or its frame interpolator, after the barrier, in the command buffer's order;
+  * - a VkSwapchainMetalFXSpatialCreateInfoMVK in the pNext chain of VkSwapchainCreateInfoKHR has the swapchain's
+  *   images upscaled with MetalFX's spatial scaler to the surface's native size when they are presented.
+  *
+  * A MoltenVK that supports them says so in VkPhysicalDeviceDriverProperties::driverInfo: the words "metalfx"
+- * (temporal and spatial scalers) and "metalfx-denoised" (MetalFX's denoised scaler, macOS 26).
++ * (temporal and spatial scalers), "metalfx-denoised" (MetalFX's denoised scaler, macOS 26) and
++ * "metalfx-interpolation" (MetalFX's frame interpolator keeping its own history, macOS 27).
+  *
+  * This file is copied as it is into the D3D layers that use it.
+  */
+@@ -28,14 +29,19 @@ extern "C" {
+ 
+ #define VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK ((VkStructureType)1000999100)
+ #define VK_STRUCTURE_TYPE_SWAPCHAIN_METALFX_SPATIAL_CREATE_INFO_MVK ((VkStructureType)1000999101)
++#define VK_STRUCTURE_TYPE_METALFX_FRAME_INTERPOLATION_INFO_MVK ((VkStructureType)1000999102)
+ 
+ #define VK_MVK_METALFX_DRIVER_INFO "metalfx"
+ #define VK_MVK_METALFX_DENOISED_DRIVER_INFO "metalfx-denoised"
++#define VK_MVK_METALFX_INTERPOLATION_DRIVER_INFO "metalfx-interpolation"
+ 
+ typedef enum VkMetalFXScalerTypeMVK {
+ 	VK_METALFX_SCALER_TYPE_NONE_MVK = 0,		/* only releases pReleaseScalerIds */
+ 	VK_METALFX_SCALER_TYPE_TEMPORAL_MVK = 1,	/* MTLFXTemporalScaler (DLSS Super Resolution) */
+ 	VK_METALFX_SCALER_TYPE_DENOISED_MVK = 2,	/* MTLFXTemporalDenoisedScaler (DLSS Ray Reconstruction) */
++	VK_METALFX_SCALER_TYPE_FRAME_INTERPOLATION_MVK = 3,	/* MTLFXFrameInterpolator (DLSS Frame Generation): the frame
++													   between the last one and the color image, with a
++													   VkMetalFXFrameInterpolationInfoMVK in pNext */
+ } VkMetalFXScalerTypeMVK;
+ 
+ /* The textures of a scale, by their index in images and formats */
+@@ -51,6 +57,9 @@ typedef enum VkMetalFXImageMVK {
+ 	VK_METALFX_IMAGE_ROUGHNESS_MVK = 8,				/* denoised */
+ 	VK_METALFX_IMAGE_SPECULAR_HIT_DISTANCE_MVK = 9,	/* denoised, optional */
+ 	VK_METALFX_IMAGE_COUNT_MVK = 10,
++	/* Frame interpolation: color, depth, motion, output and, optionally, the UI (color and alpha) in the denoised
++	 * diffuse albedo's place. Depth and motion are at the render size, the others at the swapchain's. */
++	VK_METALFX_IMAGE_UI_MVK = VK_METALFX_IMAGE_DIFFUSE_ALBEDO_MVK,
+ } VkMetalFXImageMVK;
+ 
+ typedef enum VkMetalFXScaleFlagBitsMVK {
+@@ -93,6 +102,18 @@ typedef struct VkMetalFXScaleInfoMVK {
+ 	const uint64_t* pReleaseScalerIds;
+ } VkMetalFXScaleInfoMVK;
+ 
++/* The camera and time of a frame interpolation (in the pNext chain of its VkMetalFXScaleInfoMVK). */
++typedef struct VkMetalFXFrameInterpolationInfoMVK {
++	VkStructureType sType;
++	const void* pNext;
++	float deltaTime;						/* seconds since the last frame */
++	float nearPlane;
++	float farPlane;
++	float fieldOfView;						/* vertical, in degrees */
++	float aspectRatio;
++	uint32_t uiComposited;					/* the UI image's contents are in the color image too */
++} VkMetalFXFrameInterpolationInfoMVK;
++
+ /* MetalFX spatial upscaling at present, to the surface's native size, where that is larger than the images' */
+ typedef struct VkSwapchainMetalFXSpatialCreateInfoMVK {
+ 	VkStructureType sType;
+diff --git a/include/private/vkd3d_metalfx.h b/include/private/vkd3d_metalfx.h
+index 9cddedf7..450df1f2 100644
+--- a/include/private/vkd3d_metalfx.h
++++ b/include/private/vkd3d_metalfx.h
+@@ -1,7 +1,8 @@
+ /*
+  * MetalSharp: MetalFX upscaling recorded in a D3D12 command list (ID3D12GraphicsCommandListMetalFX), for
+- * VKD3D-Proton-MacOS's NGX core (ngx/nvngx), which runs DLSS Super Resolution on MetalFX's temporal scaler and Ray
+- * Reconstruction on its denoised scaler. MoltenVK runs the scalers (mvk_metalfx.h).
++ * VKD3D-Proton-MacOS's NGX core (ngx/nvngx), which runs DLSS Super Resolution on MetalFX's temporal scaler, Ray
++ * Reconstruction on its denoised scaler and Frame Generation on its frame interpolator. MoltenVK runs them
++ * (mvk_metalfx.h).
+  *
+  * This header is C, and the NGX core (C++) includes it as it is.
+  *
+@@ -69,6 +70,29 @@ typedef struct VKD3D_METALFX_DENOISED_DESC
+     FLOAT ViewToClip[16];
+ } VKD3D_METALFX_DENOISED_DESC;
+ 
++/* The frame between the last one interpolated and Color (MetalFX's frame interpolator, DLSS Frame Generation). Depth
++ * and motion are at the render size, color, UI and output at the swap chain's. */
++typedef struct VKD3D_METALFX_FRAME_INTERPOLATE_DESC
++{
++    BOOL InReset;
++    BOOL DepthReversed;
++    BOOL UIComposited; /* the UI is in Color too */
++    ID3D12Resource *Color;
++    ID3D12Resource *Depth;
++    ID3D12Resource *MotionVector;
++    ID3D12Resource *UI; /* optional: color and alpha */
++    ID3D12Resource *Output;
++    FLOAT MotionVectorScaleX; /* to pixels of the motion vectors' resource */
++    FLOAT MotionVectorScaleY;
++    FLOAT JitterOffsetX;
++    FLOAT JitterOffsetY;
++    FLOAT DeltaTime; /* seconds */
++    FLOAT Near;
++    FLOAT Far;
++    FLOAT FieldOfView; /* vertical, in degrees */
++    FLOAT AspectRatio;
++} VKD3D_METALFX_FRAME_INTERPOLATE_DESC;
++
+ /* A feature's scaler, which its owner destroys when it is done with the feature. */
+ typedef struct ID3D12MetalFXScaler ID3D12MetalFXScaler;
+ 
+@@ -96,6 +120,10 @@ typedef struct ID3D12GraphicsCommandListMetalFXVtbl
+             const VKD3D_METALFX_TEMPORAL_DESC *desc, ID3D12MetalFXScaler **upscaler);
+     HRESULT (STDMETHODCALLTYPE *DenoisedUpscale)(ID3D12GraphicsCommandListMetalFX *This,
+             const VKD3D_METALFX_DENOISED_DESC *desc, ID3D12MetalFXScaler **upscaler);
++    /* Added in v5.0, which ships its NGX core with it. */
++    BOOL (STDMETHODCALLTYPE *SupportsFrameInterpolation)(ID3D12GraphicsCommandListMetalFX *This);
++    HRESULT (STDMETHODCALLTYPE *FrameInterpolate)(ID3D12GraphicsCommandListMetalFX *This,
++            const VKD3D_METALFX_FRAME_INTERPOLATE_DESC *desc, ID3D12MetalFXScaler **interpolator);
+ } ID3D12GraphicsCommandListMetalFXVtbl;
+ 
+ struct ID3D12GraphicsCommandListMetalFX
+diff --git a/libs/vkd3d/metalfx.c b/libs/vkd3d/metalfx.c
+index 0ce3c9d1..e006c484 100644
+--- a/libs/vkd3d/metalfx.c
++++ b/libs/vkd3d/metalfx.c
+@@ -287,6 +287,58 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_DenoisedUpscale(ID3D
+     return S_OK;
+ }
+ 
++static BOOL STDMETHODCALLTYPE d3d12_command_list_metalfx_SupportsFrameInterpolation(ID3D12GraphicsCommandListMetalFX *iface)
++{
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
++    return vkd3d_metalfx_driver_has(list->device, VK_MVK_METALFX_INTERPOLATION_DRIVER_INFO);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_FrameInterpolate(ID3D12GraphicsCommandListMetalFX *iface,
++        const VKD3D_METALFX_FRAME_INTERPOLATE_DESC *desc, ID3D12MetalFXScaler **interpolator)
++{
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
++    struct d3d12_resource *resources[VK_METALFX_IMAGE_COUNT_MVK] = {0};
++    VkMetalFXFrameInterpolationInfoMVK interpolation;
++    VkMetalFXScaleInfoMVK info;
++
++    TRACE("iface %p, desc %p, interpolator %p.\n", iface, desc, interpolator);
++
++    if (!desc || !interpolator || !desc->Color || !desc->Depth || !desc->MotionVector || !desc->Output)
++        return E_INVALIDARG;
++    if (!vkd3d_metalfx_driver_has(list->device, VK_MVK_METALFX_INTERPOLATION_DRIVER_INFO))
++        return E_NOTIMPL;
++
++    memset(&info, 0, sizeof(info));
++    info.sType = VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK;
++    if (!vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_COLOR_MVK, desc->Color, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_DEPTH_MVK, desc->Depth, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_MOTION_MVK, desc->MotionVector, true) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_OUTPUT_MVK, desc->Output, false) ||
++            !vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_UI_MVK, desc->UI, false))
++        return E_INVALIDARG;
++    if (!(info.scalerId = vkd3d_metalfx_upscaler_id(interpolator)))
++        return E_OUTOFMEMORY;
++
++    memset(&interpolation, 0, sizeof(interpolation));
++    interpolation.sType = VK_STRUCTURE_TYPE_METALFX_FRAME_INTERPOLATION_INFO_MVK;
++    interpolation.deltaTime = desc->DeltaTime;
++    interpolation.nearPlane = desc->Near;
++    interpolation.farPlane = desc->Far;
++    interpolation.fieldOfView = desc->FieldOfView;
++    interpolation.aspectRatio = desc->AspectRatio;
++    interpolation.uiComposited = !!desc->UIComposited;
++    info.pNext = &interpolation;
++    info.scalerType = VK_METALFX_SCALER_TYPE_FRAME_INTERPOLATION_MVK;
++    info.flags = (desc->InReset ? VK_METALFX_SCALE_RESET_BIT_MVK : 0) |
++            (desc->DepthReversed ? VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK : 0);
++    info.motionVectorScaleX = desc->MotionVectorScaleX;
++    info.motionVectorScaleY = desc->MotionVectorScaleY;
++    info.jitterOffsetX = desc->JitterOffsetX;
++    info.jitterOffsetY = desc->JitterOffsetY;
++    vkd3d_metalfx_record(list, &info, resources);
++    return S_OK;
++}
++
+ CONST_VTBL struct ID3D12GraphicsCommandListMetalFXVtbl d3d12_command_list_metalfx_vtbl =
+ {
+     /* IUnknown methods */
+@@ -299,6 +351,8 @@ CONST_VTBL struct ID3D12GraphicsCommandListMetalFXVtbl d3d12_command_list_metalf
+     d3d12_command_list_metalfx_SupportsDenoisedUpscale,
+     d3d12_command_list_metalfx_TemporalUpscale,
+     d3d12_command_list_metalfx_DenoisedUpscale,
++    d3d12_command_list_metalfx_SupportsFrameInterpolation,
++    d3d12_command_list_metalfx_FrameInterpolate,
+ };
+ 
+ /* vkd3d.conf: the file VKD3D_CONFIG_FILE names, else vkd3d.conf in the working directory, in dxvk.conf's form:
+-- 
+2.54.0 (Apple Git-157)
+

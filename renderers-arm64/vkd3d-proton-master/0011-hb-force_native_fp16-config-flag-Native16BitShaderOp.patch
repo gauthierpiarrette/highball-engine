@@ -1,0 +1,57 @@
+From 0075c00fdc22391265ebdbfcda39ccc7f0905e22 Mon Sep 17 00:00:00 2001
+From: hb-build <hb-build@local>
+Date: Sun, 15 Nov 2026 20:57:24 +0500
+Subject: [PATCH 11/27] hb: force_native_fp16 config flag
+ (Native16BitShaderOpsSupported without fp16 denorm preservation)
+
+---
+ include/private/config_flag_decl.h | 2 ++
+ include/private/config_flags.h     | 2 +-
+ libs/vkd3d/device.c                | 5 ++++-
+ 3 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/include/private/config_flag_decl.h b/include/private/config_flag_decl.h
+index defda994..d7f12402 100644
+--- a/include/private/config_flag_decl.h
++++ b/include/private/config_flag_decl.h
+@@ -58,6 +58,8 @@ VKD3D_DECL_CONFIG("one_time_submit", ONE_TIME_SUBMIT)
+ VKD3D_DECL_CONFIG("skip_null_sparse_tiles", SKIP_NULL_SPARSE_TILES)
+ VKD3D_DECL_CONFIG("queue_profile_extra", QUEUE_PROFILE_EXTRA)
+ VKD3D_DECL_CONFIG("damage_not_zeroed_allocations", DAMAGE_NOT_ZEROED_ALLOCATIONS)
++/* Highball: report native 16-bit shader ops on drivers without float16 denorm preservation (Apple GPUs). */
++VKD3D_DECL_CONFIG("force_native_fp16", FORCE_NATIVE_FP16)
+ VKD3D_DECL_CONFIG("defer_resource_destruction", DEFER_RESOURCE_DESTRUCTION)
+ VKD3D_DECL_CONFIG("prefer_thin_uav_tiling", PREFER_THIN_UAV_TILING)
+ VKD3D_DECL_CONFIG_PLAIN(EXTENDED_DEBUG_UTILS)
+diff --git a/include/private/config_flags.h b/include/private/config_flags.h
+index 361c54dd..d1fa7821 100644
+--- a/include/private/config_flags.h
++++ b/include/private/config_flags.h
+@@ -31,7 +31,7 @@ struct vkd3d_config_flags_bitfield
+ 	 * we may end up with stray uninitialized bits which can subtly break bitwise operations later.
+ 	 * Adding more configs will cause the static assert below to fail,
+ 	 * which indicates the need to subtract a reserved bit. */
+-	uint32_t reserved0 : 19;
++	uint32_t reserved0 : 18;
+ };
+ 
+ STATIC_ASSERT(sizeof(struct vkd3d_config_flags_bitfield) == 12);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 01565c89..59e7786a 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9436,7 +9436,10 @@ static void d3d12_device_caps_init_feature_options4(struct d3d12_device *device)
+      * If we cannot use SSBOs, we cannot use 16-bit raw buffers, which is a requirement for this feature. */
+ 
+     /* FP16 and FP64 must preserve denorms. Only FP32 can change, so we can accept both 32_BIT_INDEPENDENCY_ONLY and ALL. */
+-    options4->Native16BitShaderOpsSupported = d3d12_device_supports_16bit_shader_ops(device, false);
++    /* Highball: VKD3D_CONFIG=force_native_fp16 drops the two float16 denorm requirements, which KosmicKrisp and
++     * MoltenVK on Apple GPUs do not report; float16 denormals may then flush. */
++    options4->Native16BitShaderOpsSupported = d3d12_device_supports_16bit_shader_ops(device,
++            VKD3D_CONFIG_FLAG_IS_SET(FORCE_NATIVE_FP16));
+ }
+ 
+ static void d3d12_device_caps_init_feature_options5(struct d3d12_device *device)
+-- 
+2.54.0 (Apple Git-157)
+

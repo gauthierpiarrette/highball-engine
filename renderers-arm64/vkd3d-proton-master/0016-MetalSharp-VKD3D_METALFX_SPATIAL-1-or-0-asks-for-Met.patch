@@ -1,0 +1,45 @@
+From 9de630ea98906eab64023f7535c4069ffb6934ee Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 3 Nov 2026 00:03:32 -0700
+Subject: [PATCH 16/27] MetalSharp: VKD3D_METALFX_SPATIAL=1 or 0 asks for
+ MetalFX spatial upscaling over vkd3d.conf
+
+---
+ libs/vkd3d/metalfx.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/libs/vkd3d/metalfx.c b/libs/vkd3d/metalfx.c
+index e006c484..8ff166c3 100644
+--- a/libs/vkd3d/metalfx.c
++++ b/libs/vkd3d/metalfx.c
+@@ -422,7 +422,8 @@ static bool vkd3d_metalfx_conf_value(const char * const *keys, unsigned int key_
+     return false;
+ }
+ 
+-/* MetalFX spatial upscaling of the swapchain to the display (d3d12.metalSpatialUpscale, or d3d11's, in vkd3d.conf) */
++/* MetalFX spatial upscaling of the swapchain to the display (VKD3D_METALFX_SPATIAL, else d3d12.metalSpatialUpscale, or
++ * d3d11's, in vkd3d.conf) */
+ bool vkd3d_metalfx_spatial_requested(void)
+ {
+     static const char * const keys[] = {"d3d12.metalSpatialUpscale", "d3d11.metalSpatialUpscale"};
+@@ -431,10 +432,14 @@ bool vkd3d_metalfx_spatial_requested(void)
+ 
+     if (requested < 0)
+     {
+-        requested = vkd3d_metalfx_conf_value(keys, ARRAY_SIZE(keys), value, sizeof(value)) &&
+-                (!strcasecmp(value, "true") || !strcmp(value, "1") || !strcasecmp(value, "yes"));
++        /* VKD3D_METALFX_SPATIAL=1 or 0 over vkd3d.conf, for Wines that write no vkd3d.conf. */
++        if (vkd3d_get_env_var("VKD3D_METALFX_SPATIAL", value, sizeof(value)) && *value)
++            requested = !!strcmp(value, "0");
++        else
++            requested = vkd3d_metalfx_conf_value(keys, ARRAY_SIZE(keys), value, sizeof(value)) &&
++                    (!strcasecmp(value, "true") || !strcmp(value, "1") || !strcasecmp(value, "yes"));
+         if (requested)
+-            INFO("MetalFX spatial upscaling requested by vkd3d.conf.\n");
++            INFO("MetalFX spatial upscaling requested.\n");
+     }
+     return requested;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

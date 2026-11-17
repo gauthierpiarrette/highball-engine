@@ -1,0 +1,31 @@
+From 8ba25cd98e538d07c24e10b5558b62f1124e3ace Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Tue, 3 Nov 2026 00:05:36 -0700
+Subject: [PATCH 17/27] MetalSharp: vkd3d.conf named by a Unix path
+ (VKD3D_CONFIG_FILE=/...) is read from Wine's Z: drive
+
+---
+ libs/vkd3d/metalfx.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/libs/vkd3d/metalfx.c b/libs/vkd3d/metalfx.c
+index 8ff166c3..87a12439 100644
+--- a/libs/vkd3d/metalfx.c
++++ b/libs/vkd3d/metalfx.c
+@@ -368,6 +368,13 @@ static bool vkd3d_metalfx_conf_value(const char * const *keys, unsigned int key_
+ 
+     if (!vkd3d_get_env_var("VKD3D_CONFIG_FILE", path, sizeof(path)) || !*path)
+         strcpy(path, "vkd3d.conf");
++    /* A Unix path (/...) names the file on Wine's Z: drive. */
++    if (path[0] == '/' && strlen(path) + 3 <= sizeof(path))
++    {
++        memmove(path + 2, path, strlen(path) + 1);
++        path[0] = 'Z';
++        path[1] = ':';
++    }
+     if (!(file = fopen(path, "r")))
+         return false;
+     if (!vkd3d_get_program_name(program))
+-- 
+2.54.0 (Apple Git-157)
+

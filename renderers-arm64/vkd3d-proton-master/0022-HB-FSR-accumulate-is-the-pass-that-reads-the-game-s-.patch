@@ -1,0 +1,83 @@
+From 7416f9e37a494308ec47e3a3a7565f525dcc32b2 Mon Sep 17 00:00:00 2001
+From: hb <hb@local>
+Date: Tue, 17 Nov 2026 06:54:48 +0500
+Subject: [PATCH 22/27] HB FSR: accumulate is the pass that reads the game's
+ color at t8; log every binding of the passes
+
+---
+ libs/vkd3d/command.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index b7abbddc..a0483aed 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -9469,6 +9469,40 @@ static VkImage hb_fsr_image(struct d3d12_command_list *list, enum vkd3d_shader_d
+     return view->info.image.view->hb_vk_image;
+ }
+ 
++static void hb_fsr_log_bindings(struct d3d12_command_list *list, const char *what)
++{
++    const struct vkd3d_pipeline_bindings *bindings = &list->compute_bindings;
++    const struct vkd3d_shader_resource_binding *b;
++    const struct vkd3d_descriptor_metadata_view *view;
++    char text[1024];
++    unsigned int reg, param, t;
++    size_t len = 0;
++
++    if (!bindings->root_signature || !list->cbv_srv_uav_descriptors_view)
++        return;
++    for (t = 0; t < 2; t++)
++    {
++        for (reg = 0; reg < 12; reg++)
++        {
++            enum vkd3d_shader_descriptor_type type = t ? VKD3D_SHADER_DESCRIPTOR_TYPE_UAV : VKD3D_SHADER_DESCRIPTOR_TYPE_SRV;
++            if (!(b = hb_fsr_find_binding(bindings->root_signature, type, reg, &param)))
++                continue;
++            view = list->cbv_srv_uav_descriptors_view + bindings->descriptor_tables[b->descriptor_table] +
++                    b->descriptor_offset + (reg - b->register_index);
++            len += snprintf(text + len, sizeof(text) - len, " %c%u=", t ? 'u' : 't', reg);
++            if ((view->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) && view->info.image.view)
++                len += snprintf(text + len, sizeof(text) - len, "img%#"PRIx64"/vk%u",
++                        (uint64_t)view->info.image.view->hb_vk_image,
++                        view->info.image.view->format ? (unsigned int)view->info.image.view->format->vk_format : 0);
++            else
++                len += snprintf(text + len, sizeof(text) - len, "flags%#x", view->info.flags);
++            if (len >= sizeof(text))
++                break;
++        }
++    }
++    ERR("HB FSR: %s bindings:%s\n", what, text);
++}
++
+ static bool hb_fsr_read_constants(struct d3d12_command_list *list, uint32_t *cb, size_t size)
+ {
+     const struct vkd3d_unique_resource *u;
+@@ -9515,6 +9549,8 @@ static bool hb_fsr_dispatch(struct d3d12_command_list *list)
+                 hb_fsr_read_constants(list, list->hb_fsr.cb, sizeof(list->hb_fsr.cb));
+         if (!(logged_passes & (1u << pass)) || !list->hb_fsr.have_inputs)
+         {
++            if (!(logged_passes & (1u << pass)))
++                hb_fsr_log_bindings(list, "prepare_inputs");
+             logged_passes |= 1u << pass;
+             i32 = (const int32_t *)list->hb_fsr.cb;
+             f = (const float *)list->hb_fsr.cb;
+@@ -9530,10 +9566,15 @@ static bool hb_fsr_dispatch(struct d3d12_command_list *list)
+     if (pass == HB_FSR_PASS_OTHER)
+         return mode == HB_FSR_ON && list->hb_fsr.have_inputs;
+ 
++    /* prepare_reactivity has accumulate's binding shape; only accumulate reads the game's color (t8) */
++    if (pass == HB_FSR_PASS_ACCUMULATE && list->hb_fsr.have_inputs &&
++            hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 8) != list->hb_fsr.color)
++        return mode == HB_FSR_ON;
+     output = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_UAV, pass == HB_FSR_PASS_ACCUMULATE ? 1 : 0);
+     if (!(logged_passes & (1u << pass)))
+     {
+         logged_passes |= 1u << pass;
++        hb_fsr_log_bindings(list, pass == HB_FSR_PASS_ACCUMULATE ? "accumulate" : "rcas");
+         ERR("HB FSR: %s output %#"PRIx64", inputs %s.\n", pass == HB_FSR_PASS_ACCUMULATE ? "accumulate" : "rcas",
+                 (uint64_t)output, list->hb_fsr.have_inputs ? "ready" : "missing");
+     }
+-- 
+2.54.0 (Apple Git-157)
+

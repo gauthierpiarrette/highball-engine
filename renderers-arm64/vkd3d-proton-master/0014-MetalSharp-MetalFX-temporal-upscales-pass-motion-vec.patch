@@ -1,0 +1,63 @@
+From 5f1041642f49da506da09e41b76f06330fbe5483 Mon Sep 17 00:00:00 2001
+From: Avery Felts <averyfelts@Averys-MacBook-Air.local>
+Date: Mon, 2 Nov 2026 23:22:35 -0700
+Subject: [PATCH 14/27] MetalSharp: MetalFX temporal upscales pass motion
+ vectors at the output resolution on to MoltenVK
+
+---
+ include/private/mvk_metalfx.h |  2 ++
+ libs/vkd3d/metalfx.c          | 11 +++--------
+ 2 files changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/include/private/mvk_metalfx.h b/include/private/mvk_metalfx.h
+index 9d1aa0d3..a2e4d4d7 100644
+--- a/include/private/mvk_metalfx.h
++++ b/include/private/mvk_metalfx.h
+@@ -57,6 +57,8 @@ typedef enum VkMetalFXScaleFlagBitsMVK {
+ 	VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK = 0x1,
+ 	VK_METALFX_SCALE_RESET_BIT_MVK = 0x2,
+ 	VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK = 0x4,
++	/* The motion vectors are at the output resolution (DLSS without MV_LOWRES): they are brought to the input's. */
++	VK_METALFX_SCALE_MOTION_DISPLAY_RES_BIT_MVK = 0x8,
+ } VkMetalFXScaleFlagBitsMVK;
+ 
+ /*
+diff --git a/libs/vkd3d/metalfx.c b/libs/vkd3d/metalfx.c
+index ac7a4e38..0ce3c9d1 100644
+--- a/libs/vkd3d/metalfx.c
++++ b/libs/vkd3d/metalfx.c
+@@ -197,7 +197,6 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_TemporalUpscale(ID3D
+     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandListMetalFX(iface);
+     struct d3d12_resource *resources[VK_METALFX_IMAGE_COUNT_MVK] = {0};
+     VkMetalFXScaleInfoMVK info;
+-    static bool warned;
+ 
+     TRACE("iface %p, desc %p, upscaler %p.\n", iface, desc, upscaler);
+ 
+@@ -205,12 +204,6 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_TemporalUpscale(ID3D
+         return E_INVALIDARG;
+     if (!vkd3d_metalfx_driver_has(list->device, VK_MVK_METALFX_DRIVER_INFO))
+         return E_NOTIMPL;
+-    if (desc->MotionVectorInDisplayRes && !warned)
+-    {
+-        warned = true;
+-        WARN("MetalFX: motion vectors at the output resolution are not supported yet.\n");
+-    }
+-
+     memset(&info, 0, sizeof(info));
+     info.sType = VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK;
+     if (!vkd3d_metalfx_set_image(&info, resources, VK_METALFX_IMAGE_COLOR_MVK, desc->Color, false) ||
+@@ -225,7 +218,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_metalfx_TemporalUpscale(ID3D
+     info.scalerType = VK_METALFX_SCALER_TYPE_TEMPORAL_MVK;
+     info.flags = (desc->AutoExposure ? VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK : 0) |
+             (desc->InReset ? VK_METALFX_SCALE_RESET_BIT_MVK : 0) |
+-            (desc->DepthReversed ? VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK : 0);
++            (desc->DepthReversed ? VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK : 0) |
++            /* MoltenVK brings them to the input resolution (Hogwarts Legacy's DLSS gives them at the output's). */
++            (desc->MotionVectorInDisplayRes ? VK_METALFX_SCALE_MOTION_DISPLAY_RES_BIT_MVK : 0);
+     info.inputContentWidth = desc->InputContentWidth;
+     info.inputContentHeight = desc->InputContentHeight;
+     info.motionVectorScaleX = desc->MotionVectorScaleX;
+-- 
+2.54.0 (Apple Git-157)
+

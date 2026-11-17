@@ -1,0 +1,228 @@
+From 912ed5e2be58805ac6d9579960b3e513ba0f52e4 Mon Sep 17 00:00:00 2001
+From: hb <hb@local>
+Date: Tue, 17 Nov 2026 06:32:33 +0500
+Subject: [PATCH 21/27] HB FSR: recognize the provider's passes by DXIL hash,
+ classified by PSV0 bindings
+
+---
+ libs/vkd3d/state.c | 192 +++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 178 insertions(+), 14 deletions(-)
+
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 3f90883d..20a171d7 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3724,32 +3724,196 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     return S_OK;
+ }
+ 
+-static bool hb_bytes_contain(const void *data, size_t size, const char *needle)
++/* Highball (HB_VKD3D_METALFX_FSR): the game's FSR 3.1 passes, recognized by the HASH part of their DXIL container. The
++ * table comes from the provider beside the executable (amd_fidelityfx_upscaler_dx12.dll, only read): every DXIL
++ * container in it is classified by its resource bindings (PSV0), with FidelityFX SDK 1.1/2.x's dx12 bindings:
++ * prepare_inputs b0 t0-t2 u0-u4, accumulate b0 s1 t8 u0 u2 (u1 the output), RCAS b0 b1 t0 t1 u0. FSR2's and FSR4's
++ * containers (t10, or the "fsr4" string) are left out. */
++struct hb_fsr_shader
++{
++    uint8_t digest[16];
++    uint32_t pass;
++};
++
++static struct hb_fsr_shader *hb_fsr_shaders;
++static size_t hb_fsr_shader_count;
++static pthread_once_t hb_fsr_once = PTHREAD_ONCE_INIT;
++
++static uint32_t hb_u32(const uint8_t *p)
++{
++    uint32_t v;
++    memcpy(&v, p, sizeof(v));
++    return v;
++}
++
++static const uint8_t *hb_dxbc_part(const uint8_t *blob, size_t size, const char *fourcc, uint32_t *part_size)
+ {
+-    size_t length = strlen(needle), i;
+-    const char *bytes = data;
++    uint32_t count, k, off;
+ 
+-    if (!data || size < length)
+-        return false;
++    if (size < 32 || memcmp(blob, "DXBC", 4))
++        return NULL;
++    count = hb_u32(blob + 28);
++    if (count > 64 || 32 + 4 * (size_t)count > size)
++        return NULL;
++    for (k = 0; k < count; k++)
++    {
++        off = hb_u32(blob + 32 + 4 * k);
++        if ((size_t)off + 8 > size || memcmp(blob + off, fourcc, 4))
++            continue;
++        *part_size = hb_u32(blob + off + 4);
++        if ((size_t)off + 8 + *part_size > size)
++            return NULL;
++        return blob + off + 8;
++    }
++    return NULL;
++}
++
++static uint32_t hb_fsr_pass_from_psv0(const uint8_t *p, uint32_t size)
++{
++    uint64_t t = 0, u = 0, b = 0, smp = 0, *mask;
++    uint32_t runtime_size, count, entry_size, r, type, space, lo, hi, q;
++
++    if (size < 8)
++        return HB_FSR_PASS_NONE;
++    runtime_size = hb_u32(p);
++    q = 4 + runtime_size;
++    if (q + 4 > size)
++        return HB_FSR_PASS_NONE;
++    count = hb_u32(p + q);
++    q += 4;
++    if (count)
++    {
++        if (q + 4 > size)
++            return HB_FSR_PASS_NONE;
++        entry_size = hb_u32(p + q);
++        q += 4;
++        if (entry_size < 16 || q + (uint64_t)count * entry_size > size)
++            return HB_FSR_PASS_NONE;
++        for (r = 0; r < count; r++)
++        {
++            type = hb_u32(p + q + r * entry_size);
++            space = hb_u32(p + q + r * entry_size + 4);
++            lo = hb_u32(p + q + r * entry_size + 8);
++            hi = hb_u32(p + q + r * entry_size + 12);
++            if (space)
++                return HB_FSR_PASS_NONE;
++            mask = type == 1 ? &smp : type == 2 ? &b : (type >= 3 && type <= 5) ? &t : (type >= 6 && type <= 10) ? &u : NULL;
++            if (!mask)
++                continue;
++            for (; lo <= hi && lo < 64; lo++)
++                *mask |= 1ull << lo;
++        }
++    }
++    if (t & (1ull << 10))
++        return HB_FSR_PASS_NONE; /* FSR2 */
++    if (b == 1 && t == 0x7 && u == 0x1f && !smp)
++        return HB_FSR_PASS_PREPARE_INPUTS;
++    if ((b & 1) && (smp & 2) && (t & (1ull << 8)) && (u & 1) && (u & 4) && !(u & ~0x7ull))
++        return HB_FSR_PASS_ACCUMULATE;
++    if (b == 0x3 && t == 0x3 && u == 0x1 && !smp)
++        return HB_FSR_PASS_RCAS;
++    return b ? HB_FSR_PASS_OTHER : HB_FSR_PASS_NONE;
++}
++
++static bool hb_contains(const uint8_t *data, size_t size, const char *needle, size_t length)
++{
++    size_t i;
+     for (i = 0; i + length <= size; i++)
+     {
+-        if (bytes[i] == needle[0] && !memcmp(bytes + i, needle, length))
++        if (data[i] == (uint8_t)needle[0] && !memcmp(data + i, needle, length))
+             return true;
+     }
+     return false;
+ }
+ 
+-/* Highball: FSR 3.1's passes keep their resource names in the DXIL (FidelityFX SDK 1.1, the dx12 *_pass.hlsl). */
++static void hb_fsr_load_table(void)
++{
++    static const char fsr4[] = "fsr4";
++    size_t capacity = 0, i, file_size;
++    const uint8_t *hash, *psv0;
++    uint32_t hash_size, psv0_size, size, pass;
++    WCHAR path[MAX_PATH];
++    LARGE_INTEGER length;
++    uint8_t *data;
++    DWORD got, n;
++    HANDLE file;
++
++    n = GetModuleFileNameW(NULL, path, MAX_PATH);
++    while (n && path[n - 1] != '\\' && path[n - 1] != '/')
++        n--;
++    path[n] = 0;
++    if (n + 40 >= MAX_PATH)
++        return;
++    wcscat(path, L"amd_fidelityfx_upscaler_dx12.dll");
++    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++    if (file == INVALID_HANDLE_VALUE)
++    {
++        ERR("HB FSR: no FSR provider beside the program.\n");
++        return;
++    }
++    if (!GetFileSizeEx(file, &length) || length.QuadPart > (1 << 28) || !(data = vkd3d_malloc(length.QuadPart)))
++    {
++        CloseHandle(file);
++        return;
++    }
++    file_size = length.QuadPart;
++    if (!ReadFile(file, data, file_size, &got, NULL) || got != file_size)
++    {
++        CloseHandle(file);
++        vkd3d_free(data);
++        return;
++    }
++    CloseHandle(file);
++
++    for (i = 0; i + 32 <= file_size; i++)
++    {
++        if (data[i] != 'D' || memcmp(data + i, "DXBC", 4))
++            continue;
++        size = hb_u32(data + i + 24);
++        if (size < 32 || i + size > file_size)
++            continue;
++        if ((hash = hb_dxbc_part(data + i, size, "HASH", &hash_size)) && hash_size >= 20 &&
++                (psv0 = hb_dxbc_part(data + i, size, "PSV0", &psv0_size)) &&
++                !hb_contains(data + i, size, fsr4, 4) &&
++                (pass = hb_fsr_pass_from_psv0(psv0, psv0_size)) != HB_FSR_PASS_NONE)
++        {
++            if (!vkd3d_array_reserve((void **)&hb_fsr_shaders, &capacity, hb_fsr_shader_count + 1, sizeof(*hb_fsr_shaders)))
++                break;
++            memcpy(hb_fsr_shaders[hb_fsr_shader_count].digest, hash + 4, 16);
++            hb_fsr_shaders[hb_fsr_shader_count++].pass = pass;
++        }
++        i += size - 1;
++    }
++    vkd3d_free(data);
++    ERR("HB FSR: %zu FSR 3.1 shaders in the provider.\n", hb_fsr_shader_count);
++}
++
++static bool hb_fsr_enabled(void)
++{
++    static int enabled = -1;
++    char value[16];
++    if (enabled < 0)
++        enabled = vkd3d_get_env_var("HB_VKD3D_METALFX_FSR", value, sizeof(value)) && (value[0] == '1' || !strcmp(value, "log"));
++    return enabled;
++}
++
+ static uint32_t hb_fsr_classify(const void *code, size_t size)
+ {
+-    if (!hb_bytes_contain(code, size, "cbFSR3Upscaler"))
++    const uint8_t *hash;
++    uint32_t hash_size;
++    size_t i;
++
++    if (!hb_fsr_enabled() || !code)
+         return HB_FSR_PASS_NONE;
+-    if (hb_bytes_contain(code, size, "rw_upscaled_output"))
+-        return hb_bytes_contain(code, size, "rw_internal_upscaled_color") ? HB_FSR_PASS_ACCUMULATE : HB_FSR_PASS_RCAS;
+-    if (hb_bytes_contain(code, size, "r_input_color_jittered") && hb_bytes_contain(code, size, "r_input_depth") &&
+-            hb_bytes_contain(code, size, "rw_dilated_motion_vectors"))
+-        return HB_FSR_PASS_PREPARE_INPUTS;
+-    return HB_FSR_PASS_OTHER;
++    pthread_once(&hb_fsr_once, hb_fsr_load_table);
++    if (!(hash = hb_dxbc_part(code, size, "HASH", &hash_size)) || hash_size < 20)
++        return HB_FSR_PASS_NONE;
++    for (i = 0; i < hb_fsr_shader_count; i++)
++    {
++        if (!memcmp(hb_fsr_shaders[i].digest, hash + 4, 16))
++            return hb_fsr_shaders[i].pass;
++    }
++    return HB_FSR_PASS_NONE;
+ }
+ 
+ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *state,
+-- 
+2.54.0 (Apple Git-157)
+

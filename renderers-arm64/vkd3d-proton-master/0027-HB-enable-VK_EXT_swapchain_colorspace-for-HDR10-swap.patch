@@ -1,0 +1,44 @@
+From a93b8c5d97b1dfe077fb2367bbcc76e4da76902a Mon Sep 17 00:00:00 2001
+From: hb <hb@local>
+Date: Tue, 17 Nov 2026 08:22:24 +0500
+Subject: [PATCH 27/27] HB: enable VK_EXT_swapchain_colorspace for HDR10
+ swapchains
+
+---
+ libs/d3d12core/main.c  | 2 ++
+ libs/vkd3d/swapchain.c | 5 +++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/libs/d3d12core/main.c b/libs/d3d12core/main.c
+index fa299e33..1077f0b8 100644
+--- a/libs/d3d12core/main.c
++++ b/libs/d3d12core/main.c
+@@ -584,6 +584,8 @@ static HRESULT vkd3d_create_instance_global(struct vkd3d_instance **out_instance
+         VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
+         VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
+         VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
++        /* HDR10 / scRGB surface formats (SetColorSpace1) */
++        VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,
+ #ifndef _WIN32
+         /* TODO: We need to attempt to dlopen() native DXVK DXGI and handle this more gracefully. */
+         "VK_KHR_xcb_surface",
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index ac03e6c1..ead7e670 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1275,7 +1275,12 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetColorSpace(IDXGIVkSwapCha
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p, ColorSpace %u.\n", iface, ColorSpace);
+     if (!dxgi_vk_swap_chain_supports_color_space(chain, ColorSpace))
++    {
++        ERR("HB: color space %u not supported by the surface.\n", ColorSpace);
+         return E_INVALIDARG;
++    }
++    if (ColorSpace != chain->user.dxgi_color_space_type)
++        ERR("HB: swapchain color space %u.\n", ColorSpace);
+ 
+     chain->user.dxgi_color_space_type = ColorSpace;
+     chain->user.modifies_hdr_metadata = true;
+-- 
+2.54.0 (Apple Git-157)
+

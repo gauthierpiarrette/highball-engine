@@ -1,0 +1,25 @@
+From 00bdcf4c588a78ef8924c68358c1b3cd18ca04f6 Mon Sep 17 00:00:00 2001
+From: hb-build <hb-build@local>
+Date: Sun, 15 Nov 2026 04:19:00 +0500
+Subject: [PATCH 08/27] build fixes for master: null descriptor alloc flags
+
+---
+ libs/vkd3d/device.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 7350da3a..3ad1eaf9 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -11394,7 +11394,7 @@ HRESULT vkd3d_null_resources_init(struct d3d12_device *device)
+             VKD3D_NULL_DESC_BUFFER_SIZE, "null-descriptor-buffer", &null->vk_buffer)))
+         goto fail;
+     if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, null->vk_buffer,
+-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &null->buffer_allocation)))
++            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, &null->buffer_allocation)))
+         goto fail;
+     if (VK_CALL(vkMapMemory(device->vk_device, null->buffer_allocation.vk_memory, 0, VK_WHOLE_SIZE, 0, &mapped)) == VK_SUCCESS)
+     {
+-- 
+2.54.0 (Apple Git-157)
+

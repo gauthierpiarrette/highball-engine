@@ -1,0 +1,71 @@
+From 4b6c7e2a9b48d1d9d53f59a68c488e2180a86524 Mon Sep 17 00:00:00 2001
+From: hb <hb@local>
+Date: Tue, 17 Nov 2026 07:14:49 +0500
+Subject: [PATCH 23/27] HB FSR: pass the game's reactive mask when it gives one
+
+---
+ libs/vkd3d/command.c       | 14 ++++++++++++--
+ libs/vkd3d/vkd3d_private.h |  2 +-
+ 2 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index a0483aed..7beff687 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -9545,6 +9545,7 @@ static bool hb_fsr_dispatch(struct d3d12_command_list *list)
+         list->hb_fsr.motion = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 0);
+         list->hb_fsr.depth = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 1);
+         list->hb_fsr.color = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 2);
++        list->hb_fsr.reactive = VK_NULL_HANDLE;
+         list->hb_fsr.have_inputs = list->hb_fsr.color && list->hb_fsr.depth && list->hb_fsr.motion &&
+                 hb_fsr_read_constants(list, list->hb_fsr.cb, sizeof(list->hb_fsr.cb));
+         if (!(logged_passes & (1u << pass)) || !list->hb_fsr.have_inputs)
+@@ -9569,14 +9570,21 @@ static bool hb_fsr_dispatch(struct d3d12_command_list *list)
+     /* prepare_reactivity has accumulate's binding shape; only accumulate reads the game's color (t8) */
+     if (pass == HB_FSR_PASS_ACCUMULATE && list->hb_fsr.have_inputs &&
+             hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 8) != list->hb_fsr.color)
++    {
++        /* prepare_reactivity: t3 the game's reactive mask, t4 transparency/composition; FSR binds one placeholder
++         * to both when the game gives neither */
++        VkImage reactive = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 3);
++        list->hb_fsr.reactive = reactive != hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 4) ? reactive : VK_NULL_HANDLE;
+         return mode == HB_FSR_ON;
++    }
+     output = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_UAV, pass == HB_FSR_PASS_ACCUMULATE ? 1 : 0);
+     if (!(logged_passes & (1u << pass)))
+     {
+         logged_passes |= 1u << pass;
+         hb_fsr_log_bindings(list, pass == HB_FSR_PASS_ACCUMULATE ? "accumulate" : "rcas");
+-        ERR("HB FSR: %s output %#"PRIx64", inputs %s.\n", pass == HB_FSR_PASS_ACCUMULATE ? "accumulate" : "rcas",
+-                (uint64_t)output, list->hb_fsr.have_inputs ? "ready" : "missing");
++        ERR("HB FSR: %s output %#"PRIx64", inputs %s, reactive mask %#"PRIx64".\n",
++                pass == HB_FSR_PASS_ACCUMULATE ? "accumulate" : "rcas", (uint64_t)output,
++                list->hb_fsr.have_inputs ? "ready" : "missing", (uint64_t)list->hb_fsr.reactive);
+     }
+     if (mode != HB_FSR_ON || !list->hb_fsr.have_inputs)
+         return false;
+@@ -9604,6 +9612,8 @@ static bool hb_fsr_dispatch(struct d3d12_command_list *list)
+     info.images[VK_METALFX_IMAGE_DEPTH_MVK] = list->hb_fsr.depth;
+     info.images[VK_METALFX_IMAGE_MOTION_MVK] = list->hb_fsr.motion;
+     info.images[VK_METALFX_IMAGE_OUTPUT_MVK] = output;
++    if (hb_fsr_env_float("HB_FSR_MFX_REACTIVE", 1.0f) != 0.0f)
++        info.images[VK_METALFX_IMAGE_REACTIVE_MVK] = list->hb_fsr.reactive;
+     info.inputContentWidth = i32[0];
+     info.inputContentHeight = i32[1];
+     info.motionVectorScaleX = f[20] * target_w * hb_fsr_env_float("HB_FSR_MFX_MV_SIGN_X", 1.0f);
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 66bf3b61..e93cef8b 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3459,7 +3459,7 @@ struct d3d12_command_list
+     D3D12_GPU_VIRTUAL_ADDRESS hb_compute_root_cbv[D3D12_MAX_ROOT_COST];
+     struct
+     {
+-        VkImage color, depth, motion;
++        VkImage color, depth, motion, reactive;
+         uint32_t cb[32];
+         bool have_inputs;
+     } hb_fsr;
+-- 
+2.54.0 (Apple Git-157)
+

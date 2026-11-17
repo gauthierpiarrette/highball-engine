@@ -1,0 +1,33 @@
+From 9d7bd9e08bbe0161b303403d2e09c946c512f82d Mon Sep 17 00:00:00 2001
+From: hb-build <hb-build@local>
+Date: Sun, 15 Nov 2026 07:26:01 +0500
+Subject: [PATCH 10/27] hb: HB_VKD3D_CONFIG appends to VKD3D_CONFIG
+
+---
+ libs/vkd3d/device.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 3ad1eaf9..01565c89 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -603,6 +603,16 @@ static void vkd3d_config_flags_init_once(void)
+     char config[VKD3D_PATH_MAX];
+ 
+     vkd3d_get_env_var("VKD3D_CONFIG", config, sizeof(config));
++    {
++        /* Highball: HB_VKD3D_CONFIG is appended to VKD3D_CONFIG, so a bottle can add flags to the ones its
++         * recipe sets (the recipe's VKD3D_CONFIG replaces the bottle's on every launch). */
++        char extra[VKD3D_PATH_MAX];
++        if (vkd3d_get_env_var("HB_VKD3D_CONFIG", extra, sizeof(extra)) && extra[0])
++        {
++            size_t len = strlen(config);
++            snprintf(config + len, sizeof(config) - len, "%s%s", len ? "," : "", extra);
++        }
++    }
+     vkd3d_config_flags = vkd3d_parse_debug_options(config, vkd3d_config_options, ARRAY_SIZE(vkd3d_config_options));
+ 
+     if (!VKD3D_CONFIG_FLAG_IS_SET(SKIP_APPLICATION_WORKAROUNDS))
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,44 @@
+From 4bebfbcc53f2b6d63e2c2dc99b0e276f097997d7 Mon Sep 17 00:00:00 2001
+From: hb-build <hb-build@local>
+Date: Sun, 15 Nov 2026 04:42:08 +0500
+Subject: [PATCH 09/27] hb: HB_VKD3D_TILER switch
+
+---
+ libs/vkd3d/device_workarounds.c | 13 +++++++++++++
+ subprojects/dxil-spirv          |  2 +-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/device_workarounds.c b/libs/vkd3d/device_workarounds.c
+index 53b25236..428d40d3 100644
+--- a/libs/vkd3d/device_workarounds.c
++++ b/libs/vkd3d/device_workarounds.c
+@@ -1229,6 +1229,19 @@ void d3d12_device_init_workarounds(struct d3d12_device *device)
+             break;
+     }
+ 
++    /* Highball: HB_VKD3D_TILER=1 treats the driver as a tiler (Apple GPUs behind KosmicKrisp are TBDR), barriers
++     * plus render pass suspend/resume; HB_VKD3D_TILER=2 the barriers only; 0 leaves the driver list alone. */
++    {
++        char hb_tiler[16];
++        if (vkd3d_get_env_var("HB_VKD3D_TILER", hb_tiler, sizeof(hb_tiler)) && hb_tiler[0] && hb_tiler[0] != '0')
++        {
++            device->workarounds.tiler_renderpass_barriers = true;
++            device->workarounds.tiler_suspend_resume = hb_tiler[0] == '1';
++            INFO("HB_VKD3D_TILER=%s: tiler barriers on, suspend/resume %s.\n", hb_tiler,
++                    device->workarounds.tiler_suspend_resume ? "on" : "off");
++        }
++    }
++
+     /* For testing purposes, allow us to exercise all code paths on all GPUs. */
+     if (vkd3d_debug_control_get_behavior_flags() & VKD3D_DEBUG_CONTROL_BEHAVIOR_ENABLE_TILER_SYNC)
+         device->workarounds.tiler_renderpass_barriers = true;
+diff --git a/subprojects/dxil-spirv b/subprojects/dxil-spirv
+index 114e664e..00e99ab0 160000
+--- a/subprojects/dxil-spirv
++++ b/subprojects/dxil-spirv
+@@ -1 +1 @@
+-Subproject commit 114e664efca411c926380b2f3bd1930c1faeaf4d
++Subproject commit 00e99ab071e029e785deb7ea014c5856b3e691f0
+-- 
+2.54.0 (Apple Git-157)
+

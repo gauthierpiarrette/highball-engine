@@ -1,0 +1,126 @@
+diff --git a/src/dxgi/dxgi_adapter.cpp b/src/dxgi/dxgi_adapter.cpp
+index 259c782d..0e6b9fb2 100644
+--- a/src/dxgi/dxgi_adapter.cpp
++++ b/src/dxgi/dxgi_adapter.cpp
+@@ -312,6 +312,12 @@ namespace dxvk {
+       pVideoMemoryInfo->AvailableForReservation += memInfo.heaps[i].heapSize / 2;
+     }
+ 
++    // Highball: dxgi.maxVideoMemoryBudget caps the local budget only, the adapter description stays.
++    VkDeviceSize maxBudget = m_factory->GetOptions()->maxVideoMemoryBudget;
++
++    if (MemorySegmentGroup == DXGI_MEMORY_SEGMENT_GROUP_LOCAL && maxBudget && pVideoMemoryInfo->Budget > maxBudget)
++      pVideoMemoryInfo->Budget = maxBudget;
++
+     // We don't implement reservation, but the observable
+     // behaviour should match that of Windows drivers
+     uint32_t segmentId = uint32_t(MemorySegmentGroup);
+diff --git a/src/dxgi/dxgi_options.cpp b/src/dxgi/dxgi_options.cpp
+index d83342e2..3cd753c0 100644
+--- a/src/dxgi/dxgi_options.cpp
++++ b/src/dxgi/dxgi_options.cpp
+@@ -168,6 +168,7 @@ namespace dxvk {
+     // Interpret the memory limits as Megabytes
+     this->maxDeviceMemory = VkDeviceSize(config.getOption<int32_t>("dxgi.maxDeviceMemory", 0)) << 20;
+     this->maxSharedMemory = VkDeviceSize(config.getOption<int32_t>("dxgi.maxSharedMemory", 0)) << 20;
++    this->maxVideoMemoryBudget = VkDeviceSize(config.getOption<int32_t>("dxgi.maxVideoMemoryBudget", 0)) << 20;
+ 
+     this->maxFrameRate     = config.getOption<int32_t>("dxvk.maxFrameRate",
+                              config.getOption<int32_t>("dxgi.maxFrameRate", 0));
+diff --git a/src/dxgi/dxgi_options.h b/src/dxgi/dxgi_options.h
+index c61c574a..a413f0ef 100644
+--- a/src/dxgi/dxgi_options.h
++++ b/src/dxgi/dxgi_options.h
+@@ -39,6 +39,9 @@ namespace dxvk {
+     VkDeviceSize maxDeviceMemory;
+     VkDeviceSize maxSharedMemory;
+ 
++    /// Highball: caps the local budget QueryVideoMemoryInfo reports (unified memory)
++    VkDeviceSize maxVideoMemoryBudget;
++
+     /// Reports Nvidia GPUs running on the proprietary driver as a different
+     /// vendor (usually AMD). Proton will generally disable this option.
+     bool hideNvidiaGpu;
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 7e3d16a7..a4f43ac4 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -4,6 +4,8 @@
+ #include <sstream>
+ #include <type_traits>
+ 
++#include "../util/util_env.h"
++
+ #include "dxvk_device_info.h"
+ #include "dxvk_instance.h"
+ #include "dxvk_limits.h"
+@@ -775,6 +777,10 @@ namespace dxvk {
+     if (m_queueMapping.graphics.family == VK_QUEUE_FAMILY_IGNORED)
+       return std::string("Device does not have a graphics queue");
+ 
++    /* Report every missing required feature, not only the first; DXVK_RELAX_FEATURES=1 downgrades
++     * them to warnings so a device can be created on MoltenVK (Michael-Liendo, msfs2024-apple-silicon). */
++    std::string missingFeatures;
++
+     for (const auto& f : getFeatureList()) {
+       if (f.featureRequired && !(*f.featureEnabled)) {
+         std::string message = str::format("Device does not support required feature '", f.readableName, "'");
+@@ -782,10 +788,18 @@ namespace dxvk {
+         if (f.extensionEnabled)
+           message += str::format(" (extension: ", f.extensionEnabled->extensionName, ")");
+ 
+-        return message;
++        Logger::warn(message);
++
++        if (!missingFeatures.empty())
++          missingFeatures += ", ";
++
++        missingFeatures += f.readableName;
+       }
+     }
+ 
++    if (!missingFeatures.empty() && env::getEnvVar("DXVK_RELAX_FEATURES") != "1")
++      return str::format("Device does not support required features: ", missingFeatures);
++
+     if (!m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize)
+       return str::format("Device does not support ", MaxTotalPushDataSize, " of push data");
+ 
+@@ -853,7 +867,9 @@ namespace dxvk {
+       ENABLE_FEATURE(core.features, fillModeNonSolid, true),
+       ENABLE_FEATURE(core.features, fragmentStoresAndAtomics, true),
+       ENABLE_FEATURE(core.features, fullDrawIndexUint32, true),
+-      ENABLE_FEATURE(core.features, geometryShader, true),
++      /* Apple GPUs have no geometry shader stage, so MoltenVK never reports it; requiring it
++       * made DXVK reject the device and return zero adapters (Michael-Liendo, msfs2024-apple-silicon). */
++      ENABLE_FEATURE(core.features, geometryShader, false),
+       ENABLE_FEATURE(core.features, imageCubeArray, true),
+       ENABLE_FEATURE(core.features, independentBlend, true),
+       ENABLE_FEATURE(core.features, largePoints, false),
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 3b5b7390..5ec2e4c9 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -334,7 +334,7 @@ namespace dxvk {
+     allocationInfo.resourceCookie = cookie();
+     allocationInfo.properties = m_properties;
+     allocationInfo.mode = mode;
+-    allocationInfo.handleType = m_info.sharing.type;
++    allocationInfo.handleType = m_shared ? m_info.sharing.type : VK_EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BITS_MAX_ENUM;
+ 
+     if (m_info.transient)
+       allocationInfo.mode.set(DxvkAllocationMode::NoDedicated);
+diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
+index a92edbd8..a998eefe 100644
+--- a/src/util/config/config.cpp
++++ b/src/util/config/config.cpp
+@@ -1757,6 +1757,10 @@ namespace dxvk {
+     // Load either $DXVK_CONFIG_FILE or $PWD/dxvk.conf
+     std::string filePath = env::getEnvVar("DXVK_CONFIG_FILE");
+     std::string confLine = env::getEnvVar("DXVK_CONFIG");
++    std::string hbConfLine = env::getEnvVar("HB_DXVK_CONFIG");
++
++    if (!hbConfLine.empty())
++      confLine = confLine.empty() ? hbConfLine : confLine + ";" + hbConfLine;
+ 
+     if (filePath == "")
+       filePath = "dxvk.conf";

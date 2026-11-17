@@ -1,0 +1,27 @@
+From f8ccd68e33967dd88ddd7296a92959e7bf0f7b75 Mon Sep 17 00:00:00 2001
+From: hb <hb@local>
+Date: Tue, 17 Nov 2026 04:56:14 +0500
+Subject: [PATCH 19/27] metalfx: accept KosmicKrisp, which reports the same
+ driverInfo words
+
+---
+ libs/vkd3d/metalfx.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/metalfx.c b/libs/vkd3d/metalfx.c
+index 19cac7f3..cbe6e1d6 100644
+--- a/libs/vkd3d/metalfx.c
++++ b/libs/vkd3d/metalfx.c
+@@ -77,7 +77,8 @@ bool vkd3d_metalfx_driver_has(const struct d3d12_device *device, const char *wor
+     const char *info = device->device_info.vulkan_1_2_properties.driverInfo, *found;
+     size_t length = strlen(word);
+ 
+-    if (device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MOLTENVK)
++    if (device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MOLTENVK &&
++            device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_MESA_KOSMICKRISP)
+         return false;
+     for (found = strstr(info, word); found; found = strstr(found + 1, word))
+     {
+-- 
+2.54.0 (Apple Git-157)
+
