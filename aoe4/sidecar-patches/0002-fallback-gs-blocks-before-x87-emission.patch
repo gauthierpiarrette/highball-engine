@@ -1,0 +1,36 @@
+# Original changes to x87sidecar; provided under its MIT license.
+# Baseline: https://github.com/tarikbc/macgames/releases/tag/runtime-4
+# Translator origin: https://github.com/athei/x87sidecar
+# sidecar-source.tar.gz SHA-256: 50ad26b802a590b7c49a121da35ca632bc2676b2fcde40b663805e612d547ff0
+
+--- a/rosetta_loader/src/sidecar.cpp
++++ b/rosetta_loader/src/sidecar.cpp
+@@ -2453,6 +2453,28 @@
+     // invalidates the persisted X87Cache, which is what a None reply that
+     // skipped the translator needs.
+     std::optional<int64_t> result;
++    // GS-relative operands require Rosetta's get_tls_base routine, whose ABI
++    // owns X29. The custom effective-address path reserves that fixed register
++    // after allocating address temporaries and can collide with a live/pinned
++    // value (AoE IV save-load: translate_fild -> compute_operand_address).
++    // Decline the entire IR block before emitting any custom instruction, so
++    // no cached x87 state has to cross between custom and stock translations.
++    // Keep the allocator assertion: silently reusing the register miscompiles.
++    for (uint64_t i = 0; i < req.num_instrs && !stock_hash_hit; ++i) {
++        const auto& insn = localIR[i];
++        for (unsigned operand = 0; operand < std::min<unsigned>(insn.num_operands, 4); ++operand) {
++            const auto& op = insn.operands[operand];
++            if (op.mem.kind == IROperandKind::MemRef && op.mem.seg_override == 2) {
++                stock_hash_hit = true;
++                static unsigned gs_fallbacks = 0;
++                if (++gs_fallbacks <= 5) {
++                    fprintf(stdout, "[rosettax87] GS/TLS block handed to stock before custom emission\n");
++                    fflush(stdout);
++                }
++                break;
++            }
++        }
++    }
+     if (!stock_hash_hit) {
+         _bypass_guard.ran_translator = true;
+         result = Translator::translate_instruction(

@@ -1,0 +1,60 @@
+# Original changes to x87sidecar; provided under its MIT license.
+# Baseline: https://github.com/tarikbc/macgames/releases/tag/runtime-4
+# Translator origin: https://github.com/athei/x87sidecar
+# sidecar-source.tar.gz SHA-256: 50ad26b802a590b7c49a121da35ca632bc2676b2fcde40b663805e612d547ff0
+
+--- a/rosetta_core/src/TranslatorX87.cpp
++++ b/rosetta_core/src/TranslatorX87.cpp
+@@ -316,6 +316,13 @@
+     const int Wd_tmp = alloc_gpr(*a1, 2);   // x87_push scratch + emit_store_st offset
+     const int Wd_tmp2 = alloc_gpr(*a1, 3);  // x87_push scratch (freed after push)
+     const int Dd_val = alloc_free_fpr(*a1);
++
++    // A cached preceding pop can leave deferred tag updates. Flush these
++    // before the two BCD input registers become live: x87_push would otherwise
++    // allocate two more GPRs while base/TOP/ST-base, scratch and inputs already
++    // occupy seven of the eight slots. Keep the memory loads before the push
++    // so a faulting source does not change the architectural x87 stack.
++    x87_flush_deferred_pops(buf, *a1, Xbase, Wd_top, Wd_tmp);
+ 
+     // Step 1: compute source memory address.
+     const bool addr_is_64 = (a2->operands[0].mem.addr_size == IROperandSize::S64);
+--- a/tests/test_fbld.c
++++ b/tests/test_fbld.c
+@@ -27,6 +27,22 @@
+     return r;
+ }
+ 
++/* Start a new translation block with a pop, so the cached run has a
++ * deferred tag update when FBLD loads its two input registers. */
++static double do_pop_fbld(const uint8_t bcd[10]) {
++    double r;
++    __asm__ volatile(
++        "fld1\n\t"
++        "jmp 1f\n\t"
++        "1: fstp %%st(0)\n\t"
++        "fbld %1\n\t"
++        "fstpl %0\n"
++        : "=m"(r)
++        : "m"(*(const uint8_t (*)[10])bcd)
++        : "st");
++    return r;
++}
++
+ static void check(const char* name, const uint8_t bcd[10], double expected) {
+     double got = do_fbld(bcd);
+     /* Bit-exact compare so -0 vs +0 (and any NaN payload) is caught. */
+@@ -42,6 +58,13 @@
+ }
+ 
+ int main(void) {
++    {
++        const uint8_t b[10] = {0x42};
++        const double got = do_pop_fbld(b);
++        const int ok = got == 42.0;
++        printf("%s  FBLD after deferred pop: %.17g\n", ok ? "PASS" : "FAIL", got);
++        if (!ok) failures++;
++    }
+     /* +0  → all zero, no sign bit */
+     {
+         uint8_t b[10] = {0};

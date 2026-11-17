@@ -26,3 +26,6 @@
 | llvm-mingw | github.com/mstorsjo/llvm-mingw | Apache-2.0 with LLVM exception | build tool only |
 
 Copyright and licence texts of each component are kept unchanged inside the built engine.
+
+The AoE IV patch includes the HDE64 decoder; see [its license](aoe4/Licenses/HDE-LICENSE.txt).
+The AoE IV helper and its patches are MIT-licensed; see [the helper notice](aoe4/Licenses/x87sidecar-MIT.txt) and [source credits](aoe4/README.md#credits).

@@ -1,0 +1,74 @@
+# Original changes to x87sidecar; provided under its MIT license.
+# Baseline: https://github.com/tarikbc/macgames/releases/tag/runtime-4
+# Translator origin: https://github.com/athei/x87sidecar
+# sidecar-source.tar.gz SHA-256: 50ad26b802a590b7c49a121da35ca632bc2676b2fcde40b663805e612d547ff0
+
+--- a/rosetta_loader/src/stub_asm.cpp
++++ b/rosetta_loader/src/stub_asm.cpp
+@@ -1102,19 +1102,8 @@
+     emit_abs_jump_3movs(b.entry,handlerAddr);return b;
+ }
+ 
+-StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+-                          const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
+-    const char* softTarget=std::getenv("AOE_SOFTFAULT_TARGET");
+-    const char* softPC=std::getenv("AOE_SOFTFAULT_PC");
+-    if(softTarget && softPC) {
+-        char *endTarget=nullptr,*endPC=nullptr;
+-        uint64_t target=std::strtoull(softTarget,&endTarget,0),pc=std::strtoull(softPC,&endPC,0);
+-        if(!target || !pc || *endTarget || *endPC) return {};
+-        const char* softEnd=std::getenv("AOE_SOFTFAULT_END"),*softOne=std::getenv("AOE_SOFTFAULT_TARGET1");
+-        uint64_t end=0,one=0;
+-        if(softEnd||softOne){if(!softEnd||!softOne)return {};char *a=nullptr,*b=nullptr;end=std::strtoull(softEnd,&a,0);one=std::strtoull(softOne,&b,0);if(!end||!one||*a||*b)return {};}
+-        return buildSoftFaultHook(handlerAddr,decodeOpcodeAddr,origPrologue16,pc,target,end,one);
+-    }
++static StubBlobs buildGenericDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
++                                       const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
+     StubBlobs blobs;
+ 
+     // The 3-mov+br abs-jump encoding only works while the top 16 bits are zero.
+@@ -1370,4 +1359,44 @@
+     return blobs;
+ }
+ 
++StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
++                         const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
++    const char* softTarget = std::getenv("AOE_SOFTFAULT_TARGET");
++    const char* softPC = std::getenv("AOE_SOFTFAULT_PC");
++    if (!softTarget && !softPC) {
++        return buildGenericDecodeHook(handlerAddr, decodeOpcodeAddr, origPrologue16, hostArplOpcode);
++    }
++    if (!softTarget || !softPC) return {};
++    char *endTarget = nullptr, *endPC = nullptr;
++    const uint64_t target = std::strtoull(softTarget, &endTarget, 0);
++    const uint64_t pc = std::strtoull(softPC, &endPC, 0);
++    if (!target || !pc || *endTarget || *endPC) return {};
++    const char* softEnd = std::getenv("AOE_SOFTFAULT_END");
++    const char* softOne = std::getenv("AOE_SOFTFAULT_TARGET1");
++    uint64_t end = 0, one = 0;
++    if (softEnd || softOne) {
++        if (!softEnd || !softOne) return {};
++        char *a = nullptr, *b = nullptr;
++        end = std::strtoull(softEnd, &a, 0);
++        one = std::strtoull(softOne, &b, 0);
++        if (!end || !one || *a || *b) return {};
++    }
++    auto soft = buildSoftFaultHook(handlerAddr, decodeOpcodeAddr, origPrologue16, pc, target, end, one);
++    if (soft.entry.empty() || soft.handler.size() < 32) return {};
++    // Compose both decoder features. The soft hook first calls its displaced
++    // decoder trampoline; redirect that trampoline to the generic alias hook.
++    // The alias hook alone owns the original prologue and returns to Rosetta.
++    // Thus FCOMP/ARPL stay available, and only a remaining invalid instruction
++    // in the pinned range is lowered to software exception delivery.
++    const uint64_t genericAddr = handlerAddr + soft.handler.size();
++    auto generic = buildGenericDecodeHook(genericAddr, decodeOpcodeAddr, origPrologue16, hostArplOpcode);
++    if (generic.entry.empty() || generic.handler.empty()) return {};
++    std::vector<uint8_t> jump;
++    emit_abs_jump_3movs(jump, genericAddr);
++    if (jump.size() != 16) return {};
++    std::copy(jump.begin(), jump.end(), soft.handler.end() - 32);
++    soft.handler.insert(soft.handler.end(), generic.handler.begin(), generic.handler.end());
++    return soft;
++}
++
+ }  // namespace stub_asm

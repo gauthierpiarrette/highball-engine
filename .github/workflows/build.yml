@@ -25,20 +25,16 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v4
-      - name: pinned source
+      - name: Pinned Wine source and patch series
+        run: .github/scripts/prepare-wine.sh
+      - name: AoE IV patch tests
         run: |
-          set -euo pipefail
-          url=$(python3 -c 'import json;print(json.load(open("inputs.json"))["wine"]["url"])')
-          sha=$(python3 -c 'import json;print(json.load(open("inputs.json"))["wine"]["sha256"])')
-          curl -sSL -o crossover-sources.tar.gz "$url"
-          echo "$sha  crossover-sources.tar.gz" | shasum -a 256 -c -
-          mkdir -p src && tar -xzf crossover-sources.tar.gz -C src
-          ls src/sources/wine | head -3
-      - name: apply patch series
+          aoe4/tests/run.sh "$PWD/src/sources/wine"
+          python3 aoe4/tests/test_tools.py
+      - name: Build the pinned arm64 AoE IV helper
         run: |
-          set -euo pipefail
-          cd src/sources/wine
-          for p in ../../../patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; patch -p1 < "$p"; done
+          command -v cmake >/dev/null || brew install cmake
+          aoe4/build-sidecar.sh "$RUNNER_TEMP/aoe4-helper-build"
       - name: toolchain
         run: |
           set -euo pipefail
@@ -141,23 +137,54 @@ jobs:
           echo "winegstreamer.so links: $(otool -L out/engine/lib/wine/x86_64-unix/winegstreamer.so | awk 'NR > 1 && $1 !~ /^\/(usr\/lib|System)\// {printf "%s ", $1}')"
           echo "engine size: ${before} MB -> $(du -sm out/engine | cut -f1) MB"
           out/engine/bin/wine --version
-          name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
-          tar -C out -czf "${name}.tar.gz" .
-          shasum -a 256 "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
-          ls -la "${name}.tar.gz"
+      - name: Package Wine, AoE IV helper and corresponding source
+        env:
+          BUILD_NOTE: ${{ inputs.ref_note }}
+        run: |
+          set -euo pipefail
+          helper="$RUNNER_TEMP/aoe4-helper-build"
+          aoe=out/engine/share/wine/aoe4
+          mkdir -p "$aoe/profiles"
+          cp "$helper/build/bin/x87sidecar" "$aoe/"
+          codesign --verify --strict "$aoe/x87sidecar"
+          cp aoe4/profiles/*.cache "$aoe/profiles/"
+          cp aoe4/Licenses/x87sidecar-MIT.txt "$aoe/"
+          cp aoe4/Licenses/HDE-LICENSE.txt out/engine/share/wine/
+
+          note=${BUILD_NOTE:-manual}
+          case "$note" in *[!a-zA-Z0-9._-]*) echo "ref_note must be a filename suffix" >&2; exit 1 ;; esac
+          name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-$note"
+          tar -C out -czf "$name.tar.gz" .
+          shasum -a 256 "$name.tar.gz" | tee "$name.tar.gz.sha256"
+
+          source="$RUNNER_TEMP/corresponding-source"
+          mkdir -p "$source/.github/workflows" "$source/.github/scripts"
+          cp -R crossover-sources.tar.gz patches inputs.json LICENSE NOTICE.md aoe4 "$source/"
+          cp .github/workflows/build.yml "$source/.github/workflows/"
+          cp .github/scripts/prepare-wine.sh "$source/.github/scripts/"
+          tar --exclude=.git -czf "$source/sidecar-patched.tar.gz" -C "$helper/source" .
+          git -C "$helper/source" rev-parse HEAD > "$source/SIDECAR_COMMIT"
+          echo "$GITHUB_SHA" > "$source/ENGINE_COMMIT"
+          tar -czf "corresponding-source-$name.tar.gz" -C "$source" .
+          shasum -a 256 "corresponding-source-$name.tar.gz" > "corresponding-source-$name.tar.gz.sha256"
+          echo "ENGINE_NAME=$name" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
           name: engine
           path: |
             engine-*.tar.gz
             engine-*.tar.gz.sha256
+            corresponding-source-*.tar.gz
+            corresponding-source-*.tar.gz.sha256
           retention-days: 14
       - name: publish release
-        if: ${{ github.event.inputs.publish_release == 'true' }}
+        if: ${{ inputs.publish_release }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          f=$(ls engine-*.tar.gz | head -1)
-          tag="${f%.tar.gz}"
-          gh release create "$tag" "$f" "$f.sha256" --title "$tag" --notes "Wine from the pinned CrossOver source (inputs.json) with the patch series in patches/. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."
+          f="$ENGINE_NAME.tar.gz"
+          source="corresponding-source-$f"
+          gh release create "$ENGINE_NAME" "$f" "$f.sha256" "$source" "$source.sha256" \
+            --target "$GITHUB_SHA" --title "$ENGINE_NAME" \
+            --notes "Wine and the AoE IV helper built from pinned source by run $GITHUB_RUN_ID. Checksums and corresponding source are included."

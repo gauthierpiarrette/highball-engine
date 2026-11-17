@@ -1,0 +1,23 @@
+name: AoE IV patch tests
+on:
+  pull_request:
+    paths:
+      - ".github/scripts/prepare-wine.sh"
+      - ".github/workflows/aoe4-tests.yml"
+      - ".github/workflows/build.yml"
+      - "inputs.json"
+      - "patches/**"
+      - "aoe4/**"
+permissions:
+  contents: read
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply the Wine 11 patch series
+        run: .github/scripts/prepare-wine.sh
+      - name: Test the AoE IV patch
+        run: |
+          aoe4/tests/run.sh "$PWD/src/sources/wine"
+          python3 aoe4/tests/test_tools.py
