@@ -20,7 +20,7 @@ reader automatically.
 ## Build and check
 
 The Intel `build-engine` workflow applies the patch, runs its tests,
-and builds the pinned arm64 helper. The engine archive includes the helper,
+and builds the arm64 helper from the commit pinned in `inputs.json`. The engine archive includes the helper,
 profiles and license notices under `share/wine/aoe4`; the release also includes
 corresponding source.
 
@@ -56,6 +56,6 @@ of the final combined PR head. Smaller stutters remain in Late Siege.
 ## Credits
 
 Wine thunks/cache: [Marc Ibrahim's LGPL source, mirrored by NerRobDog](https://github.com/NerRobDog/wine-aoe4/tree/711c6fc7559a565c417aab4d52d84b09767a9c1d).
-MIT helper: [NerRobDog/x87sidecar, based on athei and Lifeisawful](https://github.com/NerRobDog/x87sidecar/tree/c407ddfabbbe6bc5f5d56a258a4866ac89b04d8e).
+MIT helper: [himbeles/x87sidecar](https://github.com/himbeles/x87sidecar/tree/4babc6e8da78feda25ffda8264d0bf178c5a27fa), based on NerRobDog, athei and Lifeisawful.
 MIT decoder composition, GS fallback and FBLD fixes: [MacGames](https://github.com/tarikbc/macgames/tree/1579841b15ce569807b92af95b478c752c26df3d/patches/x87sidecar).
-Source pins and patch hashes are in [inputs.json](../../inputs.json); [licenses](licenses/) accompany the engine.
+Source pins are in [inputs.json](../../inputs.json); [licenses](licenses/) accompany the engine.

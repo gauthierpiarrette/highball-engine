@@ -28,4 +28,4 @@
 Copyright and licence texts of each component are kept unchanged inside the built engine.
 
 The AoE IV patch includes the HDE64 decoder; see [its license](patches/aoe4/licenses/HDE-LICENSE.txt).
-The AoE IV helper and its patches are MIT-licensed; see [the helper notice](patches/aoe4/licenses/x87sidecar-MIT.txt) and [source credits](patches/aoe4/README.md#credits).
+The AoE IV helper is MIT-licensed; see [the helper notice](patches/aoe4/licenses/x87sidecar-MIT.txt) and [source credits](patches/aoe4/README.md#credits).

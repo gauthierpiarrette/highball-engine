@@ -164,9 +164,9 @@ jobs:
           mkdir -p "$source/.github/workflows" "$source/.github/scripts" "$source/tests"
           cp -R crossover-sources.tar.gz patches inputs.json LICENSE NOTICE.md "$source/"
           cp .github/workflows/build.yml "$source/.github/workflows/"
-          cp .github/scripts/{build-aoe4-sidecar.sh,prepare-aoe4-sidecar.py} "$source/.github/scripts/"
+          cp .github/scripts/build-aoe4-sidecar.sh "$source/.github/scripts/"
           cp -R tests/aoe4 "$source/tests/"
-          tar --exclude=.git -czf "$source/sidecar-patched.tar.gz" -C "$RUNNER_TEMP/aoe4-helper-build/source" .
+          tar --exclude=.git -czf "$source/sidecar-source.tar.gz" -C "$RUNNER_TEMP/aoe4-helper-build/source" .
           echo "$GITHUB_SHA" > "$source/ENGINE_COMMIT"
           tar -czf aoe4-corresponding-source.tar.gz -C "$source" .
           shasum -a 256 aoe4-corresponding-source.tar.gz > aoe4-corresponding-source.tar.gz.sha256

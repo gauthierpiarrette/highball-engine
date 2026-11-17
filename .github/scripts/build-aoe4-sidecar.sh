@@ -8,7 +8,7 @@ helper_repo=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["a
 helper_commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aoe4Sidecar"]["commit"])' "$repo_root/inputs.json")
 git clone --no-checkout "$helper_repo" "$work/source"
 git -C "$work/source" checkout --detach "$helper_commit"
-python3 "$repo_root/.github/scripts/prepare-aoe4-sidecar.py" "$work/source"
+[[ "$(git -C "$work/source" rev-parse HEAD)" == "$helper_commit" ]]
 cmake -S "$work/source" -B "$work/build" -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_BUILD_TYPE=Release
 cmake --build "$work/build" --target x87sidecar --parallel
 helper="$work/build/bin/x87sidecar"
