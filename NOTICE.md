@@ -28,4 +28,4 @@
 Copyright and licence texts of each component are kept unchanged inside the built engine.
 
 The AoE IV patch includes the HDE64 decoder; see [its license in patch 0032](patches/0032-aoe4-rosetta-profile-cache.patch).
-The AoE IV helper is MIT-licensed; see [the helper notice](https://github.com/himbeles/x87sidecar-aoe4/blob/f02887422ec3a671718261e1a31cb0e1c232bbbe/LICENSE) and [source credits](https://github.com/himbeles/highball-engine-aoe4/blob/main/proposals/aoe4/README.md#credits).
+The shared x87sidecar is MIT-licensed. Its archive includes the upstream license. See the [helper patch series and source credits](x87sidecar/patches/README.md).

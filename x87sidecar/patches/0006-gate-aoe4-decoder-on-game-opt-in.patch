@@ -1,0 +1,28 @@
+x87sidecar: select AoE decoding only on an opted-in Wine launch
+
+Kind: Highball integration. License: MIT (upstream LICENSE).
+Wine supplies the decoder addresses after checking the game image.
+
+--- a/rosetta_loader/src/stub_asm.cpp
++++ b/rosetta_loader/src/stub_asm.cpp
+@@ -1387,7 +1387,8 @@
+                          const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
+     const char* softTarget = std::getenv("AOE_SOFTFAULT_TARGET");
+     const char* softPC = std::getenv("AOE_SOFTFAULT_PC");
+-    if (!softTarget && !softPC) {
++    const char* enabled = std::getenv("HB_AOE4");
++    if (!enabled || std::strcmp(enabled, "1") || (!softTarget && !softPC)) {
+         return buildGenericDecodeHook(handlerAddr, decodeOpcodeAddr, origPrologue16, hostArplOpcode);
+     }
+     if (!softTarget || !softPC) return {};
+--- a/scripts/test_aoe_softfault.py
++++ b/scripts/test_aoe_softfault.py
+@@ -14,7 +14,7 @@
+     fields = line.split()
+     if len(fields) == 3:
+         symbols[fields[2]] = int(fields[0], 16)
+-env = dict(os.environ,
++env = dict(os.environ, HB_AOE4="1",
+     AOE_SOFTFAULT_PC=hex(symbols['_aoe_softfault_begin']),
+     AOE_SOFTFAULT_END=hex(symbols['_aoe_softfault_end']),
+     AOE_SOFTFAULT_TARGET=hex(symbols['_aoe_softfault_handler']),

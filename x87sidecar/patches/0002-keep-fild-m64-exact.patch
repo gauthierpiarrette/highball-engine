@@ -1,0 +1,863 @@
+From 052944fc613e187f5e238bfa362b411787045d6b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Alexander=20Thei=C3=9Fen?= <alex@theissen.io>
+Date: Fri, 13 Nov 2026 20:38:23 +0400
+Subject: [PATCH] Keep fild m64 values exact in IR runs (#57)
+
+With native slots on, an IR run converted every `fild m64` to binary64,
+so an int64 of 2^53 or more lost its low bits when the run ended with it
+on the stack or stored it with `fistp m64` (#53). `pass_exact_i64_copy`
+kept the raw bits only when every use was a 64-bit store, and the direct
+path's exact `fild` planning never applies to IR runs.
+
+## Changes
+
+- With native slots on, keep the loaded bits for `fistp`/`fisttp m64`
+stores and for the stack at the run's end, and write the slot back with
+`emit_i64_to_f80_slot`.
+- Give every other reader (arithmetic, compares, `fst`, `fist m16/m32`,
+`fcmov`) a separate `CvtI64` node, so only that reader sees the rounded
+value.
+- Stop gating the exact copy on the `fild_fistp` fusion knob under
+native slots.
+- Count the write-back and `CvtI64` in the GPR and FPR pressure models.
+- Native slots off: unchanged.
+- Test the shapes in `test_x87_cross_reply_exact`, run phase 19 also
+with `X87_DISABLE_ALL_FUSIONS=1`, and drop the `test_fild_fistp_copy`
+skip from the `X87_SMC_SPLIT=2` sweep.
+- Update README and internals.md, including where `fcmov` and the direct
+emitters still round.
+
+## Validation
+
+Failures in the new `test_x87_cross_reply_exact` cases, macOS 27.2.1
+(26B131):
+
+| config | master | branch |
+|---|---|---|
+| default and IR variants | 2432 | 0 |
+| `X87_SMC_SPLIT=2` | 2432 | 0 |
+| IR off, `X87_GPR_POOL_LIMIT=4`, stock | 0 | 0 |
+| `X87_NATIVE_SLOTS=0` (expected to fail) | 6920 | 6920 |
+
+- `test_fild_fistp_copy` under `X87_SMC_SPLIT=2` and under
+`X87_DISABLE_ALL_FUSIONS=1`: fails on master, passes on the branch.
+- Full suite: 1579 passed, 0 failed, 2 known stock divergences.
+- Emitted code: identical for all benchmarks; it changes only in blocks
+with an exact `fild m64` copy. `ir_pressure_replay` counters are
+unchanged.
+
+## Not covered
+
+- `fcmov` still rounds the register it writes (#55).
+- Outside IR runs, a register that arithmetic or a compare reads is
+still converted to binary64 in place, as documented for the native
+slots.
+
+Fixes #53.
+
+Kind: upstream backport
+License: MIT (see upstream LICENSE)
+---
+ README.md                                 |  17 ++-
+ docs/internals.md                         |  77 ++++++----
+ rosetta_core/include/rosetta_core/X87IR.h |  21 ++-
+ rosetta_core/src/X87IRLower.cpp           | 103 +++++++------
+ rosetta_core/src/X87IROptimize.cpp        | 114 +++++++++++++--
+ scripts/run_tests.sh                      |  25 ++--
+ tests/test_x87_cross_reply_exact.c        | 167 ++++++++++++++++++++++
+ 7 files changed, 414 insertions(+), 110 deletions(-)
+
+diff --git a/README.md b/README.md
+index 900a71c..1034f1f 100644
+--- a/README.md
++++ b/README.md
+@@ -328,10 +328,11 @@ binary64 exponent range; at 64-bit or 24-bit precision control, for 64-bit
+ integers above 2^53 that meet arithmetic and for sequences that carry extra
+ precision from one instruction to the next, such as the `fyl2x`-based
+ `pow`, they do not. The registers themselves stay in Rosetta's 80-bit
+-format, and a register is converted to binary64 only where arithmetic reads
+-it, so a value that is only loaded, held on the stack, copied, exchanged or
+-stored keeps all its bits, across blocks too: a `fild m64; fistp m64` copy
+-moves its eight bytes unchanged and an `fld m80; fstp m80` copy its ten.
++format, and a register is converted to binary64 only where arithmetic, a
++compare or `fcmov` reads it, so a value that is only loaded, held on the
++stack, copied, exchanged or stored keeps all its bits, across blocks too: a
++`fild m64; fistp m64` copy moves its eight bytes unchanged and an `fld m80;
++fstp m80` copy its ten.
+ `X87_NATIVE_SLOTS=0` goes back to converting every register to binary64 in
+ each reply with floating-point work.
+ [docs/internals.md](docs/internals.md#precision-and-the-floating-point-environment)
+@@ -375,9 +376,7 @@ Code that rewrites itself runs in its new form at the next instruction, as
+ under stock Rosetta, once the sidecar has seen its page rewritten: on such
+ a page an x87 run ends after each store, so a store into the run's own code
+ takes effect. The execution that first rewrites a page can still run one
+-stale instruction, and on such a page an IR run rounds an `fild m64` value
+-still on the stack at its end
+-([#53](https://github.com/athei/x87sidecar/issues/53)).
++stale instruction.
+ [docs/internals.md](docs/internals.md#code-on-writable-pages) says how
+ pages are picked, what was tested and what it costs.
+ 
+@@ -469,8 +468,8 @@ knowing. Bracketed values are defaults.
+ | `X87_BRIDGE_V2=0` | disable bridging across flag-writing ALU whose flags Rosetta's liveness proves dead [on] |
+ | `X87_ENABLE_IR_SPLIT=0`, `X87_ENABLE_IR_REMAT=0` | disable register-pressure relief: splitting over-pressure runs, sinking long-lived values [on] |
+ | `X87_NATIVE_TRANSPORT=0` | put replies made only of integer loads and stores (`fild`, `fistp`, ...) back through the ordinary replies, which with `X87_NATIVE_SLOTS=0` round int64 values of 2^53 or more held on the stack; for bisecting [on] |
+-| `X87_NATIVE_SLOTS=0` | go back to converting all eight x87 registers to binary64 and back in every reply with floating-point work, which rounds values held on the stack, copied, exchanged, stored with `fst`/`fistp` or saved with `fsave`; for bisecting. By default the registers stay in their native 80-bit slots and a register is converted to binary64 only where arithmetic reads it, so those values keep all 80 bits as on real x87 [on, see [docs/internals.md](docs/internals.md#asynchronous-signals-inside-emitted-code)] |
+-| `X87_SMC_SPLIT=0` | keep x87 runs whole in code the guest rewrites; for bisecting. By default, on a page the guest can make writable and whose code bytes the sidecar has seen change, a run ends after each x87 store and is not bridged, so a store that rewrites a later instruction of the same run takes effect, as in stock Rosetta, except in the execution that first changes the page. x87 loops with stores inside a run get slower on such pages, 1.29 times as a geometric mean over the benchmarks with the split forced on, and [#53](https://github.com/athei/x87sidecar/issues/53) rounds some int64 copies there. In the tests, code on a private file mapping or an RWX page that is never written keeps its emitted code; no wine run was done. `=2` applies it to every block, for testing [on, see [docs/internals.md](docs/internals.md#code-on-writable-pages)] |
++| `X87_NATIVE_SLOTS=0` | go back to converting all eight x87 registers to binary64 and back in every reply with floating-point work, which rounds values held on the stack, copied, exchanged, stored with `fst`/`fistp` or saved with `fsave`; for bisecting. By default the registers stay in their native 80-bit slots and a register is converted to binary64 only where arithmetic, a compare or `fcmov` reads it, so those values keep all 80 bits as on real x87 [on, see [docs/internals.md](docs/internals.md#asynchronous-signals-inside-emitted-code)] |
++| `X87_SMC_SPLIT=0` | keep x87 runs whole in code the guest rewrites; for bisecting. By default, on a page the guest can make writable and whose code bytes the sidecar has seen change, a run ends after each x87 store and is not bridged, so a store that rewrites a later instruction of the same run takes effect, as in stock Rosetta, except in the execution that first changes the page. x87 loops with stores inside a run get slower on such pages, 1.29 times as a geometric mean over the benchmarks with the split forced on. In the tests, code on a private file mapping or an RWX page that is never written keeps its emitted code; no wine run was done. `=2` applies it to every block, for testing [on, see [docs/internals.md](docs/internals.md#code-on-writable-pages)] |
+ | `X87_PRECISE_FAULTS=1` | for a program that aborts with "unexpectedly need to EmulateForward on a synchronous exception": probe the memory operand of each reply's first x87 instruction and answer runs of integer loads and stores one instruction per reply, so a memory fault there reaches the program's handler; costs up to 7 percent on x87 loops, makes an x87 store into write-combined memory 23 to 40 times slower, and faults later in a floating-point run still abort. `=2` also ends each x87 run before every later memory access, so every fault reaches the handler, and makes x87 loops up to 63 times slower (3.7 times as a geometric mean); it needs `X87_NATIVE_SLOTS` and acts as `=1` without it [off: any memory fault in translated x87 code aborts] |
+ | `X87_DISABLE_X87_IR=1` | direct translator only, no IR pipeline |
+ | `X87_DISABLE_ALL_FUSIONS=1`, `X87_DISABLE_FUSIONS=f1,f2` | disable every fusion, or the named ones (`--help` lists the names) |
+diff --git a/docs/internals.md b/docs/internals.md
+index 852c330..9aa242f 100644
+--- a/docs/internals.md
++++ b/docs/internals.md
+@@ -173,7 +173,7 @@ work; `X87_NATIVE_SLOTS=0` turns them off and brings back the compact slots
+ and their conversion. The register file stays in the native layout for the
+ whole reply, and there is no entry or exit conversion of all eight slots. A
+ slot is converted to binary64 in place, inside its own ten bytes, only where
+-an instruction reads it for arithmetic or a compare; an IR run, an
++an instruction reads it for arithmetic, a compare or `fcmov`; an IR run, an
+ `fst m32`/`fst m64`, an integer store and the single-op fast path convert it
+ into a register instead and leave the slot as it is. `fld st(i)`, `fst` and
+ `fstp` to a register, `fxch` and the deferred FXCH flush, `fld m80`,
+@@ -191,7 +191,25 @@ holds 80-bit values and int64s across every kind of reply the translator
+ emits and checks that they come out bit for bit. It also reads them in the
+ reply between and compares each read with the same read done in the block
+ that loaded the value; `--dump` prints the reads, and a run under stock
+-Rosetta prints the same ones.
++Rosetta prints the same ones. Its last group loads the int64 inside an IR
++run that ends with the value still on the stack.
++
++In an IR run, an `fild m64` that the run stores with `fistp m64` or
++`fisttp m64`, or leaves on the stack, is loaded as its eight bytes, and the
++fusion knobs do not change that. Those stores write the bytes unchanged, and
++the run's end writes the exact 80-bit value into every slot that holds the
++value or one of its `fld st(i)` copies. A reader that needs the number
++(arithmetic, a compare, `fst` to m32 or m64, `fist` or `fistp` to m16 or
++m32, `fcmov`) reads a binary64 conversion of the bytes in a register of its
++own. It sees the value rounded, but the value keeps its exact bits for the
++64-bit integer stores and the stack, also when arithmetic reads it. The
++direct emitters, outside IR runs, convert a register that arithmetic or a
++compare reads in place, so that register stays rounded, and only the
++`fld st(i)` copies made before keep their bits. `fcmov` is the exception:
++in an IR run the register it writes holds the rounded value, and the direct
++emitters, which take every `fcmov` without an `fcomi` earlier in its run,
++convert the value in place, so all its copies are rounded. Stock keeps them
++all exact.
+ 
+ An opaque save/restore round trip can hide a layout mismatch: the same
+ misinterpreted bytes can be copied out and back unchanged. It fails when a
+@@ -470,14 +488,6 @@ without its warm-up
+ (`SMC_NO_WARMUP=1`), each of the six same-run patches gets its first
+ iteration wrong and the other 499 right.
+ 
+-On a marked page the shorter runs also expose
+-[#53](https://github.com/athei/x87sidecar/issues/53): an IR run rounds an
+-`fild m64` value that is still on the x87 stack when the run ends to
+-binary64, so an int64 copy such as `fild m64; fld st(0); fistp m64; fistp
+-m64` that the split ends inside loses the low bits of values of 2^53 or
+-more. That is the current behaviour on marked pages, and with
+-`X87_SMC_SPLIT=2` on every page.
+-
+ What the tests show, on an M5 Max against the build without the rule:
+ 
+ - Code the guest can make writable but never rewrites keeps its runs. In
+@@ -677,17 +687,21 @@ from one block to the next arrives intact. Inside a run that also holds
+ other instructions, the `fild_fistp` fusion (a lone pair, or up to three
+ nested pairs) and an IR pass copy the eight bytes as long as nothing else
+ reads the value. With the native slots, the default, the value keeps its 80
+-bits until arithmetic reads it (see [Asynchronous signals inside emitted
+-code](#asynchronous-signals-inside-emitted-code)), so the copy is exact
+-whatever runs in between, with the IR on or off. An integer store converts
+-the 80-bit value exactly when five scratch registers are free; with fewer,
+-the stored integer comes from a binary64 copy and the register keeps its
+-bits. With `X87_NATIVE_SLOTS=0` what remains is a value that meets
+-arithmetic, or that is on the stack while a reply with floating-point work
+-runs, since that reply converts its slots to binary64: above 2^53 in
+-magnitude it is rounded, and 2^53 + 1 comes back as 2^53 and 2^62 + 3 as
+-2^62. With the IR off as well, a copy inside such a mixed run is exact only
+-where the fusion matches it.
++bits until arithmetic, a compare or `fcmov` reads it (see [Asynchronous
++signals inside emitted code](#asynchronous-signals-inside-emitted-code)),
++and an `fld st(i)` copy of it keeps them when another copy is read that
++way, so the copy is exact whatever runs in between, with the IR and the
++fusions on or off. The exception is `fcmov`: the copy it writes is rounded,
++and outside an IR run so is the value it reads, in every copy. An integer
++store converts the 80-bit value exactly when five scratch registers are
++free; with fewer, the stored integer comes from a binary64 copy and the
++register keeps its bits. With `X87_NATIVE_SLOTS=0` what remains is a value
++that meets arithmetic, or that is on the stack while a reply with
++floating-point work runs, since that reply converts its slots to binary64:
++above 2^53 in magnitude it is rounded, and 2^53 + 1 comes back as 2^53 and
++2^62 + 3 as 2^62. There the IR pass is switched off with the `fild_fistp`
++fusion, and with the IR off as well, a copy inside such a mixed run is
++exact only where the fusion matches it.
+ 
+ `fld m80; fstp m80`, the code for a `long double` or Delphi `Extended`
+ assignment, is copied the same way by the `fld_fstp_m80` fusion: the ten
+@@ -824,15 +838,18 @@ reverse of the hardware.
+ 
+ These differences from stock Rosetta remain with the native slots.
+ Arithmetic is still binary64, with the precision-control and exponent-range
+-differences above. A register that arithmetic, a compare, `fxam` or `ftst`
+-reads is converted to binary64 in place, so it stays rounded for the rest of
+-its life, also when a later `fstp m80` stores it, where stock would keep the
+-untouched source register's 80 bits. An integer store short of registers
+-rounds the stored value through binary64, as described above. Reading an
+-80-bit value as binary64 (for arithmetic, or for `fst m64`) always rounds to
+-nearest even, where the hardware's `fst m64` follows the control word's RC;
+-`fst m32` rounds by MXCSR.RC, like the arithmetic, and a finite value beyond
+-binary64's range becomes infinity whatever the rounding mode.
++differences above. Outside an IR run, a register that arithmetic, a
++compare, `fcmov`, `fxam` or `ftst` reads is converted to binary64 in place,
++so it stays rounded for the rest of its life, also when a later `fstp m80`
++stores it, where stock would keep the untouched source register's 80 bits.
++Inside an IR run, an `fild m64` value keeps its exact bits for the 64-bit
++integer stores and the stack even when arithmetic reads it. An integer
++store short of registers rounds the stored value through binary64, as
++described above. Reading an 80-bit value as binary64 (for
++arithmetic, or for `fst m64`) always rounds to nearest even, where the
++hardware's `fst m64` follows the control word's RC; `fst m32` rounds by
++MXCSR.RC, like the arithmetic, and a finite value beyond binary64's range
++becomes infinity whatever the rounding mode.
+ 
+ An unnormal, pseudo-infinity or pseudo-NaN (integer bit clear, exponent not
+ zero) reads as the default NaN with the native slots and without them, as
+diff --git a/rosetta_core/include/rosetta_core/X87IR.h b/rosetta_core/include/rosetta_core/X87IR.h
+index e2dbdb4..10cf83b 100644
+--- a/rosetta_core/include/rosetta_core/X87IR.h
++++ b/rosetta_core/include/rosetta_core/X87IR.h
+@@ -36,6 +36,8 @@ enum class Op : uint8_t {
+     ConstZero,  // 0.0
+     ConstOne,   // 1.0
+     ConstF64,   // arbitrary f64 constant (imm_bits in payload)
++    CvtI64,     // inputs[0] holds an int64's bits (a LoadF64 retagged by
++                // pass_exact_i64_copy); convert them to f64
+ 
+     // Binary arithmetic
+     FAdd,
+@@ -159,6 +161,13 @@ enum NodeFlags : uint8_t {
+     kFmaReduceMember = 1 << 5,  // FMAdd / LoadF32 absorbed by a chain (incl. head)
+ 
+     kBridge64 = 1 << 6,  // Bridge*: 64-bit operand width (default 32-bit)
++
++    // LoadF64 retagged from an fild m64 (pass_exact_i64_copy) whose value is
++    // still on the stack when the run ends: its FPR holds the int64's bits,
++    // and lower()'s write-back stores the exact 80-bit value into the native
++    // slot (X87_NATIVE_SLOTS only).  Readers that need a number read a
++    // CvtI64 of it.
++    kExactI64 = 1 << 7,
+ };
+ 
+ // Guest GPR numbers inside Bridge* nodes' inputs[] — negative so every pass
+@@ -324,8 +333,16 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
+            int run_length, bool allow_bridges = false, bool bridges_v2 = false);
+ 
+ // Run optimization passes on the IR (DSE, FMA detection, FCOM+FSTSW fusion,
+-// exact int64 copy).
+-void optimize(Context& ctx);
++// exact int64 copy).  native_slots: the run lowers into a reply with
++// X87_NATIVE_SLOTS, whose write-back can store an exact fild m64 value.
++void optimize(Context& ctx, bool native_slots);
++
++// Open a slot at `pos` by shifting nodes [pos..) and their node_src entries
++// up one, and remap every node reference (inputs, slot_val, initial_read,
++// last_fcmp, last_fcomi) past it.  nodes[pos] and node_src[pos] keep a copy
++// of what moved to pos + 1; the caller writes them.  Returns false when the
++// node budget is exhausted.
++bool insert_node_at(Context& ctx, int pos);
+ 
+ // pass_fma_reduce diagnostics.  Atomic counters incremented as the pass
+ // walks a Context, plus a reject-reason histogram for chains the pass
+diff --git a/rosetta_core/src/X87IRLower.cpp b/rosetta_core/src/X87IRLower.cpp
+index 2b15de7..b826ed0 100644
+--- a/rosetta_core/src/X87IRLower.cpp
++++ b/rosetta_core/src/X87IRLower.cpp
+@@ -763,6 +763,21 @@ void lower(Context& ctx, TranslationResult* result) {
+                 emit_f64_const(buf, Dd, n.imm_bits, Wd_tmp);
+                 break;
+             }
++            case Op::CvtI64: {
++                // The input FPR holds an fild m64's bits.  SCVTF from a GPR,
++                // as LoadI64 converts.
++                const int Dn = fprs.get(n.inputs[0]);
++                int Dd = fprs.try_reuse_input(ctx, i);
++                if (Dd < 0) {
++                    Dd = alloc_free_fpr(*result);
++                }
++                fprs.node_fpr[i] = static_cast<int8_t>(Dd);
++                const int Xv = alloc_free_gpr(*result);
++                emit_fmov_d_to_x(buf, Xv, Dn);
++                emit_scvtf_x_to_d(buf, Dd, Xv);
++                free_gpr(*result, Xv);
++                break;
++            }
+ 
+             // ── Binary arithmetic ───────────────────────────────────────────
+             case Op::FAdd: {
+@@ -1537,6 +1552,22 @@ void lower(Context& ctx, TranslationResult* result) {
+         if (Dd < 0) {
+             continue;  // dead or already freed
+         }
++        if (ctx.nodes[val].flags & kExactI64) {
++            // Dd holds an fild m64's integer bits: write its exact 80-bit
++            // value, as translate_fild_native does, so the exit leaves the
++            // slot as it is.
++            emit_native_st_addr(buf, Xbase, Wd_top, d, Wd_tmp, Xst_base);
++            const int Xint = alloc_free_gpr(*result);
++            const int Xs = alloc_free_gpr(*result);
++            const int Xe = alloc_free_gpr(*result);
++            emit_fmov_d_to_x(buf, Xint, Dd);
++            TranslatorX87::emit_i64_to_f80_slot(buf, Wd_tmp, Xint, Xs, Xe);
++            free_gpr(*result, Xe);
++            free_gpr(*result, Xs);
++            free_gpr(*result, Xint);
++            x87_slot_note_native(d);
++            continue;
++        }
+         emit_store_st(buf, Xbase, Wd_top, d, Wd_tmp, Dd, Xst_base);
+     }
+ 
+@@ -1634,6 +1665,7 @@ void lower(Context& ctx, TranslationResult* result) {
+ //   - LoadF64, LoadF32, StoreF64, StoreF32: 1 (addr from compute_operand_address);
+ //     3 for a StoreF32 narrowing an 80-bit slot (narrows_native_slot)
+ //   - LoadI16/I32/I64: 2 (addr + Wd_val)
++//   - CvtI64: 1 (the bits between FMOV and SCVTF)
+ //   - StoreI16/I32/I64: 2 (Wd_int + the indefinite guard's Xt, then Wd_int + addr);
+ //     4 for an exact store of an 80-bit slot (stores_native_slot)
+ //   - FRndInt without RC cache: 1 (Wd_rc via alloc_gpr(3))
+@@ -1645,6 +1677,8 @@ void lower(Context& ctx, TranslationResult* result) {
+ //   - FStsw (non-fused): 2 (Wd_sw + Wd_adj if top_delta != 0)
+ //   - StoreCW/LoadCW: 2 (addr + Wd_cw)
+ //   - Epilogue (top_delta != 0): 2 (Wd_tmp2 + Wd_tagw)
++//   - Epilogue write-back of a kExactI64 value: 3 (Xint, Xs, Xe), with
++//     every pinned register still held
+ //
+ // Fused FCmp/FTst holds 1 GPR (Wd_packed) alive across nodes until FStsw.
+ // We track this as a "held" count that overlaps with per-node transient demand.
+@@ -1781,6 +1815,11 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
+                 transient = 4;
+                 break;
+ 
++            // CvtI64: the int64 bits pass through one GPR.
++            case Op::CvtI64:
++                transient = 1;
++                break;
++
+             // 1 GPR: addr from compute_operand_address
+             case Op::LoadF64:
+             case Op::LoadF32:
+@@ -1888,6 +1927,25 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
+         }
+     }
+ 
++    // Epilogue write-back: an exact fild m64 value left on the stack takes
++    // Xint, Xs and Xe for its conversion before the tag update frees
++    // Xst_base.  An overflow is attributed to the last node, as below.
++    bool exact_writeback = false;
++    for (const short v : ctx.slot_val) {
++        if (v >= 0 && v < ctx.num_nodes && (ctx.nodes[v].flags & kExactI64) &&
++            !(ctx.nodes[v].flags & kDead)) {
++            exact_writeback = true;
++        }
++    }
++    if (exact_writeback) {
++        const int writeback_total = pinned + held + 3;
++        peak = std::max(writeback_total, peak);
++        if (first_over_node && *first_over_node < 0 && writeback_total > budget &&
++            ctx.num_nodes > 0) {
++            *first_over_node = ctx.num_nodes - 1;
++        }
++    }
++
+     // Epilogue: if top_delta != 0, needs 2 more transient GPRs (Wd_tmp2 + Wd_tagw).
+     // lower() releases Xst_base before allocating those two — the tag-batch
+     // helpers don't use it — so the actual peak at the epilogue is
+@@ -1990,6 +2048,7 @@ int peak_live_fprs(const Context& ctx, int budget, int* first_over_node) {
+             case Op::ConstZero:
+             case Op::ConstOne:
+             case Op::ConstF64:
++            case Op::CvtI64:
+             case Op::FAdd:
+             case Op::FSub:
+             case Op::FMul:
+@@ -2230,49 +2289,9 @@ static int split_prefix_len(const Context& ctx, int first_over_node, int attempt
+ // inputs, slot_val, initial_read, last_fcmp/last_fcomi, node_src — are
+ // remapped.  The caller retargets the consumer afterwards.
+ static bool insert_clone_at(Context& ctx, int src, int pos) {
+-    if (ctx.num_nodes >= kMaxNodes || src >= pos) {
++    if (src >= pos || !insert_node_at(ctx, pos)) {
+         return false;
+     }
+-    const int n = ctx.num_nodes;
+-    std::memmove(&ctx.nodes[pos + 1], &ctx.nodes[pos], static_cast<size_t>(n - pos) * sizeof(Node));
+-    std::memmove(&ctx.node_src[pos + 1], &ctx.node_src[pos],
+-                 static_cast<size_t>(n - pos) * sizeof(int16_t));
+-    ctx.num_nodes = static_cast<int16_t>(n + 1);
+-
+-    const auto remap = [pos](int16_t& ref) {
+-        if (ref >= pos) {
+-            ref = static_cast<int16_t>(ref + 1);
+-        }
+-    };
+-    for (int i = 0; i < ctx.num_nodes; i++) {
+-        if (i == pos) {
+-            continue;  // clone slot, written below
+-        }
+-        const int nrefs = node_ref_input_count(ctx.nodes[i]);
+-        for (int k = 0; k < nrefs; k++) {
+-            auto& in = ctx.nodes[i].inputs[k];
+-            if (in >= 0) {
+-                remap(in);
+-            }
+-        }
+-    }
+-    for (auto& v : ctx.slot_val) {
+-        if (v >= 0) {
+-            remap(v);
+-        }
+-    }
+-    for (auto& v : ctx.initial_read) {
+-        if (v >= 0) {
+-            remap(v);
+-        }
+-    }
+-    if (ctx.last_fcmp >= 0) {
+-        remap(ctx.last_fcmp);
+-    }
+-    if (ctx.last_fcomi >= 0) {
+-        remap(ctx.last_fcomi);
+-    }
+-
+     ctx.nodes[pos] = ctx.nodes[src];  // src < pos: unshifted
+     ctx.nodes[pos].flags = kNone;
+     ctx.node_src[pos] = ctx.node_src[pos + 1];  // same instruction as the consumer
+@@ -2541,7 +2560,7 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
+             return 0;
+         }
+ 
+-        optimize(ctx);
++        optimize(ctx, result->x87_cache.native_slots != 0);
+         // X87_NATIVE_SLOTS: which initial depths hold an 80-bit value.
+         // lower()'s prologue flushes a leftover FXCH permutation by moving
+         // the slots as they are, so depth d then holds what was at depth
+diff --git a/rosetta_core/src/X87IROptimize.cpp b/rosetta_core/src/X87IROptimize.cpp
+index 109b3ca..db4ede4 100644
+--- a/rosetta_core/src/X87IROptimize.cpp
++++ b/rosetta_core/src/X87IROptimize.cpp
+@@ -710,24 +710,36 @@ static void pass_fma_reduce(Context& ctx) {
+ // bridge node.  Operands with a segment override are left alone so the GPR
+ // model's per-op cost for them does not drop.
+ //
+-// Runs last, after every pass that matches LoadF64 or StoreI64.  Gated with
+-// the fild_fistp peephole on FusionId::fild_fistp.
++// With X87_NATIVE_SLOTS the value may also be left on the stack: such a
++// load is tagged kExactI64, and lower()'s write-back converts the bits into
++// the exact 80-bit value in the native slot, as fild m64 does outside the
++// IR.  A load that other nodes also read as a number keeps the bits for its
++// 64-bit stores and the stack, and those readers get a CvtI64 of it.  The
++// compact slots of X87_NATIVE_SLOTS=0 hold binary64, so there a value left
++// on the stack, or read as a number, keeps the SCVTF.  Exactness is not a
++// fusion, so with the native slots the pass ignores the fusion knobs;
++// without them it is gated with the fild_fistp peephole on
++// FusionId::fild_fistp.
++//
++// Runs last, after every pass that matches LoadF64 or StoreI64.
+ 
+ static bool has_seg_override(const Node& n) {
+     return n.mem_operand != nullptr && n.mem_operand->mem.seg_override != 0;
+ }
+ 
+-static void pass_exact_i64_copy(Context& ctx) {
+-    if (g_rosetta_config != nullptr &&
++static void pass_exact_i64_copy(Context& ctx, bool native_slots) {
++    if (!native_slots && g_rosetta_config != nullptr &&
+         fusion_is_disabled(*g_rosetta_config, FusionId::fild_fistp)) {
+         return;
+     }
+ 
+     int16_t store_uses[kMaxNodes] = {};
+     bool other_use[kMaxNodes] = {};
++    bool on_stack[kMaxNodes] = {};
+     for (short d : ctx.slot_val) {
+         if (d >= 0 && d < ctx.num_nodes) {
+-            other_use[d] = true;
++            on_stack[d] = true;
++            other_use[d] = other_use[d] || !native_slots;
+         }
+     }
+     for (int i = 0; i < ctx.num_nodes; i++) {
+@@ -749,13 +761,47 @@ static void pass_exact_i64_copy(Context& ctx) {
+         }
+     }
+ 
+-    for (int i = 0; i < ctx.num_nodes; i++) {
+-        auto& n = ctx.nodes[i];
+-        if (n.op != Op::LoadI64 || (n.flags & kDead) || other_use[i] || store_uses[i] == 0 ||
+-            has_seg_override(n)) {
++    // Descending, so a CvtI64 inserted after load i only shifts nodes this
++    // loop has already handled, and the use tables stay valid for the rest.
++    for (int i = ctx.num_nodes - 1; i >= 0; i--) {
++        if (ctx.nodes[i].op != Op::LoadI64 || (ctx.nodes[i].flags & kDead) ||
++            (store_uses[i] == 0 && !on_stack[i]) || has_seg_override(ctx.nodes[i])) {
+             continue;
+         }
++        if (other_use[i]) {
++            // Readers that need the number (arithmetic, compares, fst, the
++            // narrower integer stores, fcmov) take a CvtI64 placed right
++            // after the load; the 64-bit stores and the stack keep the bits.
++            if (!native_slots || !insert_node_at(ctx, i + 1)) {
++                continue;
++            }
++            Node& cvt = ctx.nodes[i + 1];
++            cvt.op = Op::CvtI64;
++            cvt.flags = kNone;
++            cvt.inputs[0] = static_cast<int16_t>(i);
++            cvt.inputs[1] = -1;
++            cvt.inputs[2] = -1;
++            cvt.imm_bits = 0;
++            ctx.node_src[i + 1] = ctx.node_src[i];
++            for (int j = i + 2; j < ctx.num_nodes; j++) {
++                Node& m = ctx.nodes[j];
++                if (m.flags & kDead) {
++                    continue;
++                }
++                const int nrefs = node_ref_input_count(m);
++                for (int k = 0; k < nrefs; k++) {
++                    const bool exact_store = m.op == Op::StoreI64 && k == 0 && !has_seg_override(m);
++                    if (m.inputs[k] == i && !exact_store) {
++                        m.inputs[k] = static_cast<int16_t>(i + 1);
++                    }
++                }
++            }
++        }
++        Node& n = ctx.nodes[i];
+         n.op = Op::LoadF64;
++        if (on_stack[i]) {
++            n.flags |= kExactI64;
++        }
+         for (int j = i + 1; j < ctx.num_nodes; j++) {
+             auto& s = ctx.nodes[j];
+             if (s.op == Op::StoreI64 && !(s.flags & kDead) && s.inputs[0] == i) {
+@@ -768,7 +814,53 @@ static void pass_exact_i64_copy(Context& ctx) {
+ 
+ // ── Public API ──────────────────────────────────────────────────────────────
+ 
+-void optimize(Context& ctx) {
++bool insert_node_at(Context& ctx, int pos) {
++    if (ctx.num_nodes >= kMaxNodes || pos < 0 || pos > ctx.num_nodes) {
++        return false;
++    }
++    const int n = ctx.num_nodes;
++    std::memmove(&ctx.nodes[pos + 1], &ctx.nodes[pos], static_cast<size_t>(n - pos) * sizeof(Node));
++    std::memmove(&ctx.node_src[pos + 1], &ctx.node_src[pos],
++                 static_cast<size_t>(n - pos) * sizeof(int16_t));
++    ctx.num_nodes = static_cast<int16_t>(n + 1);
++
++    const auto remap = [pos](int16_t& ref) {
++        if (ref >= pos) {
++            ref = static_cast<int16_t>(ref + 1);
++        }
++    };
++    for (int i = 0; i < ctx.num_nodes; i++) {
++        if (i == pos) {
++            continue;  // the opened slot, written by the caller
++        }
++        const int nrefs = node_ref_input_count(ctx.nodes[i]);
++        for (int k = 0; k < nrefs; k++) {
++            auto& in = ctx.nodes[i].inputs[k];
++            if (in >= 0) {
++                remap(in);
++            }
++        }
++    }
++    for (auto& v : ctx.slot_val) {
++        if (v >= 0) {
++            remap(v);
++        }
++    }
++    for (auto& v : ctx.initial_read) {
++        if (v >= 0) {
++            remap(v);
++        }
++    }
++    if (ctx.last_fcmp >= 0) {
++        remap(ctx.last_fcmp);
++    }
++    if (ctx.last_fcomi >= 0) {
++        remap(ctx.last_fcomi);
++    }
++    return true;
++}
++
++void optimize(Context& ctx, bool native_slots) {
+     pass_dse(ctx);
+     // FMA contraction changes numerics (no intermediate rounding of the
+     // product), so it must be opt-in.  pass_fma_reduce only matches FMAdd
+@@ -778,7 +870,7 @@ void optimize(Context& ctx) {
+     }
+     pass_fma_reduce(ctx);
+     pass_fcom_fstsw_fusion(ctx);
+-    pass_exact_i64_copy(ctx);
++    pass_exact_i64_copy(ctx, native_slots);
+ }
+ 
+ }  // namespace X87IR
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index 478f68e..be63041 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -63,13 +63,14 @@
+ #  18. test_crash_after_release: a target that is no longer traced after
+ #      the release and then dies (abort, SIGSEGV, SIGKILL, SIGILL, exit(3))
+ #      must end with its own exit status natively and under both attaches
+-#  19. test_x87_cross_reply_exact with X87_NATIVE_SLOTS=1 (default, IR off,
+-#      fusions off, run cache off, single-op fast path off, clamped
+-#      register pool, bridging off, X87_PRECISE_FAULTS=1,
+-#      X87_FAIL_ALLOC_EVERY=N, and X87_GPR_POOL_LIMIT=4, where integer
+-#      stores fall back to binary64), then the tests that read or replace the
+-#      native x87 state with it.  The knob is on by default, so this covers
+-#      it also in a run that exports X87_NATIVE_SLOTS=0
++#  19. test_x87_cross_reply_exact with X87_NATIVE_SLOTS=1 in each of these
++#      configurations: default; IR off; IR and fusions off; fusions off
++#      with the IR on; run cache off; single-op fast path off; clamped
++#      register pool; bridging off; X87_PRECISE_FAULTS=1;
++#      X87_FAIL_ALLOC_EVERY=N; and X87_GPR_POOL_LIMIT=4, where integer
++#      stores fall back to binary64.  Then the tests that read or replace
++#      the native x87 state with it.  The knob is on by default, so this
++#      covers it also in a run that exports X87_NATIVE_SLOTS=0
+ #  20. every test with X87_NATIVE_SLOTS=0, the kill switch, where
+ #      test_x87_cross_reply_exact has to fail; exporting X87_NATIVE_SLOTS=0
+ #      for the whole run makes every phase run that way
+@@ -1307,6 +1308,7 @@ NATIVE_SLOTS_CONFIGS=(
+     ""
+     "X87_DISABLE_X87_IR=1"
+     "X87_DISABLE_X87_IR=1 X87_DISABLE_ALL_FUSIONS=1"
++    "X87_DISABLE_ALL_FUSIONS=1"
+     "X87_DISABLE_CACHE=1"
+     "X87_DISABLE_SINGLE_FAST=1"
+     "X87_FPR_POOL_LIMIT=5"
+@@ -1444,14 +1446,6 @@ fi
+ # X87_SMC_SPLIT=2, which splits every block, since the other tests' code is
+ # on read-only image pages.  Naming tests on the command line runs the last
+ # part for them, and the rest only when test_x87_smc is among them.
+-#
+-# test_fild_fistp_copy is left out of the X87_SMC_SPLIT=2 run.  An IR run
+-# rounds an fild m64 whose value is still on the x87 stack when the run
+-# ends, and the split ends runs inside its copies; the same copies with an
+-# lfence in place of the split are rounded without the split too.
+-SMC_SPLIT_ALL_SKIP=(
+-    test_fild_fistp_copy
+-)
+ SMC_CONFIGS=(
+     "X87_PRECISE_FAULTS=1"
+     "X87_PRECISE_FAULTS=2"
+@@ -1533,7 +1527,6 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
+     fi
+     echo "      X87_SMC_SPLIT=2"
+     for t in "${TESTS[@]}"; do
+-        [[ " ${SMC_SPLIT_ALL_SKIP[*]} " == *" $t "* ]] && continue
+         BINARY="$TESTS_BIN/$t"
+         if [[ ! -x "$BINARY" ]]; then
+             echo -e "${YELLOW}SKIP${NC}  $t  (binary not found)"
+diff --git a/tests/test_x87_cross_reply_exact.c b/tests/test_x87_cross_reply_exact.c
+index 060bd32..3d4f63c 100644
+--- a/tests/test_x87_cross_reply_exact.c
++++ b/tests/test_x87_cross_reply_exact.c
+@@ -32,6 +32,11 @@
+  * each of the eight physical registers and the middle block's pushes wrap
+  * TOP past 0.
+  * Blocks are separated by `jmp 1f; 1:`, which ends a translation block.
++ * A last group loads the int64 inside a run the IR lowers, which ends with
++ * the value still on the stack (at an lfence or the block's end), stores it
++ * in the next reply with fistp m64 or fstp m80, and checks the integer
++ * stores of copies of it, also where the run reads another copy with
++ * arithmetic, fist m32, fcom or fcomi.
+  *
+  * Expected: passes under stock Rosetta and under x87sidecar, fails with
+  * X87_NATIVE_SLOTS=0 (run_tests.sh checks both).
+@@ -278,6 +283,123 @@ static uint16_t status_word(void) {
+     return sw;
+ }
+ 
++/* ── fild m64 inside a run ───────────────────────────────────────────────── */
++/* The fild m64 is one of three or more x87 instructions in a run the IR
++ * lowers, and its value is still on the stack when the run ends: lfence ends
++ * the run inside the block, SEP ends the block.  A later reply stores it.
++ * The integer stores into dst2 and dst3 must be exact too, also where the
++ * run reads another copy of the value as a number.  PRE runs in a block of
++ * its own before the run, TAIL after the store. */
++#define RUN_FSTPL "fildll (%[src])\n\tfildll (%[w])\n\tfstpl 0(%[out])\n\t"
++#define RUN_COPY "fildll (%[src])\n\tfld %%st(0)\n\tfistpll (%[dst2])\n\t"
++#define RUN_DEPTH1 "fildll (%[src])\n\tfldl 0(%[c])\n\tfmull 8(%[c])\n\t"
++#define RUN_COPY2 \
++    "fildll (%[src])\n\tfld %%st(0)\n\tfld %%st(0)\n\tfistpll (%[dst2])\n\tfistpll (%[dst3])\n\t"
++/* Copies read as a number: arithmetic, fist m32, fcom, fcomi. */
++#define RUN_ARITH "fildll (%[src])\n\tfld %%st(0)\n\tfldz\n\tfaddp %%st, %%st(1)\n\t"
++#define RUN_FIST32 "fildll (%[src])\n\tfld %%st(0)\n\tfistpll (%[dst2])\n\tfistl 0(%[out])\n\t"
++#define RUN_FCOM "fildll (%[src])\n\tfld %%st(0)\n\tfcompl 0(%[c])\n\tfld %%st(0)\n\tfistpll (%[dst2])\n\t"
++#define RUN_FCOMI                                                                  \
++    "fildll (%[src])\n\tfld %%st(0)\n\tfldz\n\tfcomip %%st(1), %%st\n\tfstp %%st(0)\n\t" \
++    "fld %%st(0)\n\tfistpll (%[dst2])\n\t"
++/* Three copies on the stack at the run's end. */
++#define RUN_THREE "fildll (%[src])\n\tfld %%st(0)\n\tfld %%st(0)\n\t"
++/* No net push or pop: the value goes over a slot that holds an 80-bit 1.0
++ * from the earlier block. */
++#define RUN_DELTA0 "fildll (%[src])\n\tfstp %%st(2)\n\tfxch %%st(1)\n\t"
++/* fxch inside the run. */
++#define RUN_FXCH "fildll (%[src])\n\tfildll (%[w])\n\tfxch %%st(1)\n\t"
++#define PRE_FSTPL ""
++#define PRE_COPY ""
++#define PRE_DEPTH1 ""
++#define PRE_COPY2 ""
++#define PRE_ARITH ""
++#define PRE_FIST32 ""
++#define PRE_FCOM ""
++#define PRE_FCOMI ""
++#define PRE_THREE ""
++#define PRE_DELTA0 "fld1\n\tfld1\n\t" SEP
++#define PRE_FXCH ""
++#define AFTER_FSTPL ""
++#define AFTER_COPY ""
++#define AFTER_DEPTH1 "fstpl 0(%[out])\n\t"
++#define AFTER_COPY2 ""
++#define AFTER_ARITH "fstp %%st(0)\n\t"
++#define AFTER_FIST32 ""
++#define AFTER_FCOM ""
++#define AFTER_FCOMI ""
++#define AFTER_THREE "fistpll (%[dst2])\n\tfistpll (%[dst3])\n\t"
++#define AFTER_DELTA0 ""
++#define AFTER_FXCH ""
++#define TAIL_FSTPL ""
++#define TAIL_COPY ""
++#define TAIL_DEPTH1 ""
++#define TAIL_COPY2 ""
++#define TAIL_ARITH ""
++#define TAIL_FIST32 ""
++#define TAIL_FCOM ""
++#define TAIL_FCOMI ""
++#define TAIL_THREE ""
++#define TAIL_DELTA0 "\tfstpl 0(%[out])\n"
++#define TAIL_FXCH "\tfstpl 0(%[out])\n"
++#define LFENCE "lfence\n\t"
++
++typedef void (*run_fn)(const int64_t* src, void* dst, int64_t* dst2, int64_t* dst3, double* out);
++
++#define DEFINE_RUN_CASE(name, PRE, RUN, BREAK, AFTER, STORE, TAIL)                             \
++    static void name(const int64_t* src, void* dst, int64_t* dst2, int64_t* dst3, double* out) { \
++        static const int64_t w = 7;                                                           \
++        __asm__ volatile(PRE RUN BREAK AFTER STORE TAIL                                       \
++                         :                                                                    \
++                         : [src] "r"(src), [dst] "r"(dst), [dst2] "r"(dst2), [dst3] "r"(dst3), \
++                           [out] "r"(out), [w] "r"(&w), [c] "r"(kConst)                       \
++                         : CLOBBERS);                                                         \
++    }
++
++#define DEFINE_RUN_FORMS(s)                                                                   \
++    DEFINE_RUN_CASE(run_lf_i64_##s, PRE_##s, RUN_##s, LFENCE, AFTER_##s, STORE_I64, TAIL_##s) \
++    DEFINE_RUN_CASE(run_lf_m80_##s, PRE_##s, RUN_##s, LFENCE, AFTER_##s, STORE_M80, TAIL_##s) \
++    DEFINE_RUN_CASE(run_jmp_i64_##s, PRE_##s, RUN_##s, SEP, AFTER_##s, STORE_I64, TAIL_##s)   \
++    DEFINE_RUN_CASE(run_jmp_m80_##s, PRE_##s, RUN_##s, SEP, AFTER_##s, STORE_M80, TAIL_##s)
++
++DEFINE_RUN_FORMS(FSTPL)
++DEFINE_RUN_FORMS(COPY)
++DEFINE_RUN_FORMS(DEPTH1)
++DEFINE_RUN_FORMS(COPY2)
++DEFINE_RUN_FORMS(ARITH)
++DEFINE_RUN_FORMS(FIST32)
++DEFINE_RUN_FORMS(FCOM)
++DEFINE_RUN_FORMS(FCOMI)
++DEFINE_RUN_FORMS(THREE)
++DEFINE_RUN_FORMS(DELTA0)
++DEFINE_RUN_FORMS(FXCH)
++
++typedef struct {
++    const char* name;
++    run_fn fn[4]; /* lfence + fistp m64, lfence + fstp m80, jmp + fistp m64, jmp + fstp m80 */
++    int in_run_stores; /* how many of dst2, dst3 the case stores */
++    double want_out;   /* out[0], or 0 when it is not checked */
++} run_shape;
++
++#define RUN_FORMS(shape) \
++    {run_lf_i64_##shape, run_lf_m80_##shape, run_jmp_i64_##shape, run_jmp_m80_##shape}
++
++static const run_shape kRunShapes[] = {
++    {"fild, fild, fstpl", RUN_FORMS(FSTPL), 0, 7.0},
++    {"fild, fld st(0), fistp m64", RUN_FORMS(COPY), 1, 0},
++    {"fild, fldl, fmull, then fstpl", RUN_FORMS(DEPTH1), 0, 6.0},
++    {"fild, fld st(0) twice, fistp m64 twice", RUN_FORMS(COPY2), 2, 0},
++    {"fild, fld st(0), fldz, faddp", RUN_FORMS(ARITH), 0, 0},
++    {"fild, fld st(0), fistp m64, fist m32", RUN_FORMS(FIST32), 1, 0},
++    {"fild, fld st(0), fcomp m64, fld st(0), fistp m64", RUN_FORMS(FCOM), 1, 0},
++    {"fild, fld st(0), fldz, fcomip, fstp, fld st(0), fistp m64", RUN_FORMS(FCOMI), 1, 0},
++    {"fild, fld st(0) twice, then fistp m64 twice", RUN_FORMS(THREE), 2, 0},
++    {"fild, fstp st(2), fxch over held 80-bit values", RUN_FORMS(DELTA0), 0, 1.0},
++    {"fild, fild, fxch", RUN_FORMS(FXCH), 0, 7.0},
++};
++static const char* const kRunForms[] = {"lfence, fistp m64", "lfence, fstp m80",
++                                        "jmp, fistp m64", "jmp, fstp m80"};
++
+ /* ── Values ──────────────────────────────────────────────────────────────── */
+ 
+ typedef struct {
+@@ -310,6 +432,7 @@ static const i64_value kI64Values[] = {
+     {"2^62+3", 4611686018427387907LL, {0x8000000000000006ULL, 0x403D}},
+     {"INT64_MIN", INT64_MIN, {0x8000000000000000ULL, 0xC03E}},
+     {"2^53+1", 9007199254740993LL, {0x8000000000000400ULL, 0x4034}},
++    {"INT64_MAX", INT64_MAX, {0xFFFFFFFFFFFFFFFEULL, 0x403D}},
+     {"-(2^63-1)", -INT64_MAX, {0xFFFFFFFFFFFFFFFEULL, 0xC03D}},
+ };
+ 
+@@ -473,6 +596,50 @@ int main(int argc, char** argv) {
+             }
+         }
+     }
++    for (size_t si = 0; si < sizeof(kRunShapes) / sizeof(kRunShapes[0]); si++) {
++        const run_shape* s = &kRunShapes[si];
++        for (int form = 0; form < 4; form++) {
++            const int to_m80 = form == 1 || form == 3;
++            for (int rot = 0; rot < 8; rot++) {
++                for (size_t vi = 0; vi < sizeof(kI64Values) / sizeof(kI64Values[0]); vi++) {
++                    const i64_value* v = &kI64Values[vi];
++                    f80_slot dst;
++                    int64_t dst2 = 0x5A5A5A5A5A5A5A5ALL;
++                    int64_t dst3 = 0x5A5A5A5A5A5A5A5ALL;
++                    double out[2] = {0};
++                    memset(&dst, 0xA5, sizeof(dst));
++                    rotate_down(rot);
++                    s->fn[form](&v->v, &dst, &dst2, &dst3, out);
++                    rotate_up(rot);
++                    cases++;
++                    if (to_m80 ? memcmp(&dst.v, &v->as_f80, sizeof(f80)) != 0
++                               : !int64_matches(&dst, &v->v)) {
++                        report(kRunForms[form], s->name, rot, v->name, &dst,
++                               to_m80 ? (const void*)&v->as_f80 : (const void*)&v->v,
++                               to_m80 ? sizeof(f80) : sizeof(int64_t));
++                    }
++                    if (s->in_run_stores >= 1 && !int64_matches(&dst2, &v->v)) {
++                        report("fistp m64 of a copy", s->name, rot, v->name, &dst2, &v->v,
++                               sizeof(dst2));
++                    }
++                    if (s->in_run_stores >= 2 && !int64_matches(&dst3, &v->v)) {
++                        report("second fistp m64 of a copy", s->name, rot, v->name, &dst3, &v->v,
++                               sizeof(dst3));
++                    }
++                    if (s->want_out != 0 && memcmp(&out[0], &s->want_out, sizeof(double)) != 0) {
++                        report("other result", s->name, rot, v->name, &out[0], &s->want_out,
++                               sizeof(double));
++                    }
++                    const uint16_t top = (status_word() >> 11) & 7;
++                    if (top != 0) {
++                        const uint16_t zero = 0;
++                        report("TOP after the case", s->name, rot, v->name, &top, &zero,
++                               sizeof(top));
++                    }
++                }
++            }
++        }
++    }
+     if (failures == 0) {
+         printf("PASS  %d cases: values held across replies come out bit for bit\n", cases);
+     }

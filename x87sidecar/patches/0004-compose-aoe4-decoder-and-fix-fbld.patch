@@ -1,0 +1,144 @@
+From ae084c865eee0b45bf22881ff826f58c8f78d9bf Mon Sep 17 00:00:00 2001
+From: Luis Riegger <lri@me.com>
+Date: Tue, 17 Nov 2026 15:41:16 +0100
+Subject: [PATCH] Add combined AoE IV decoding and correctness fixes
+
+
+Kind: AoE IV decoder composition and shared x87 FBLD correction
+License: MIT (see upstream LICENSE)
+---
+ rosetta_core/src/TranslatorX87.cpp |  7 ++++
+ rosetta_loader/src/stub_asm.cpp    | 55 +++++++++++++++++++++++-------
+ tests/test_fbld.c                  | 23 +++++++++++++
+ 3 files changed, 72 insertions(+), 13 deletions(-)
+
+diff --git a/rosetta_core/src/TranslatorX87.cpp b/rosetta_core/src/TranslatorX87.cpp
+index c8d8808..cc046eb 100644
+--- a/rosetta_core/src/TranslatorX87.cpp
++++ b/rosetta_core/src/TranslatorX87.cpp
+@@ -357,6 +357,13 @@ auto translate_fbld(TranslationResult* a1, IRInstr* a2) -> void {
+     const int Wd_tmp2 = alloc_gpr(*a1, 3);  // x87_push scratch (freed after push)
+     const int Dd_val = alloc_free_fpr(*a1);
+ 
++    // A cached preceding pop can leave deferred tag updates. Flush these
++    // before the two BCD input registers become live: x87_push would otherwise
++    // allocate two more GPRs while base/TOP/ST-base, scratch and inputs already
++    // occupy seven of the eight slots. Keep the memory loads before the push
++    // so a faulting source does not change the architectural x87 stack.
++    x87_flush_deferred_pops(buf, *a1, Xbase, Wd_top, Wd_tmp);
++
+     // Step 1: compute source memory address.
+     const bool addr_is_64 = (a2->operands[0].mem.addr_size == IROperandSize::S64);
+     const int Xaddr = compute_operand_address(*a1, addr_is_64, &a2->operands[0], GPR::XZR);
+diff --git a/rosetta_loader/src/stub_asm.cpp b/rosetta_loader/src/stub_asm.cpp
+index eb9ddcc..64ccfcc 100644
+--- a/rosetta_loader/src/stub_asm.cpp
++++ b/rosetta_loader/src/stub_asm.cpp
+@@ -1126,19 +1126,8 @@ static StubBlobs buildSoftFaultHook(uint64_t handlerAddr, uint64_t decodeOpcodeA
+     emit_abs_jump_3movs(b.entry,handlerAddr);return b;
+ }
+ 
+-StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+-                          const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
+-    const char* softTarget=std::getenv("AOE_SOFTFAULT_TARGET");
+-    const char* softPC=std::getenv("AOE_SOFTFAULT_PC");
+-    if(softTarget && softPC) {
+-        char *endTarget=nullptr,*endPC=nullptr;
+-        uint64_t target=std::strtoull(softTarget,&endTarget,0),pc=std::strtoull(softPC,&endPC,0);
+-        if(!target || !pc || *endTarget || *endPC) return {};
+-        const char* softEnd=std::getenv("AOE_SOFTFAULT_END"),*softOne=std::getenv("AOE_SOFTFAULT_TARGET1");
+-        uint64_t end=0,one=0;
+-        if(softEnd||softOne){if(!softEnd||!softOne)return {};char *a=nullptr,*b=nullptr;end=std::strtoull(softEnd,&a,0);one=std::strtoull(softOne,&b,0);if(!end||!one||*a||*b)return {};}
+-        return buildSoftFaultHook(handlerAddr,decodeOpcodeAddr,origPrologue16,pc,target,end,one);
+-    }
++static StubBlobs buildGenericDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
++                                       const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
+     StubBlobs blobs;
+ 
+     // The 3-mov+br abs-jump encoding only works while the top 16 bits are zero.
+@@ -1394,4 +1383,44 @@ StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+     return blobs;
+ }
+ 
++StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
++                         const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
++    const char* softTarget = std::getenv("AOE_SOFTFAULT_TARGET");
++    const char* softPC = std::getenv("AOE_SOFTFAULT_PC");
++    if (!softTarget && !softPC) {
++        return buildGenericDecodeHook(handlerAddr, decodeOpcodeAddr, origPrologue16, hostArplOpcode);
++    }
++    if (!softTarget || !softPC) return {};
++    char *endTarget = nullptr, *endPC = nullptr;
++    const uint64_t target = std::strtoull(softTarget, &endTarget, 0);
++    const uint64_t pc = std::strtoull(softPC, &endPC, 0);
++    if (!target || !pc || *endTarget || *endPC) return {};
++    const char* softEnd = std::getenv("AOE_SOFTFAULT_END");
++    const char* softOne = std::getenv("AOE_SOFTFAULT_TARGET1");
++    uint64_t end = 0, one = 0;
++    if (softEnd || softOne) {
++        if (!softEnd || !softOne) return {};
++        char *a = nullptr, *b = nullptr;
++        end = std::strtoull(softEnd, &a, 0);
++        one = std::strtoull(softOne, &b, 0);
++        if (!end || !one || *a || *b) return {};
++    }
++    auto soft = buildSoftFaultHook(handlerAddr, decodeOpcodeAddr, origPrologue16, pc, target, end, one);
++    if (soft.entry.empty() || soft.handler.size() < 32) return {};
++    // Compose both decoder features. The soft hook first calls its displaced
++    // decoder trampoline; redirect that trampoline to the generic alias hook.
++    // The alias hook alone owns the original prologue and returns to Rosetta.
++    // Thus FCOMP/ARPL stay available, and only a remaining invalid instruction
++    // in the pinned range is lowered to software exception delivery.
++    const uint64_t genericAddr = handlerAddr + soft.handler.size();
++    auto generic = buildGenericDecodeHook(genericAddr, decodeOpcodeAddr, origPrologue16, hostArplOpcode);
++    if (generic.entry.empty() || generic.handler.empty()) return {};
++    std::vector<uint8_t> jump;
++    emit_abs_jump_3movs(jump, genericAddr);
++    if (jump.size() != 16) return {};
++    std::copy(jump.begin(), jump.end(), soft.handler.end() - 32);
++    soft.handler.insert(soft.handler.end(), generic.handler.begin(), generic.handler.end());
++    return soft;
++}
++
+ }  // namespace stub_asm
+diff --git a/tests/test_fbld.c b/tests/test_fbld.c
+index e25c960..0feede7 100644
+--- a/tests/test_fbld.c
++++ b/tests/test_fbld.c
+@@ -27,6 +27,22 @@ static double do_fbld(const uint8_t bcd[10]) {
+     return r;
+ }
+ 
++/* Start a new translation block with a pop, so the cached run has a
++ * deferred tag update when FBLD loads its two input registers. */
++static double do_pop_fbld(const uint8_t bcd[10]) {
++    double r;
++    __asm__ volatile(
++        "fld1\n\t"
++        "jmp 1f\n\t"
++        "1: fstp %%st(0)\n\t"
++        "fbld %1\n\t"
++        "fstpl %0\n"
++        : "=m"(r)
++        : "m"(*(const uint8_t (*)[10])bcd)
++        : "st");
++    return r;
++}
++
+ static void check(const char* name, const uint8_t bcd[10], double expected) {
+     double got = do_fbld(bcd);
+     /* Bit-exact compare so -0 vs +0 (and any NaN payload) is caught. */
+@@ -42,6 +58,13 @@ static void check(const char* name, const uint8_t bcd[10], double expected) {
+ }
+ 
+ int main(void) {
++    {
++        const uint8_t b[10] = {0x42};
++        const double got = do_pop_fbld(b);
++        const int ok = got == 42.0;
++        printf("%s  FBLD after deferred pop: %.17g\n", ok ? "PASS" : "FAIL", got);
++        if (!ok) failures++;
++    }
+     /* +0  → all zero, no sign bit */
+     {
+         uint8_t b[10] = {0};

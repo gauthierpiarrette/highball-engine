@@ -1,0 +1,114 @@
+From 5b4358b3a6a524ca54f72f2f1cd6a12d3590a0f6 Mon Sep 17 00:00:00 2001
+From: NerRobDog <119906947+NerRobDog@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 20:03:44 +0200
+Subject: [PATCH] Softfault decoder hook from GameToMac 0.1.5 (Marc Ibrahim)
+
+GameToMac 0.1.5-alpha ships its x87sidecar as sidecar-source.tar.gz
+(sha256 50ad26b802a590b7c49a121da35ca632bc2676b2fcde40b663805e612d547ff0).
+That tree is this repository at 4e9c738 plus one change: an opt-in
+invalid-opcode lowering hook for a bounded guest text range in
+rosetta_loader/src/stub_asm.cpp, written by Marc Ibrahim for the Age of
+Empires IV Rosetta path. This commit carries exactly that difference, so
+the fork's history shows what came from upstream and what came from
+GameToMac.
+
+Kind: AoE IV integration
+License: MIT (see upstream LICENSE)
+---
+ rosetta_loader/src/stub_asm.cpp | 74 +++++++++++++++++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+
+diff --git a/rosetta_loader/src/stub_asm.cpp b/rosetta_loader/src/stub_asm.cpp
+index f76412b..eb9ddcc 100644
+--- a/rosetta_loader/src/stub_asm.cpp
++++ b/rosetta_loader/src/stub_asm.cpp
+@@ -4,6 +4,9 @@
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
++#include <map>
++#include <string>
+ #include <vector>
+ 
+ #include "rosetta_core/IRInstr.h"
+@@ -1063,8 +1066,79 @@ StubBlobs build(uint64_t handlerAddr, uint64_t translateInsnAddr, const uint8_t
+     return blobs;
+ }
+ 
++
++// Experimental, opt-in invalid-opcode lowering for a bounded guest text range.
++// The original guest bytes are never written. Decoder calls at other PCs,
++// valid instructions, legacy mode, and mismatched bytes retain stock behavior.
++static StubBlobs buildSoftFaultHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
++                                    const uint8_t orig[16], uint64_t pc, uint64_t target, uint64_t end=0, uint64_t target1=0) {
++    StubBlobs b;
++    if ((handlerAddr | decodeOpcodeAddr | pc | target) & 0xffff000000000000ULL) return b;
++    const int64_t displacement = static_cast<int64_t>(target) - static_cast<int64_t>(pc + 2);
++    if (displacement < INT32_MIN || displacement > INT32_MAX) return b;
++    if(end && (end<=pc || !target1 || end-pc>0x6000000ULL))return b;
++    if(end){for(uint64_t t:{target,target1})for(uint64_t a:{pc,end}){int64_t d=(int64_t)t-(int64_t)a-5;if(d<INT32_MIN||d>INT32_MAX)return b;}}
++    auto& h=b.handler;
++    std::map<std::string,size_t> labels;
++    struct Fix { size_t pos; std::string label; int kind; unsigned cond; };
++    std::vector<Fix> fixes;
++    auto ins=[&](uint32_t v){emit(h,v);};
++    auto label=[&](const char* n){labels[n]=h.size();};
++    auto branch=[&](const char* n,int kind,unsigned cond=0){fixes.push_back({h.size(),n,kind,cond});ins(0);};
++    auto constant=[&](unsigned reg,uint64_t value){ins(movz(reg,value&0xffff,0));ins(movk(reg,(value>>16)&0xffff,16));ins(movk(reg,(value>>32)&0xffff,32));};
++    ins(sub_imm_x(SP,SP,96));
++    ins(stp_offset(0,1,SP,0));ins(stp_offset(2,3,SP,16));ins(str_x_offset(LR,SP,32));
++    branch("stock",1);
++    ins(cmp_imm_w(0,1));branch("done",2,COND_NE);
++    ins(ldr_x_offset(12,SP,0));ins(ldrb_w_offset(9,12,0));ins(cmp_imm_w(9,0));branch("done",2,COND_NE);
++    ins(ldr_x_offset(10,12,kDecoderCtxCodeBase));ins(ldr_x_offset(11,12,kDecoderCtxCodeEnd));
++    ins(ldr_w_offset(9,SP,8));ins(add_reg_x(13,10,9));constant(14,pc);ins(cmp_reg_x(13,14));
++    if(end){branch("done",2,COND_LO);constant(14,end);ins(cmp_reg_x(13,14));branch("done",2,COND_HS);}
++    else branch("done",2,COND_NE);
++    ins(cmp_reg_x(13,11));branch("done",2,COND_HS);
++    if(end){
++        ins(ldrb_w_offset(9,13,0));ins(cmp_imm_w(9,0xd5));branch("two",2,COND_EQ);
++        ins(cmp_imm_w(9,0xd4));branch("two",2,COND_EQ);
++        for(unsigned op:{0x1e,0x16,0x3f,0x27,0x37,0x06,0x0e,0x1f,0x60,0xea,0x9a}){ins(cmp_imm_w(9,op));branch("one",2,COND_EQ);}
++        branch("done",0);
++        label("one");ins(movz(14,1,0));constant(9,target1);branch("selected",0);
++    }
++    label("two");ins(add_imm(14,13,2));ins(cmp_reg_x(14,11));branch("done",2,COND_HI);
++    if(!end){ins(ldrh_w_offset(9,13,0));ins(movz(14,0x7fd5,0));ins(cmp_reg_w(9,14));branch("done",2,COND_NE);}
++    ins(movz(14,2,0));constant(9,target);
++    label("selected");ins(str_x_offset(14,SP,88));ins(add_reg_x(14,13,14));ins(sub_reg_x(9,9,14));ins(str_w_offset(9,SP,80));
++    ins(str_x_offset(10,SP,40));ins(str_x_offset(11,SP,48));ins(str_x_offset(13,SP,56));
++    ins(add_imm(15,SP,64));ins(movz(9,0xe8,0));ins(strb_w_offset(9,15,0));
++    ins(ldr_w_offset(9,SP,80));ins(add_imm(16,15,1));ins(str_w_offset(9,16,0));
++    ins(str_x_offset(15,12,kDecoderCtxCodeBase));ins(add_imm(9,15,5));ins(str_x_offset(9,12,kDecoderCtxCodeEnd));
++    ins(ldr_x_offset(0,SP,0));ins(movz(1,0,0));ins(ldp_offset(2,3,SP,16));branch("stock",1);
++    ins(ldr_x_offset(12,SP,0));ins(ldp_offset(10,11,SP,40));
++    ins(str_x_offset(10,12,kDecoderCtxCodeBase));ins(str_x_offset(11,12,kDecoderCtxCodeEnd));
++    ins(ldr_x_offset(13,SP,56));ins(str_x_offset(13,12,kDecoderCtxInsnStart));
++    ins(cmp_imm_w(0,0));branch("decode_success",2,COND_EQ);
++    ins(ldp_offset(0,1,SP,0));ins(ldp_offset(2,3,SP,16));branch("stock",1);branch("done",0);
++    label("decode_success");
++    ins(ldr_x_offset(9,SP,24));ins(ldr_x_offset(14,SP,88));ins(strb_w_offset(14,9,0));
++    ins(add_reg_x(13,13,14));ins(str_x_offset(13,12,kDecoderCtxCursor));
++    label("done");ins(ldr_x_offset(LR,SP,32));ins(add_imm(SP,SP,96));ins(RET_INSN);
++    label("stock");h.insert(h.end(),orig,orig+16);emit_abs_jump_3movs(h,decodeOpcodeAddr+16);
++    for(const auto& f:fixes){const int offset=static_cast<int>((static_cast<int64_t>(labels.at(f.label))-static_cast<int64_t>(f.pos))/4);patch_word(h,f.pos,f.kind==1?bl(offset):f.kind==0?b_uncond(offset):b_cond(f.cond,offset));}
++    emit_abs_jump_3movs(b.entry,handlerAddr);return b;
++}
++
+ StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+                           const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
++    const char* softTarget=std::getenv("AOE_SOFTFAULT_TARGET");
++    const char* softPC=std::getenv("AOE_SOFTFAULT_PC");
++    if(softTarget && softPC) {
++        char *endTarget=nullptr,*endPC=nullptr;
++        uint64_t target=std::strtoull(softTarget,&endTarget,0),pc=std::strtoull(softPC,&endPC,0);
++        if(!target || !pc || *endTarget || *endPC) return {};
++        const char* softEnd=std::getenv("AOE_SOFTFAULT_END"),*softOne=std::getenv("AOE_SOFTFAULT_TARGET1");
++        uint64_t end=0,one=0;
++        if(softEnd||softOne){if(!softEnd||!softOne)return {};char *a=nullptr,*b=nullptr;end=std::strtoull(softEnd,&a,0);one=std::strtoull(softOne,&b,0);if(!end||!one||*a||*b)return {};}
++        return buildSoftFaultHook(handlerAddr,decodeOpcodeAddr,origPrologue16,pc,target,end,one);
++    }
+     StubBlobs blobs;
+ 
+     // The 3-mov+br abs-jump encoding only works while the top 16 bits are zero.

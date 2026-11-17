@@ -5,8 +5,8 @@ Wine changes recovered from Marc Ibrahim's LGPL sources via NerRobDog/wine-aoe4
 Layout validation and ring discovery are LGPL-2.1-or-later. HDE notices retained.
 
 HB_AOE4=1 enables the path only for RelicCardinal.exe with a verified x64 image
-under Rosetta on macOS 26 or newer. AOE4_SIDECAR_PATH names the separately
-installed helper; measured profiles are built into ntdll.
+under Rosetta on macOS 26 or newer. Wine resolves the engine's installed x87sidecar;
+measured profiles are built into ntdll.
 The same-descriptor check verifies the image being mapped. The cache uses a
 SHA-bound profile or validated ring discovery; relocated fragments retain
 their original addresses for exception reporting.
@@ -1790,7 +1790,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
      if (reason[0]) x87_coop_unhooked( reason );
      unsetenv( X87_COOP_ENV );
  }
-@@ -2857,18 +3014,122 @@
+@@ -2857,18 +3014,126 @@
   *
   * Main entry point called by the wine loader.
   */
@@ -1830,7 +1830,9 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 +
 +static void aoe_reexec_sidecar(int argc, char **argv)
 +{
-+    const char *sidecar=getenv("AOE4_SIDECAR_PATH"), *loader=getenv("WINELOADER");
++    const char *loader=getenv("WINELOADER");
++    char *root, *sidecar;
++    struct stat st;
 +    char digest[65], address[32];
 +    struct aoe_image_layout image;
 +    int fd, ok;
@@ -1838,11 +1840,6 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 +    if (!aoe_rosetta_supported())
 +    {
 +        WARN("AoE4 hooks require Rosetta on macOS 26 or newer\n");
-+        return;
-+    }
-+    if (!sidecar || sidecar[0]!='/' || access(sidecar,X_OK))
-+    {
-+        ERR("AoE4 helper path is missing or not executable; continuing with stock Wine\n");
 +        return;
 +    }
 +    if (!loader) loader=wineloader; /* init_paths resolved the engine's own loader */
@@ -1856,6 +1853,13 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 +        ERR("AoE4 executable could not be verified; continuing with the stock Wine launch\n");
 +        return;
 +    }
++    /* init_paths resolved this ntdll from the selected Highball engine. */
++    root = remove_tail(ntdll_dir, "/engine/lib/wine/x86_64-unix");
++    if (!root) fatal_error("cannot locate the Highball engine for the AoE IV fix\n");
++    sidecar = build_path(root, "x87sidecar/x87sidecar");
++    free(root);
++    if (stat(sidecar, &st) || !S_ISREG(st.st_mode) || access(sidecar, X_OK))
++        fatal_error("AoE IV needs the engine helper at %s; reinstall this engine\n", sidecar);
 +    setenv("AOE4_EXPECTED_SHA256",digest,1);
 +    setenv("AOELAB_SOFTFAULT_BRIDGE","1",1);
 +    snprintf(address,sizeof(address),"0x%llx",(unsigned long long)image.text_start);
@@ -1917,7 +1921,7 @@ diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -866,6 +866,26 @@
+@@ -866,6 +870,26 @@
  }
 
 
@@ -1944,7 +1948,7 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
  static inline void set_sigcontext( const CONTEXT *context, ucontext_t *sigcontext )
  {
      RAX_sig(sigcontext) = context->Rax;
-@@ -984,7 +1004,7 @@
+@@ -984,7 +1008,7 @@
      context->R13    = R13_sig(sigcontext);
      context->R14    = R14_sig(sigcontext);
      context->R15    = R15_sig(sigcontext);
@@ -1953,7 +1957,7 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
      context->SegCs  = CS_sig(sigcontext);
      context->SegFs  = FS_sig(sigcontext);
      context->EFlags = EFL_sig(sigcontext);
-@@ -1118,6 +1138,7 @@
+@@ -1118,6 +1142,7 @@
   */
  NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
  {
@@ -1961,7 +1965,7 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
      NTSTATUS ret = STATUS_SUCCESS;
      DWORD flags = context->ContextFlags & ~CONTEXT_AMD64;
      BOOL self = (handle == GetCurrentThread());
-@@ -1190,7 +1211,7 @@
+@@ -1190,7 +1215,7 @@
      if (flags & CONTEXT_CONTROL)
      {
          frame->rsp    = context->Rsp;
@@ -1970,7 +1974,7 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
          frame->eflags = context->EFlags;
      }
      if (flags & CONTEXT_FLOATING_POINT)
-@@ -1256,7 +1277,7 @@
+@@ -1256,7 +1281,7 @@
      if (needed_flags & CONTEXT_CONTROL)
      {
          context->Rsp    = frame->rsp;
@@ -1979,7 +1983,7 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
          context->EFlags = frame->eflags;
          context->SegCs  = cs64_sel;
          context->SegSs  = ds64_sel;
-@@ -1664,7 +1685,7 @@
+@@ -1664,7 +1689,7 @@
  {
      struct xcontext context;
 
@@ -1988,7 +1992,7 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
      save_context( &context, sigcontext );
      setup_raise_exception( sigcontext, rec, &context );
  }
-@@ -2420,7 +2441,7 @@
+@@ -2420,7 +2445,7 @@
      extern const void *__wine_syscall_dispatcher_gs_load_ptr;
      extern const void *__wine_unix_call_dispatcher_gs_load_ptr;
 
@@ -1997,7 +2001,7 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
      BYTE instr[16];
      unsigned int i, len, prefix_count = 0;
      TEB *teb = NtCurrentTeb();
-@@ -2537,17 +2558,46 @@
+@@ -2537,17 +2562,46 @@
   *
   * Handler for SIGSEGV and related errors.
   */
@@ -2045,7 +2049,7 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
      save_context( &context, ucontext );
 
      switch(TRAP_sig(ucontext))
-@@ -2649,7 +2699,7 @@
+@@ -2649,7 +2703,7 @@
 
      if (handle_syscall_trap( ucontext, siginfo )) return;
 
@@ -2054,7 +2058,7 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
      save_context( &context, ucontext );
 
      switch (TRAP_sig(ucontext))
-@@ -2678,7 +2728,7 @@
+@@ -2678,7 +2732,7 @@
  static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  {
      ucontext_t *ucontext = init_handler( sigcontext );
