@@ -11,8 +11,7 @@ SHA-bound profile or validated ring discovery; relocated fragments retain
 their original addresses for exception reporting.
 
 The instruction cache includes VM-generation-validated page snapshots and a
-private no-fault copy that preserves guard pages. It is part of the AoE path,
-not a separately selectable feature.
+private no-fault copy that preserves guard pages.
 
 diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
 --- a/dlls/ntdll/ntdll.spec

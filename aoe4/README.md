@@ -4,7 +4,7 @@ Patch 0032 lets the Wine 11 engine run AoE IV's generated-code decoder on
 Apple Silicon. The game recipe sets `HB_AOE4=1` and selects D3DMetal. Wine also
 requires Rosetta on macOS 26+, `RelicCardinal.exe`, a supported x64 PE layout,
 and a matching hash for the executable actually mapped. Other processes use
-normal Wine behavior. The existing 32-bit helper remains separate.
+normal Wine behavior.
 
 The arm64 helper combines the software-fault and x87 decoders. Wine caches
 relocated instruction fragments, retaining the original PC for exceptions.
@@ -15,15 +15,14 @@ Unsupported fragments use the decoder; inconclusive discovery leaves caching off
 The cache includes per-thread validated-page snapshots. VM mapping/protection
 changes invalidate them. Lookups still reread the live ring pointer and bytes;
 a private no-fault copy preserves guard pages. Invalid snapshots use the locked
-reader automatically. This is part of the patch, without a separate disable option.
+reader automatically.
 
 ## Build and check
 
-The existing Intel `build-engine` workflow applies the patch, runs its tests,
+The Intel `build-engine` workflow applies the patch, runs its tests,
 and builds the pinned arm64 helper. The engine archive includes the helper,
 profiles and license notices under `share/wine/aoe4`; the release also includes
-corresponding source. Source preparation and publication otherwise use the
-existing workflow.
+corresponding source.
 
 After applying the normal Wine patch series:
 
