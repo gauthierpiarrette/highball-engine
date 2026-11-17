@@ -25,6 +25,7 @@ vkd3d-proton or DXVK yet.
 | vkd3d-proton `0005` tessellation on MoltenVK | Tessellation pipelines failed to translate to Metal. | Microsoft Flight Simulator 2024 (terrain) | workaround | |
 | vkd3d-proton `0006` SV_ShadingRate dropped | Pipelines writing a shading rate failed to compile on devices that cannot express it. | general | general | |
 | vkd3d-proton `0007` force_native_fp16 | Games lost pipelines using 16-bit shader operations (16 per Microsoft Flight Simulator 2024 run). | Microsoft Flight Simulator 2024 (its recipe sets it) | workaround (opt-in: `VKD3D_CONFIG=force_native_fp16`) | |
+| vkd3d-proton `0014` FSR 3.1 on MetalFX | FSR's own upscaler passes were slow and soft on Apple GPUs; MetalFX's temporal scaler replaces them. | games with FSR 3.1 whose recipe sets `HB_VKD3D_METALFX_FSR=1` (Forza Horizon 6) | Apple GPU (opt in) | KosmicKrisp `0013` |
 | DXVK `0001` unshared fallback | A crash at the game's first boot video when a texture could not be shared. | Microsoft Flight Simulator 2024 | general | Wine 0036 made sharing work later |
 | DXVK `0002` video memory budget | Games filled more memory than the GPU may wire, and the GPU stalled. | Microsoft Flight Simulator 2024 (its recipe sets it) | Apple GPU (opt-in: `dxgi.maxVideoMemoryBudget`) | |
 | DXVK `0003` relaxed features | DXVK rejected Apple GPUs for missing features, geometry shaders included. | every DXVK game on this line (the engine's base environment sets it) | workaround (opt-in: `DXVK_RELAX_FEATURES=1`) | from Michael Liendo's work (highball-db#6) |
@@ -59,6 +60,11 @@ vkd3d-proton or DXVK yet.
   the full range; actual typed buffers are unchanged. `tests/vkd3d-reserved/large-raw-buffer.c` reproduces the
   assertion on the control and passes all 35 checks with the patch, including raw and structured GPU reads
   through the last word of 2 GB. Oversized actual typed views and type aliasing beyond the limit remain unsupported.
+- `0014` `HB_VKD3D_METALFX_FSR=1` runs a game's own FSR 3.1 upscaler on MetalFX's temporal scaler when the driver lists
+  "hb-metalfx" (KosmicKrisp `0013`). The passes are recognized from the DXIL hashes and bindings in the game's FSR 3.1
+  provider DLL, read at run time, so nothing is specific to one game; a game's recipe turns it on. The interface is
+  Highball's own `include/private/vkd3d_hb_metalfx.h`. Forza Horizon 6: FSR Quality on MetalFX, full frame, the game's
+  sharpening kept.
 
 ### DXVK (master of 2026-10-09, 1cad6cd)
 
