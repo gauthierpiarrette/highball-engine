@@ -6,12 +6,18 @@
  * first, so that the page holds translated code, then lets one system call write into the same page before the
  * program writes there itself. A copy protection asks for the SMBIOS table this way (Football Manager 27).
  * The rewrite checks change the code without a flush after those calls: the emulator must still see the change.
- * The last checks run two threads: a query into a code page while the other thread rewrites code (no thread may
- * wait for ever), and a copy into a code page while the other thread rewrites and runs code in the same page.
+ * Two checks write while the system holds a lock (GetWriteWatch, NtQueryDirectoryFile). The last checks run two
+ * threads: a query into a code page while the other thread rewrites code (no thread may wait for ever), and a copy
+ * into a code page while the other thread rewrites and runs code in the same page.
  */
 #include "fid.h"
 
 typedef NTSTATUS (WINAPI *NtQuerySystemInformation_t)(ULONG, void *, ULONG, ULONG *);
+
+struct io_status { ULONG_PTR status; ULONG_PTR information; };  /* IO_STATUS_BLOCK */
+typedef NTSTATUS (WINAPI *NtQueryDirectoryFile_t)(HANDLE, HANDLE, void *, void *, struct io_status *, void *,
+                                                  ULONG, ULONG, BOOLEAN, void *, BOOLEAN);
+#define FileDirectoryInformation 1
 
 #define SystemFirmwareTableInformation 76
 
@@ -294,6 +300,58 @@ int main(void)
         ok = ReadProcessMemory(GetCurrentProcess(), source, page + 0x900, sizeof(source), &done);
         fid_info("readonly.readprocessmemory", "ok %d error %lu bytes %lu", ok, ok ? 0 : GetLastError(), (unsigned long)done);
         fid_check(page[0x900] == 0, "readonly.unchanged", "byte %#x", page[0x900]);
+        VirtualFree(page, 0, MEM_RELEASE);
+    }
+
+    /* GetWriteWatch fills its list while the system holds its lock for memory; a rewrite after it must take effect */
+    page = code_page_that_ran();
+    fid_check(page != NULL, "setup.writewatch", "no code page");
+    if (page)
+    {
+        unsigned char *watched = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+        ULONG_PTR count = 16;
+        ULONG granularity = 0;
+        UINT res = 1;
+
+        fn = (int (*)(void))page;
+        if (watched)
+        {
+            watched[0] = 1;
+            watched[0x2000] = 1;
+            res = GetWriteWatch(0, watched, 0x10000, (void **)(page + 0x800), &count, &granularity);
+        }
+        fid_check(watched && res == 0 && count >= 2, "writewatch.syscall", "result %u count %lu", res, (unsigned long)count);
+        fid_check(fn() == 42, "writewatch.still-runs", "got %#x", fn());
+        page[1] = 7;  /* mov eax, 7, without FlushInstructionCache */
+        fid_check(fn() == 7, "writewatch.no-flush", "got %#x", fn());
+        if (watched) VirtualFree(watched, 0, MEM_RELEASE);
+        VirtualFree(page, 0, MEM_RELEASE);
+    }
+
+    /* NtQueryDirectoryFile writes its entries while the system holds its lock for directories */
+    page = code_page_that_ran();
+    fid_check(page != NULL, "setup.directory", "no code page");
+    if (page)
+    {
+        NtQueryDirectoryFile_t pNtQueryDirectoryFile =
+            (NtQueryDirectoryFile_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryDirectoryFile");
+        struct io_status io = { 0, 0 };
+        HANDLE dir;
+
+        fn = (int (*)(void))page;
+        GetTempPathA(sizeof(tmp), tmp);
+        dir = CreateFileA(tmp, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                          OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        status = (dir != INVALID_HANDLE_VALUE && pNtQueryDirectoryFile)
+            ? pNtQueryDirectoryFile(dir, NULL, NULL, NULL, &io, page + 0x800, 0x400, FileDirectoryInformation,
+                                    FALSE, NULL, TRUE)
+            : (NTSTATUS)0xc0000001;
+        fid_check(status == 0 && io.information > 0, "directory.syscall", "status %#lx bytes %lu",
+                  (unsigned long)status, (unsigned long)io.information);
+        fid_check(fn() == 42, "directory.still-runs", "got %#x", fn());
+        page[1] = 7;  /* mov eax, 7, without FlushInstructionCache */
+        fid_check(fn() == 7, "directory.no-flush", "got %#x", fn());
+        if (dir != INVALID_HANDLE_VALUE) CloseHandle(dir);
         VirtualFree(page, 0, MEM_RELEASE);
     }
 

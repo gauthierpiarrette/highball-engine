@@ -42,6 +42,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0041` ntdll-arm64ec-the-x64-state-on-an-unhandled-exception | A crash log named the instruction but not the x64 registers. | Microsoft Flight Simulator 2024 | diagnostics | |
 | `0042` ntdll-arm64ec-rtliseccode-above-the-user-address-space | A thread could fault in a loop until its stack ran out. | Microsoft Flight Simulator 2024 | general | |
 | `0043` ntdll-arm64ec-a-program-sees-its-own-page-protection | Programs saw the emulator's page protection, so restoring it made their own pages fault. | Microsoft Flight Simulator 2024, copy protections | x86-64 fidelity | pairs with FEX 0022 |
+| `0058` ntdll-arm64ec-system-calls-write-into-the-emulators-write-trap | A system call that wrote into a page holding code that already ran failed with an access violation, where Windows writes. | Football Manager 27 | x86-64 fidelity | needs FEX's `BTCpu64NotifyMemoryDirty`; uses `0043`, test in `tests/x64-fidelity/syscallwrite` |
 
 ## Details
 
@@ -340,24 +341,29 @@ take a read, a copy or a query. Football Manager 27's copy protection asks for t
 the game at "Loading game database".
 
 `0058` marks the pages the emulator traps (ntdll's ARM64EC side asks `GuestProtection` from `0043` for each 4 KB
-page). A write from inside a system call into a marked page takes the steps of a write by the program, in FEX's
-order: the signal handler sends the thread to a user callback that calls `BTCpu64NotifyMemoryDirty`, opens the
-page and calls it again, and then the write runs again. FEX traps the page again when it translates code from it
-again. The callback does not run while the system call holds `virtual_mutex`, because FEX calls
-`NtProtectVirtualMemory` while it holds its own lock for code invalidation; there the page opens on the Unix side,
-and the `NtQueryVirtualMemory` wrapper tells FEX when the call returns. macOS only.
+page, committed pages only). A write from inside a system call into a marked page takes the steps of a write by
+the program, in FEX's order: the signal handler sends the thread to a user callback that calls
+`BTCpu64NotifyMemoryDirty`, opens the page and calls it again, and then the write runs again. FEX traps the page
+again when it translates code from it again. The callback runs during the call only when the thread holds no Unix
+lock, because FEX calls `NtProtectVirtualMemory` while it holds its own lock for code invalidation. Under a lock
+(`virtual_mutex` in `NtGetWriteWatch` or `NtQueryVirtualMemory`, `dir_mutex` in `NtQueryDirectoryFile`) the page
+opens on the Unix side, and the dispatcher runs the same callback when the call returns. A call without such a
+write pays nothing. A reply that wineserver writes straight into such a page (`NtQueryObject`, some
+`NtQueryInformationProcess` classes, registry queries) still ends the thread; that is not covered. macOS only.
 
 A first way, FEX's notice after the marked calls only (as `BTCpu64NotifyReadFile` does for `NtReadFile`), passed
 the other checks but let a second thread run old code: its own write into the open page did not reach FEX before
 the call returned (`thread.no-stale-code`, 2 to 73 stale runs of about 52,000 in 4 of 13 runs).
 
-tests/x64-fidelity `syscallwrite` (M5 Pro, macOS 27.2), 31 checks:
+tests/x64-fidelity `syscallwrite` (M5 Pro, macOS 27.2), 39 checks:
 
 | Engine | Result |
 |---|---|
-| Rosetta 2 (CrossOver 26.3) | 31 of 31 (3 of 3 runs) |
-| r5, without `0058` | 19 of the first 28, then `lock` hangs |
-| r5 with `0058` | 31 of 31 (5 of 5 runs); the first 28 in 13 of 13 runs |
+| Rosetta 2 (CrossOver 26.3) | 39 of 39 |
+| r5, without `0058` | 23 of the first 34, then `lock` hangs |
+| r5 with `0058` | 39 of 39 (10 of 10 runs) |
+
+`VirtualQuery` in a loop: about 1,173,000 calls a second on r5, 1,165,000 with `0058`.
 
 The other x64-fidelity tests give the same results with and without `0058`.
 
@@ -367,7 +373,8 @@ Games on r5 with `0058` (M5 Pro, macOS 27.2, 2026-11-16):
   stops there in 5 of 5 starts.
 - DREDGE: plays as before.
 - Forza Horizon 6 (Game Pass), with the arm64 route of Highball's recipe, at 2560x1440, the Medium preset and
-  V-Sync off, the game's benchmark:
+  V-Sync off, the game's benchmark, measured on the previous version of `0058` (which also called
+  `BTCpu64NotifyMemoryDirty` after every `VirtualQuery`):
 
 | | r5 | r5 with `0058` |
 |---|---|---|
