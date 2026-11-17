@@ -1,0 +1,888 @@
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -170,6 +170,45 @@
+ static struct wine_rb_tree views_tree;
+ static pthread_mutex_t virtual_mutex;
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++static BOOL aoe_vm_tracking;
++static UINT64 aoe_vm_epoch;
++static __thread unsigned aoe_vm_depth;
++#endif
++
++/* Keep the epoch odd for the entire outermost VM critical section, including
++ * protection changes made by signal handlers. Never retain file_view pointers. */
++static void lock_virtual(void)
++{
++    mutex_lock( &virtual_mutex );
++#if defined(__APPLE__) && defined(__x86_64__)
++    if (aoe_vm_tracking && !aoe_vm_depth++)
++        __atomic_add_fetch( &aoe_vm_epoch, 1, __ATOMIC_ACQ_REL );
++#endif
++}
++
++static void unlock_virtual(void)
++{
++#if defined(__APPLE__) && defined(__x86_64__)
++    if (aoe_vm_tracking && !--aoe_vm_depth)
++        __atomic_add_fetch( &aoe_vm_epoch, 1, __ATOMIC_RELEASE );
++#endif
++    mutex_unlock( &virtual_mutex );
++}
++
++static void enter_virtual_section(sigset_t *sigset)
++{
++    pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
++    lock_virtual();
++}
++
++static void leave_virtual_section(sigset_t *sigset)
++{
++    unlock_virtual();
++    pthread_sigmask( SIG_SETMASK, sigset, NULL );
++}
++
++
+ static const UINT page_shift = 12;
+ static const UINT_PTR page_mask = 0xfff;
+ static const UINT_PTR granularity_mask = 0xffff;
+@@ -819,7 +858,7 @@
+     void *ret = NULL;
+     struct builtin_module *builtin;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+     {
+         if (builtin->module != module) continue;
+@@ -827,7 +866,7 @@
+         if (ret) builtin->refcount++;
+         break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+ 
+@@ -842,7 +881,7 @@
+     NTSTATUS status = STATUS_DLL_NOT_FOUND;
+     struct builtin_module *builtin;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+     {
+         if (builtin->module != module) continue;
+@@ -859,7 +898,7 @@
+         }
+         break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -873,7 +912,7 @@
+     NTSTATUS status = STATUS_SUCCESS;
+     struct builtin_module *builtin;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+     {
+         if (builtin->module != module) continue;
+@@ -881,7 +920,7 @@
+         else status = STATUS_IMAGE_ALREADY_LOADED;
+         break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -1417,12 +1456,12 @@
+     struct file_view *view;
+ 
+     TRACE( "Dump of all virtual memory views:\n" );
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+     {
+         dump_view( view );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ }
+ #endif
+ 
+@@ -3419,7 +3458,7 @@
+         SERVER_END_REQ;
+     }
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     status = map_image_view( &view, image_info, size, limit_low, limit_high, alloc_type );
+     if (status) goto done;
+@@ -3456,7 +3495,7 @@
+     else delete_view( view );
+ 
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     if (needs_close) close( unix_fd );
+     if (shared_needs_close) close( shared_fd );
+     return status;
+@@ -3563,7 +3602,7 @@
+ 
+     if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
+     if (res) goto done;
+@@ -3597,7 +3636,7 @@
+     else delete_view( view );
+ 
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     if (needs_close) close( unix_handle );
+     return res;
+ }
+@@ -3650,6 +3689,22 @@
+     int i;
+     pthread_mutexattr_t attr;
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++    /* Set before guest threads exist. Actual reads also require the verified
++     * AoE profile/ring checks in aoe_code_cache.h. */
++    if (getenv( "HB_AOE4" ) && !strcmp( getenv( "HB_AOE4" ), "1" ) &&
++        !getenv( "AOE4_DISABLE_VM_CACHE" ))
++    {
++        const char *name, *slash;
++        for (i = 0; i < main_argc && i < 2; ++i)
++        {
++            name = main_argv[i];
++            if ((slash = strrchr( name, '/' ))) name = slash + 1;
++            if ((slash = strrchr( name, '\\' ))) name = slash + 1;
++            if (!strcasecmp( name, "RelicCardinal.exe" )) aoe_vm_tracking = TRUE;
++        }
++    }
++#endif
+     pthread_mutexattr_init( &attr );
+     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
+     pthread_mutex_init( &virtual_mutex, &attr );
+@@ -3872,7 +3927,7 @@
+     void *base = wine_server_get_ptr( info->base );
+     int i;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     status = create_view( &view, base, size, SEC_IMAGE | SEC_FILE | VPROT_SYSTEM |
+                           VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY | VPROT_EXEC );
+     if (!status)
+@@ -3909,7 +3964,7 @@
+         }
+         else delete_view( view );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ 
+     return status;
+ }
+@@ -4083,7 +4138,7 @@
+     NTSTATUS status = STATUS_SUCCESS;
+     SIZE_T block_size = signal_stack_mask + 1;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (next_free_teb)
+     {
+         ptr = next_free_teb;
+@@ -4099,7 +4154,7 @@
+             if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, user_space_wow_limit,
+                                                    &total, MEM_RESERVE, PAGE_READWRITE )))
+             {
+-                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++                leave_virtual_section( &sigset );
+                 return status;
+             }
+             teb_block = ptr;
+@@ -4116,7 +4171,7 @@
+         *(void **)ptr = next_free_teb;
+         next_free_teb = ptr;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -4155,14 +4210,14 @@
+         NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
+     }
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     signal_free_thread( teb );
+     list_remove( &thread_data->entry );
+     ptr = teb;
+     if (!is_win64) ptr = (char *)ptr - teb_offset;
+     *(void **)ptr = next_free_teb;
+     next_free_teb = ptr;
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ }
+ 
+ 
+@@ -4271,10 +4326,10 @@
+     if (is_win64 && !is_wow64()) return STATUS_NOT_IMPLEMENTED;
+     if (sel1 >> 16 || sel2 >> 16) return STATUS_INVALID_LDT_DESCRIPTOR;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (sel1) ldt_update_entry( sel1, entry1 );
+     if (sel2) ldt_update_entry( sel2, entry2 );
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -4302,7 +4357,7 @@
+ 
+     if (index < TLS_MINIMUM_AVAILABLE)
+     {
+-        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++        enter_virtual_section( &sigset );
+         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
+         {
+             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+@@ -4313,14 +4368,14 @@
+ #endif
+             teb->TlsSlots[index] = 0;
+         }
+-        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++        leave_virtual_section( &sigset );
+     }
+     else
+     {
+         index -= TLS_MINIMUM_AVAILABLE;
+         if (index >= 8 * sizeof(peb->TlsExpansionBitmapBits)) return STATUS_INVALID_PARAMETER;
+ 
+-        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++        enter_virtual_section( &sigset );
+         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
+         {
+             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+@@ -4335,7 +4390,7 @@
+ #endif
+             if (teb->TlsExpansionSlots) teb->TlsExpansionSlots[index] = 0;
+         }
+-        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++        leave_virtual_section( &sigset );
+     }
+     return STATUS_SUCCESS;
+ }
+@@ -4359,7 +4414,7 @@
+     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */
+     size = ROUND_SIZE( 0, size, granularity_mask );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
+                        limit_low, limit_high, 0 );
+@@ -4386,7 +4441,7 @@
+     stack->StackBase = (char *)view->base + view->size;
+     stack->StackLimit = (char *)view->base + (guard_page ? 2 * host_page_size : 0);
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -4550,7 +4605,7 @@
+     char *page = ROUND_ADDR( addr, host_page_mask );
+     BYTE vprot;
+ 
+-    mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
++    lock_virtual();  /* no need for signal masking inside signal handler */
+     vprot = get_host_page_vprot( page );
+ 
+ #ifdef __APPLE__
+@@ -4621,7 +4676,7 @@
+ #ifdef __APPLE__
+ done:
+ #endif
+-    mutex_unlock( &virtual_mutex );
++    unlock_virtual();
+     rec->ExceptionCode = ret;
+     return ret;
+ }
+@@ -4661,13 +4716,13 @@
+     else if (stack < stack_info.limit)
+     {
+         char *page = ROUND_ADDR( stack, host_page_mask );
+-        mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
++        lock_virtual();  /* no need for signal masking inside signal handler */
+         if ((get_host_page_vprot( page ) & VPROT_GUARD) && grow_thread_stack( page, &stack_info ))
+         {
+             rec->ExceptionCode = STATUS_STACK_OVERFLOW;
+             rec->NumberParameters = 0;
+         }
+-        mutex_unlock( &virtual_mutex );
++        unlock_virtual();
+     }
+ #if defined(VALGRIND_MAKE_MEM_UNDEFINED)
+     VALGRIND_MAKE_MEM_UNDEFINED( stack, size );
+@@ -4716,14 +4771,14 @@
+ 
+     if (!size) return wine_server_call( req_ptr );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!(ret = check_write_access( addr, size, &has_write_watch )))
+     {
+         ret = server_call_unlocked( req );
+         if (has_write_watch) update_write_watches( addr, size, wine_server_reply_size( req ));
+     }
+     else memset( &req->u.reply, 0, sizeof(req->u.reply) );
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+ 
+@@ -4740,14 +4795,14 @@
+     ssize_t ret = read( fd, addr, size );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!check_write_access( addr, size, &has_write_watch ))
+     {
+         ret = read( fd, addr, size );
+         err = errno;
+         if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     errno = err;
+     return ret;
+ }
+@@ -4765,14 +4820,14 @@
+     ssize_t ret = pread( fd, addr, size, offset );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!check_write_access( addr, size, &has_write_watch ))
+     {
+         ret = pread( fd, addr, size, offset );
+         err = errno;
+         if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     errno = err;
+     return ret;
+ }
+@@ -4791,7 +4846,7 @@
+     ssize_t ret = recvmsg( fd, hdr, flags );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     for (i = 0; i < hdr->msg_iovlen; i++)
+         if (check_write_access( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, &has_write_watch ))
+             break;
+@@ -4803,7 +4858,7 @@
+     if (has_write_watch)
+         while (i--) update_write_watches( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, 0 );
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     errno = err;
+     return ret;
+ }
+@@ -4818,10 +4873,10 @@
+     BOOL ret = FALSE;
+     sigset_t sigset;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if ((view = find_view( addr, size )))
+         ret = !(view->protect & VPROT_SYSTEM);  /* system views are not visible to the app */
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+ 
+@@ -4940,7 +4995,7 @@
+ #if defined(__APPLE__) && defined(__x86_64__)
+ /* Keep the ring and fragment reads in one VM section. The VM lock protects
+  * mappings, so sample the bytes twice to detect concurrent game writes. */
+-SIZE_T virtual_read_aoe_fragment( const void *ring_address, UINT_PTR pc, UINT_PTR *ring, BYTE *bytes )
++static SIZE_T read_aoe_fragment_locked( const void *ring_address, UINT_PTR pc, UINT_PTR *ring, BYTE *bytes )
+ {
+     static const UINT_PTR ring_size = 0x1000000;
+     BYTE check[32];
+@@ -4969,6 +5024,109 @@
+     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+     return length;
+ }
++#ifdef __APPLE__
++/* Each cached range was checked while holding the VM lock. No view pointers
++ * survive unlocking. VM critical sections conservatively invalidate the epoch;
++ * only the audited read-only snapshot helpers bypass it. A fault at our private
++ * copy instruction returns failure before Wine can consume PAGE_GUARD. */
++struct aoe_validated_page
++{
++    UINT64 epoch;
++    UINT_PTR pointer_address, ring, page;
++    BOOL valid;
++};
++static __thread struct aoe_validated_page aoe_page;
++static __thread volatile sig_atomic_t aoe_read_busy;
++
++static BOOL aoe_page_readable( UINT_PTR address )
++{
++    struct file_view *view = find_view( (const void *)address, host_page_size );
++    return view && !(view->protect & VPROT_SYSTEM) &&
++           (get_unix_prot( get_host_page_vprot( (const void *)address )) & PROT_READ);
++}
++
++SIZE_T virtual_read_aoe_fragment( const void *pointer, UINT_PTR pc, UINT_PTR *ring, BYTE *bytes )
++{
++    UINT_PTR observed, check_ring;
++    UINT64 epoch;
++    SIZE_T length = 0;
++    BYTE check[32];
++    sigset_t sigset;
++
++    if (!aoe_vm_tracking || aoe_read_busy)
++        return read_aoe_fragment_locked( pointer, pc, ring, bytes );
++    aoe_read_busy = 1;
++    __atomic_signal_fence( __ATOMIC_SEQ_CST );
++    epoch = __atomic_load_n( &aoe_vm_epoch, __ATOMIC_ACQUIRE );
++    if (!(epoch & 1) && aoe_page.valid && aoe_page.epoch == epoch &&
++        aoe_page.pointer_address == (UINT_PTR)pointer &&
++        aoe_nofault_copy( &observed, pointer, sizeof(observed) ) && observed == aoe_page.ring)
++    {
++        if (pc < observed || pc - observed >= 0x1000000)
++        {
++            __atomic_thread_fence( __ATOMIC_ACQUIRE );
++            if (__atomic_load_n( &aoe_vm_epoch, __ATOMIC_ACQUIRE ) == epoch)
++            {
++                *ring = observed;
++                aoe_read_busy = 0;
++                return 0;
++            }
++        }
++        length = 32 - (pc - observed) % 32;
++        if (aoe_page.page == (pc & ~host_page_mask) && pc >= observed && pc - observed < 0x1000000 &&
++            aoe_nofault_copy( bytes, (const void *)pc, length ) &&
++            aoe_nofault_copy( check, (const void *)pc, length ) &&
++            aoe_nofault_copy( &check_ring, pointer, sizeof(check_ring) ) &&
++            check_ring == observed && !memcmp( bytes, check, length ))
++        {
++            __atomic_thread_fence( __ATOMIC_ACQUIRE );
++            if (__atomic_load_n( &aoe_vm_epoch, __ATOMIC_ACQUIRE ) == epoch)
++            {
++                *ring = observed;
++                aoe_read_busy = 0;
++                return length;
++            }
++        }
++    }
++    length = 0;
++    /* Read-only scope: the writer wrappers cannot run concurrently with it. */
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    if (read_memory_locked( pointer, ring, sizeof(*ring) ) == sizeof(*ring) &&
++        *ring && !(*ring & 31) && *ring <= ~(UINT_PTR)0 - 0x1000000 &&
++        pc >= *ring && pc - *ring < 0x1000000)
++    {
++        length = 32 - (pc - *ring) % 32;
++        if (read_memory_locked( (const void *)pc, bytes, length ) != length)
++            length = 0;
++        else
++        {
++            __atomic_signal_fence( __ATOMIC_SEQ_CST );
++            memcpy( check, (const void *)pc, length );
++            if (memcmp( bytes, check, length ) ||
++                read_memory_locked( pointer, &check_ring, sizeof(check_ring) ) != sizeof(check_ring) ||
++                check_ring != *ring) length = 0;
++        }
++        if (length && !aoe_vm_depth && aoe_page_readable( pc & ~host_page_mask ))
++        {
++            aoe_page.epoch = __atomic_load_n( &aoe_vm_epoch, __ATOMIC_ACQUIRE );
++            aoe_page.pointer_address = (UINT_PTR)pointer;
++            aoe_page.ring = *ring;
++            aoe_page.page = pc & ~host_page_mask;
++            aoe_page.valid = TRUE;
++        }
++    }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    __atomic_signal_fence( __ATOMIC_SEQ_CST );
++    aoe_read_busy = 0;
++    return length;
++}
++#else
++SIZE_T virtual_read_aoe_fragment( const void *pointer, UINT_PTR pc, UINT_PTR *ring, BYTE *bytes )
++{
++    return read_aoe_fragment_locked( pointer, pc, ring, bytes );
++}
++#endif
++
+ #endif
+ 
+ 
+@@ -4987,13 +5145,13 @@
+ 
+     if (!size) return STATUS_SUCCESS;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!(ret = check_write_access( addr, size, &has_write_watch )))
+     {
+         memcpy( addr, buffer, size );
+         if (has_write_watch) update_write_watches( addr, size, size );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+ 
+@@ -5008,7 +5166,7 @@
+     struct file_view *view;
+     sigset_t sigset;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!force_exec_prot != !enable)  /* change all existing views */
+     {
+         force_exec_prot = enable;
+@@ -5021,7 +5179,7 @@
+             mprotect_range( view->base, view->size, commit, 0 );
+         }
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ }
+ 
+ 
+@@ -5033,7 +5191,7 @@
+     struct file_view *view;
+     sigset_t sigset;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!enable_write_exceptions && enable)  /* change all existing views */
+     {
+         WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+@@ -5041,7 +5199,7 @@
+                 mprotect_range( view->base, view->size, 0, 0 );
+     }
+     enable_write_exceptions = enable;
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ }
+ 
+ 
+@@ -5230,7 +5388,7 @@
+ 
+     /* Reserve the memory */
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     if ((type & MEM_RESERVE) || !base)
+     {
+@@ -5284,7 +5442,7 @@
+ 
+     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ 
+     if (status == STATUS_SUCCESS)
+     {
+@@ -5538,7 +5696,7 @@
+     if (size) size = ROUND_SIZE( addr, size, page_mask );
+     base = ROUND_ADDR( addr, page_mask );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     /* avoid freeing the DOS area when a broken app passes a NULL pointer */
+     if (!base)
+@@ -5583,7 +5741,7 @@
+         *addr_ptr = base;
+         *size_ptr = size;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -5638,7 +5796,7 @@
+     size = ROUND_SIZE( addr, size, page_mask );
+     base = ROUND_ADDR( addr, page_mask );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     if ((view = find_view( base, size )))
+     {
+@@ -5664,7 +5822,7 @@
+ 
+     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ 
+     if (status == STATUS_SUCCESS)
+     {
+@@ -5765,7 +5923,7 @@
+ 
+     /* Find the view containing the address */
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     view = get_memory_region_size( base, &alloc_base, &alloc_end, &fake_reserved );
+ 
+     /* Fill the info structure */
+@@ -5805,7 +5963,7 @@
+         else if (view->protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) info->Type = MEM_MAPPED;
+         else info->Type = MEM_PRIVATE;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ 
+     return STATUS_SUCCESS;
+ }
+@@ -5877,7 +6035,7 @@
+ 
+     if (is_beyond_limit( base, 1, working_set_limit )) return STATUS_INVALID_PARAMETER;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     if ((view = get_memory_region_size( base, &region_start, &region_end, &fake_reserved )))
+     {
+@@ -5904,7 +6062,7 @@
+     {
+         if (!fake_reserved)
+         {
+-            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++            leave_virtual_section( &sigset );
+             return STATUS_INVALID_ADDRESS;
+         }
+         info->AllocationBase = region_start;
+@@ -5914,7 +6072,7 @@
+         info->CommitSize = 0;
+     }
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ 
+     if (res_len) *res_len = sizeof(*info);
+     return STATUS_SUCCESS;
+@@ -6106,7 +6264,7 @@
+     start = ref[0].addr;
+     end = ref[count - 1].addr + page_size;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     init_fill_working_set_info_data( &data, end );
+ 
+     view = find_view_range( start, end - start );
+@@ -6137,7 +6295,7 @@
+ 
+     free_fill_working_set_info_data( &data );
+     if (ref != ref_buffer) free( ref );
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ 
+     if (res_len)
+         *res_len = len;
+@@ -6518,7 +6676,7 @@
+         return status;
+     }
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!(view = find_view( addr, 0 )) || is_view_valloc( view )) goto done;
+ 
+     if (flags & MEM_PRESERVE_PLACEHOLDER && !(view->protect & VPROT_PLACEHOLDER))
+@@ -6537,7 +6695,7 @@
+             {
+                 TRACE( "not freeing in-use builtin %p\n", view->base );
+                 builtin->refcount--;
+-                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++                leave_virtual_section( &sigset );
+                 return STATUS_SUCCESS;
+             }
+         }
+@@ -6557,7 +6715,7 @@
+     }
+     else FIXME( "failed to unmap %p %x\n", view->base, status );
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -6709,7 +6867,7 @@
+         return result.virtual_flush.status;
+     }
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!(view = find_view( addr, *size_ptr ))) status = STATUS_INVALID_PARAMETER;
+     else
+     {
+@@ -6720,7 +6878,7 @@
+             status = STATUS_NOT_MAPPED_DATA;
+ #endif
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -6747,7 +6905,7 @@
+     TRACE( "%p %x %p-%p %p %lu\n", process, flags, base, (char *)base + size,
+            addresses, *count );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     if (is_write_watch_range( base, size ))
+     {
+@@ -6779,7 +6937,7 @@
+     }
+     else status = STATUS_INVALID_PARAMETER;
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -6800,14 +6958,14 @@
+ 
+     if (!size) return STATUS_INVALID_PARAMETER;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     if (is_write_watch_range( base, size ))
+         reset_write_watches( base, size );
+     else
+         status = STATUS_INVALID_PARAMETER;
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -6953,7 +7111,7 @@
+ 
+     TRACE("%p %p\n", addr1, addr2);
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+ 
+     view1 = find_view( addr1, 0 );
+     view2 = find_view( addr2, 0 );
+@@ -6977,7 +7135,7 @@
+         SERVER_END_REQ;
+     }
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+ 
+@@ -7019,7 +7177,7 @@
+     sigset_t sigset;
+     NTSTATUS ret = STATUS_SUCCESS;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     for (i = 0; i < count; i++)
+     {
+         void *base = ROUND_ADDR( addresses[i].VirtualAddress, page_mask );
+@@ -7035,7 +7193,7 @@
+         else if (set_page_vprot_exec_write_protect( base, size ))
+             mprotect_range( base, size, 0, 0 );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+ 
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -1140,6 +1140,7 @@
+  */
+ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+ {
++
+     NTSTATUS ret = STATUS_SUCCESS;
+     DWORD flags = context->ContextFlags & ~CONTEXT_AMD64;
+     BOOL self = (handle == GetCurrentThread());
+@@ -2560,14 +2561,43 @@
+  *
+  * Handler for SIGSEGV and related errors.
+  */
++
++#ifdef __APPLE__
++/* Only this exact load instruction may recover without touching Wine's VM
++ * metadata. An exception in the game or anywhere else follows the stock path. */
++__ASM_GLOBAL_FUNC( aoe_nofault_copy,
++                   "movq %rdx,%rcx\n\t"
++                   "L_aoe_nofault_load:\n\t"
++                   "rep movsb\n\t"
++                   "movl $1,%eax\n\t"
++                   "ret\n\t"
++                   "L_aoe_nofault_failed:\n\t"
++                   "xorl %eax,%eax\n\t"
++                   "ret" )
++#endif
++
+ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     ucontext_t *ucontext = init_handler( sigcontext );
+     EXCEPTION_RECORD rec = { 0 };
+     struct xcontext context;
++#ifdef __APPLE__
++    ULONG_PTR copy_pc, failed_pc;
++#endif
+ 
+ #ifdef __APPLE__
+     if (foreign_thread_fault( signal, TRUE )) return;
++#endif
++
++#ifdef __APPLE__
++    __asm__ volatile( "leaq L_aoe_nofault_load(%%rip),%0" : "=r"(copy_pc) );
++    if ((signal == SIGSEGV || signal == SIGBUS) && RIP_sig(ucontext) == copy_pc)
++    {
++        __asm__ volatile( "leaq L_aoe_nofault_failed(%%rip),%0" : "=r"(failed_pc) );
++        RIP_sig(ucontext) = failed_pc;
++        leave_handler( ucontext );
++        return;
++    }
+ #endif
+ 
+     rec.ExceptionAddress = (void *)aoe_cache_logical_pc(RIP_sig(ucontext));
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -310,6 +310,7 @@
+ extern SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T size );
+ #if defined(__APPLE__) && defined(__x86_64__)
+ extern SIZE_T virtual_read_aoe_fragment( const void *ring_address, UINT_PTR pc, UINT_PTR *ring, BYTE *bytes );
++extern BOOL aoe_nofault_copy( void *dst, const void *src, SIZE_T length );
+ #endif
+ extern NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZE_T size );
+ extern void virtual_set_force_exec( BOOL enable );

@@ -22,6 +22,30 @@ decoder on, `AOE4_X87=0` selects the software-fault decoder alone, and
 enables cache counters; `cache-stats.py` summarizes them. See [validation](VALIDATION.md)
 for prototype results and remaining checks.
 
+## r3 memory-page cache (patch 0033)
+
+
+r3 retains r2's relocated-instruction cache and adds a thread-local cache of validated
+memory-page permissions. Most instruction lookups no longer acquire Wine's VM lock or
+search its mapping tree. They still reread the live ring pointer and instruction bytes.
+A VM generation changes around mapping/protection operations; a changed generation,
+changed pointer, different page or failed copy falls back to the locked reader. Normal
+resumes outside the ring preserve the useful page snapshot.
+
+A private no-fault copy recovers only faults at its own load instruction, before Wine
+consumes a Windows guard page. The optimization is limited to the AoE executable on
+Darwin x86-64; the existing executable verification and ring discovery still gate use.
+Steam and other executables do not enable VM generation tracking.
+
+Three same-process Late Siege comparisons reduced P99 frame intervals from 75–83 ms
+to 42 ms, with about 50 ms-or-longer frames falling from 40–41 to 4–7 per 20-second
+window. Average FPS rose from 36.6–37.0 to 38.7–39.2. This does not eliminate every
+stutter. See [r3 measurements and limitations](VALIDATION.md#r3-validated-page-cache).
+
+Set `AOE4_DISABLE_VM_CACHE=1` and restart the game to use the previous locked
+reader while retaining the other AoE fixes. Remove the variable entirely to restore r3.
+The upstream path still requires `HB_AOE4=1`.
+
 ## Build and test
 
 Dispatch the usual **build-engine** workflow. It applies the Wine 11 series
