@@ -60,6 +60,11 @@ vkd3d-proton or DXVK yet.
   assertion on the control and passes all 35 checks with the patch, including raw and structured GPU reads
   through the last word of 2 GB. Oversized actual typed views and type aliasing beyond the limit remain unsupported.
 
+- `0011` `HB_VKD3D_TILER=1` gives a driver vkd3d-proton does not list as a tiler (KosmicKrisp, MoltenVK) the tiler
+  barriers and render pass suspend/resume, `=2` the barriers only. Off by default. On KosmicKrisp suspend/resume only pays
+  with KosmicKrisp `0010` (`HB_KK_SKIP_EMPTY_PASSES=1`), which skips the empty renderings its fixups record.
+- `0012` `HB_VKD3D_CONFIG` is appended to `VKD3D_CONFIG`, so a bottle can add flags to the ones its recipe sets.
+
 ### DXVK (master of 2026-10-09, 1cad6cd)
 
 - `0001` a texture that cannot be shared is created unshared instead of calling vkGetMemoryWin32HandleKHR, which was
