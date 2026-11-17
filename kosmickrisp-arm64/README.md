@@ -23,6 +23,12 @@ with two sets of patches, applied in this order:
     constant buffer reads, 24.4 to 21 ms there, and null constant buffer descriptors then read a buffer of zeros. A read
     past a bound constant buffer returns the memory after it instead of zero. Also 256 command buffer records, so
     `MESA_KK_DEBUG=cbs` logs all of a frame's.
+  - `0013` MetalFX's temporal scaler, run when a VkHbMetalFXScaleInfo (`src/kosmickrisp/vulkan/kk_hb_metalfx.h`, the
+    same interface as vkd3d-proton's `vkd3d_hb_metalfx.h`) is in the pNext chain of vkCmdPipelineBarrier2, in command
+    order; driverInfo lists "hb-metalfx". One scaler per id and size is kept; it reads the rendered region of the color,
+    depth and motion images and writes the output image, with the encoders around it ending in full barriers. Used by
+    vkd3d-proton `0014` for FSR 3.1; on the base of this series Forza Horizon 6 logged "MetalFX temporal 1280x800 ->
+    1920x1200 ... ok" (M5 Max, 2026-11-17).
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.
