@@ -141,6 +141,7 @@ jobs:
           echo "winegstreamer.so links: $(otool -L out/engine/lib/wine/x86_64-unix/winegstreamer.so | awk 'NR > 1 && $1 !~ /^\/(usr\/lib|System)\// {printf "%s ", $1}')"
           echo "engine size: ${before} MB -> $(du -sm out/engine | cut -f1) MB"
           out/engine/bin/wine --version
+          sed -n '1,/^ \*\//p' src/sources/wine/dlls/ntdll/unix/aoe_hde64.h > out/engine/share/wine/HDE-LICENSE.txt
           name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
           tar -C out -czf "${name}.tar.gz" .
           shasum -a 256 "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
@@ -160,4 +161,4 @@ jobs:
           set -euo pipefail
           f=$(ls engine-*.tar.gz | head -1)
           tag="${f%.tar.gz}"
-          gh release create "$tag" "$f" "$f.sha256" --title "$tag" --notes "Wine from the pinned CrossOver source (inputs.json) with the patch series in patches/. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."
+          gh release create "$tag" "$f" "$f.sha256" --target "$GITHUB_SHA" --title "$tag" --notes "Wine from the pinned CrossOver source (inputs.json) with the patch series in patches/. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."

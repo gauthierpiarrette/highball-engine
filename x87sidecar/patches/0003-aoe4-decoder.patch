@@ -1,0 +1,292 @@
+x87sidecar: compose the AoE IV software-fault and x87 decoders
+
+Wine verifies the game image and supplies the guest code range. Select the
+combined decoder when HB_AOE4=1, and handle deferred x87 pops before FBLD.
+Include regression fixtures for software faults, x87 aliases and FBLD.
+
+The bounded decoder is by Marc Ibrahim (GameToMac 0.1.5-alpha), carried by
+NerRobDog: https://github.com/NerRobDog/x87sidecar/commit/4b6bad8
+Decoder composition and FBLD fix:
+https://github.com/tarikbc/macgames/tree/1579841b15ce569807b92af95b478c752c26df3d/patches/x87sidecar
+Integration and fixtures: https://github.com/himbeles/x87sidecar-aoe4/commit/f028874
+License: MIT (see upstream LICENSE).
+
+diff --git a/rosetta_core/src/TranslatorX87.cpp b/rosetta_core/src/TranslatorX87.cpp
+index c8d8808..cc046eb 100644
+--- a/rosetta_core/src/TranslatorX87.cpp
++++ b/rosetta_core/src/TranslatorX87.cpp
+@@ -357,6 +357,13 @@ auto translate_fbld(TranslationResult* a1, IRInstr* a2) -> void {
+     const int Wd_tmp2 = alloc_gpr(*a1, 3);  // x87_push scratch (freed after push)
+     const int Dd_val = alloc_free_fpr(*a1);
+ 
++    // A cached preceding pop can leave deferred tag updates. Flush these
++    // before the two BCD input registers become live: x87_push would otherwise
++    // allocate two more GPRs while base/TOP/ST-base, scratch and inputs already
++    // occupy seven of the eight slots. Keep the memory loads before the push
++    // so a faulting source does not change the architectural x87 stack.
++    x87_flush_deferred_pops(buf, *a1, Xbase, Wd_top, Wd_tmp);
++
+     // Step 1: compute source memory address.
+     const bool addr_is_64 = (a2->operands[0].mem.addr_size == IROperandSize::S64);
+     const int Xaddr = compute_operand_address(*a1, addr_is_64, &a2->operands[0], GPR::XZR);
+diff --git a/rosetta_loader/src/stub_asm.cpp b/rosetta_loader/src/stub_asm.cpp
+index f76412b..f64862b 100644
+--- a/rosetta_loader/src/stub_asm.cpp
++++ b/rosetta_loader/src/stub_asm.cpp
+@@ -4,6 +4,9 @@
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
++#include <map>
++#include <string>
+ #include <vector>
+ 
+ #include "rosetta_core/IRInstr.h"
+@@ -1063,8 +1066,68 @@ StubBlobs build(uint64_t handlerAddr, uint64_t translateInsnAddr, const uint8_t
+     return blobs;
+ }
+ 
+-StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+-                          const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
++
++// Experimental, opt-in invalid-opcode lowering for a bounded guest text range.
++// The original guest bytes are never written. Decoder calls at other PCs,
++// valid instructions, legacy mode, and mismatched bytes retain stock behavior.
++static StubBlobs buildSoftFaultHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
++                                    const uint8_t orig[16], uint64_t pc, uint64_t target, uint64_t end=0, uint64_t target1=0) {
++    StubBlobs b;
++    if ((handlerAddr | decodeOpcodeAddr | pc | target) & 0xffff000000000000ULL) return b;
++    const int64_t displacement = static_cast<int64_t>(target) - static_cast<int64_t>(pc + 2);
++    if (displacement < INT32_MIN || displacement > INT32_MAX) return b;
++    if(end && (end<=pc || !target1 || end-pc>0x6000000ULL))return b;
++    if(end){for(uint64_t t:{target,target1})for(uint64_t a:{pc,end}){int64_t d=(int64_t)t-(int64_t)a-5;if(d<INT32_MIN||d>INT32_MAX)return b;}}
++    auto& h=b.handler;
++    std::map<std::string,size_t> labels;
++    struct Fix { size_t pos; std::string label; int kind; unsigned cond; };
++    std::vector<Fix> fixes;
++    auto ins=[&](uint32_t v){emit(h,v);};
++    auto label=[&](const char* n){labels[n]=h.size();};
++    auto branch=[&](const char* n,int kind,unsigned cond=0){fixes.push_back({h.size(),n,kind,cond});ins(0);};
++    auto constant=[&](unsigned reg,uint64_t value){ins(movz(reg,value&0xffff,0));ins(movk(reg,(value>>16)&0xffff,16));ins(movk(reg,(value>>32)&0xffff,32));};
++    ins(sub_imm_x(SP,SP,96));
++    ins(stp_offset(0,1,SP,0));ins(stp_offset(2,3,SP,16));ins(str_x_offset(LR,SP,32));
++    branch("stock",1);
++    ins(cmp_imm_w(0,1));branch("done",2,COND_NE);
++    ins(ldr_x_offset(12,SP,0));ins(ldrb_w_offset(9,12,0));ins(cmp_imm_w(9,0));branch("done",2,COND_NE);
++    ins(ldr_x_offset(10,12,kDecoderCtxCodeBase));ins(ldr_x_offset(11,12,kDecoderCtxCodeEnd));
++    ins(ldr_w_offset(9,SP,8));ins(add_reg_x(13,10,9));constant(14,pc);ins(cmp_reg_x(13,14));
++    if(end){branch("done",2,COND_LO);constant(14,end);ins(cmp_reg_x(13,14));branch("done",2,COND_HS);}
++    else branch("done",2,COND_NE);
++    ins(cmp_reg_x(13,11));branch("done",2,COND_HS);
++    if(end){
++        ins(ldrb_w_offset(9,13,0));ins(cmp_imm_w(9,0xd5));branch("two",2,COND_EQ);
++        ins(cmp_imm_w(9,0xd4));branch("two",2,COND_EQ);
++        for(unsigned op:{0x1e,0x16,0x3f,0x27,0x37,0x06,0x0e,0x1f,0x60,0xea,0x9a}){ins(cmp_imm_w(9,op));branch("one",2,COND_EQ);}
++        branch("done",0);
++        label("one");ins(movz(14,1,0));constant(9,target1);branch("selected",0);
++    }
++    label("two");ins(add_imm(14,13,2));ins(cmp_reg_x(14,11));branch("done",2,COND_HI);
++    if(!end){ins(ldrh_w_offset(9,13,0));ins(movz(14,0x7fd5,0));ins(cmp_reg_w(9,14));branch("done",2,COND_NE);}
++    ins(movz(14,2,0));constant(9,target);
++    label("selected");ins(str_x_offset(14,SP,88));ins(add_reg_x(14,13,14));ins(sub_reg_x(9,9,14));ins(str_w_offset(9,SP,80));
++    ins(str_x_offset(10,SP,40));ins(str_x_offset(11,SP,48));ins(str_x_offset(13,SP,56));
++    ins(add_imm(15,SP,64));ins(movz(9,0xe8,0));ins(strb_w_offset(9,15,0));
++    ins(ldr_w_offset(9,SP,80));ins(add_imm(16,15,1));ins(str_w_offset(9,16,0));
++    ins(str_x_offset(15,12,kDecoderCtxCodeBase));ins(add_imm(9,15,5));ins(str_x_offset(9,12,kDecoderCtxCodeEnd));
++    ins(ldr_x_offset(0,SP,0));ins(movz(1,0,0));ins(ldp_offset(2,3,SP,16));branch("stock",1);
++    ins(ldr_x_offset(12,SP,0));ins(ldp_offset(10,11,SP,40));
++    ins(str_x_offset(10,12,kDecoderCtxCodeBase));ins(str_x_offset(11,12,kDecoderCtxCodeEnd));
++    ins(ldr_x_offset(13,SP,56));ins(str_x_offset(13,12,kDecoderCtxInsnStart));
++    ins(cmp_imm_w(0,0));branch("decode_success",2,COND_EQ);
++    ins(ldp_offset(0,1,SP,0));ins(ldp_offset(2,3,SP,16));branch("stock",1);branch("done",0);
++    label("decode_success");
++    ins(ldr_x_offset(9,SP,24));ins(ldr_x_offset(14,SP,88));ins(strb_w_offset(14,9,0));
++    ins(add_reg_x(13,13,14));ins(str_x_offset(13,12,kDecoderCtxCursor));
++    label("done");ins(ldr_x_offset(LR,SP,32));ins(add_imm(SP,SP,96));ins(RET_INSN);
++    label("stock");h.insert(h.end(),orig,orig+16);emit_abs_jump_3movs(h,decodeOpcodeAddr+16);
++    for(const auto& f:fixes){const int offset=static_cast<int>((static_cast<int64_t>(labels.at(f.label))-static_cast<int64_t>(f.pos))/4);patch_word(h,f.pos,f.kind==1?bl(offset):f.kind==0?b_uncond(offset):b_cond(f.cond,offset));}
++    emit_abs_jump_3movs(b.entry,handlerAddr);return b;
++}
++
++static StubBlobs buildGenericDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
++                                       const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
+     StubBlobs blobs;
+ 
+     // The 3-mov+br abs-jump encoding only works while the top 16 bits are zero.
+@@ -1320,4 +1383,45 @@ StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+     return blobs;
+ }
+ 
++StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
++                         const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
++    const char* softTarget = std::getenv("AOE_SOFTFAULT_TARGET");
++    const char* softPC = std::getenv("AOE_SOFTFAULT_PC");
++    const char* enabled = std::getenv("HB_AOE4");
++    if (!enabled || std::strcmp(enabled, "1") || (!softTarget && !softPC)) {
++        return buildGenericDecodeHook(handlerAddr, decodeOpcodeAddr, origPrologue16, hostArplOpcode);
++    }
++    if (!softTarget || !softPC) return {};
++    char *endTarget = nullptr, *endPC = nullptr;
++    const uint64_t target = std::strtoull(softTarget, &endTarget, 0);
++    const uint64_t pc = std::strtoull(softPC, &endPC, 0);
++    if (!target || !pc || *endTarget || *endPC) return {};
++    const char* softEnd = std::getenv("AOE_SOFTFAULT_END");
++    const char* softOne = std::getenv("AOE_SOFTFAULT_TARGET1");
++    uint64_t end = 0, one = 0;
++    if (softEnd || softOne) {
++        if (!softEnd || !softOne) return {};
++        char *a = nullptr, *b = nullptr;
++        end = std::strtoull(softEnd, &a, 0);
++        one = std::strtoull(softOne, &b, 0);
++        if (!end || !one || *a || *b) return {};
++    }
++    auto soft = buildSoftFaultHook(handlerAddr, decodeOpcodeAddr, origPrologue16, pc, target, end, one);
++    if (soft.entry.empty() || soft.handler.size() < 32) return {};
++    // Compose both decoder features. The soft hook first calls its displaced
++    // decoder trampoline; redirect that trampoline to the generic alias hook.
++    // The alias hook alone owns the original prologue and returns to Rosetta.
++    // Thus FCOMP/ARPL stay available, and only a remaining invalid instruction
++    // in the pinned range is lowered to software exception delivery.
++    const uint64_t genericAddr = handlerAddr + soft.handler.size();
++    auto generic = buildGenericDecodeHook(genericAddr, decodeOpcodeAddr, origPrologue16, hostArplOpcode);
++    if (generic.entry.empty() || generic.handler.empty()) return {};
++    std::vector<uint8_t> jump;
++    emit_abs_jump_3movs(jump, genericAddr);
++    if (jump.size() != 16) return {};
++    std::copy(jump.begin(), jump.end(), soft.handler.end() - 32);
++    soft.handler.insert(soft.handler.end(), generic.handler.begin(), generic.handler.end());
++    return soft;
++}
++
+ }  // namespace stub_asm
+diff --git a/scripts/test_aoe_softfault.py b/scripts/test_aoe_softfault.py
+new file mode 100644
+index 0000000..1051bca
+--- /dev/null
++++ b/scripts/test_aoe_softfault.py
+@@ -0,0 +1,30 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: MIT
++"""Exercise the AoE decoder through cooperative attach on the installed Rosetta."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++build = Path(sys.argv[1] if len(sys.argv) > 1 else 'build').resolve()
++helper = build / 'bin/x87sidecar'
++fixture = build / 'bin/tests/test_aoe_softfault'
++symbols = {}
++for line in subprocess.check_output(['nm', '-g', str(fixture)], text=True).splitlines():
++    fields = line.split()
++    if len(fields) == 3:
++        symbols[fields[2]] = int(fields[0], 16)
++env = dict(os.environ, HB_AOE4="1",
++    AOE_SOFTFAULT_PC=hex(symbols['_aoe_softfault_begin']),
++    AOE_SOFTFAULT_END=hex(symbols['_aoe_softfault_end']),
++    AOE_SOFTFAULT_TARGET=hex(symbols['_aoe_softfault_handler']),
++    AOE_SOFTFAULT_TARGET1=hex(symbols['_aoe_softfault_handler']),
++    X87_STRICT_ALLOC='1')
++subprocess.run([str(helper), '--cooperative', str(fixture)], env=env, check=True, timeout=30)
++# The composed hook must also retain the generic decoder's aliases.
++for name in ('test_decoder_fcomp_st', 'test_decoder_arpl'):
++    # An unused range enables composition without matching these test executables.
++    outside = dict(env, AOE_SOFTFAULT_PC='0x10000', AOE_SOFTFAULT_END='0x10010',
++                   AOE_SOFTFAULT_TARGET='0x20000', AOE_SOFTFAULT_TARGET1='0x20010')
++    subprocess.run([str(helper), '--cooperative', str(build / 'bin/tests' / name)],
++                   env=outside, check=True, timeout=30)
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 94869f2..0adff8c 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -135,3 +135,6 @@ target_include_directories(test_opcode_table_parse PRIVATE ${PROJECT_SOURCE_DIR}
+ add_executable(test_fragment_root host/test_fragment_root.cpp
+     ${PROJECT_SOURCE_DIR}/rosetta_loader/src/fragment_root.cpp)
+ target_include_directories(test_fragment_root PRIVATE ${PROJECT_SOURCE_DIR}/rosetta_loader/src)
++
++# Fixed guest addresses let the AoE decoder fixture specify its bounded text range.
++_add_x86_sample_impl(test_aoe_softfault "-Wl,-no_pie")
+diff --git a/tests/test_aoe_softfault.c b/tests/test_aoe_softfault.c
+new file mode 100644
+index 0000000..8fc515a
+--- /dev/null
++++ b/tests/test_aoe_softfault.c
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: MIT
++ * Run with scripts/test_aoe_softfault.py: these bytes are invalid in 64-bit mode. */
++#include <stdio.h>
++
++volatile unsigned aoe_softfault_calls;
++__attribute__((noinline)) void aoe_softfault_handler(void) { ++aoe_softfault_calls; }
++extern void aoe_softfault_pair(void);
++extern void aoe_softfault_single(void);
++
++__asm__(".text\n"
++        ".globl _aoe_softfault_begin\n"
++        "_aoe_softfault_begin:\n"
++        ".globl _aoe_softfault_pair\n"
++        "_aoe_softfault_pair:\n"
++        ".byte 0xd5, 0x7f\n" /* AAD: two-byte lowering. */
++        "ret\n"
++        ".globl _aoe_softfault_single\n"
++        "_aoe_softfault_single:\n"
++        ".byte 0x1e\n"       /* PUSH DS: one-byte lowering. */
++        "ret\n"
++        ".globl _aoe_softfault_end\n"
++        "_aoe_softfault_end:\n");
++
++int main(void)
++{
++    double sum;
++    aoe_softfault_pair();
++    aoe_softfault_single();
++    __asm__ volatile("fld1; fld1; faddp; fstpl %0" : "=m"(sum) : : "st");
++    if (aoe_softfault_calls != 2 || sum != 2.0) {
++        printf("FAIL AoE decoder: calls=%u, sum=%g\n", aoe_softfault_calls, sum);
++        return 1;
++    }
++    puts("PASS AoE one/two-byte software faults and x87 composition");
++    return 0;
++}
+diff --git a/tests/test_fbld.c b/tests/test_fbld.c
+index e25c960..0feede7 100644
+--- a/tests/test_fbld.c
++++ b/tests/test_fbld.c
+@@ -27,6 +27,22 @@ static double do_fbld(const uint8_t bcd[10]) {
+     return r;
+ }
+ 
++/* Start a new translation block with a pop, so the cached run has a
++ * deferred tag update when FBLD loads its two input registers. */
++static double do_pop_fbld(const uint8_t bcd[10]) {
++    double r;
++    __asm__ volatile(
++        "fld1\n\t"
++        "jmp 1f\n\t"
++        "1: fstp %%st(0)\n\t"
++        "fbld %1\n\t"
++        "fstpl %0\n"
++        : "=m"(r)
++        : "m"(*(const uint8_t (*)[10])bcd)
++        : "st");
++    return r;
++}
++
+ static void check(const char* name, const uint8_t bcd[10], double expected) {
+     double got = do_fbld(bcd);
+     /* Bit-exact compare so -0 vs +0 (and any NaN payload) is caught. */
+@@ -42,6 +58,13 @@ static void check(const char* name, const uint8_t bcd[10], double expected) {
+ }
+ 
+ int main(void) {
++    {
++        const uint8_t b[10] = {0x42};
++        const double got = do_pop_fbld(b);
++        const int ok = got == 42.0;
++        printf("%s  FBLD after deferred pop: %.17g\n", ok ? "PASS" : "FAIL", got);
++        if (!ok) failures++;
++    }
+     /* +0  → all zero, no sign bit */
+     {
+         uint8_t b[10] = {0};

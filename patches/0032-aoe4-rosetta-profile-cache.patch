@@ -1,0 +1,3002 @@
+ntdll: opt-in Age of Empires IV software faults and generated-code cache on Rosetta
+
+Wine changes recovered from Marc Ibrahim's LGPL sources via NerRobDog/wine-aoe4
+711c6fc7559a565c417aab4d52d84b09767a9c1d; relocator extensions by NerRobDog.
+Layout validation and ring discovery are LGPL-2.1-or-later. HDE notices retained.
+
+HB_AOE4=1 enables the path only for RelicCardinal.exe with a verified x64 image
+under Rosetta on macOS 26 or newer. Wine resolves the engine's installed x87sidecar;
+measured profiles are built into ntdll.
+The same-descriptor check verifies the image being mapped. The cache uses a
+SHA-bound profile or validated ring discovery; relocated fragments retain
+their original addresses for exception reporting.
+
+The instruction cache includes VM-generation-validated page snapshots and a
+private no-fault copy that preserves guard pages.
+
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1771,3 +1771,6 @@
+
+ # CW HACK 22435
+ @ stdcall __wine_unix_call(int64 long ptr) __wine_unix_call_exported
++
++@ cdecl -norelay -arch=x86_64 __wine_aoe_softfault1()
++@ cdecl -norelay -arch=x86_64 __wine_aoe_softfault2()
+diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
+--- a/dlls/ntdll/signal_x86_64.c
++++ b/dlls/ntdll/signal_x86_64.c
+@@ -133,6 +133,126 @@
+ /***********************************************************************
+  *		RtlCaptureContext (NTDLL.@)
+  */
++/* Opt-in software delivery thunk; installed only for the verified AoE IV process. */
++void DECLSPEC_NORETURN aoe_soft_dispatch(ULONG64 *r, BYTE *xs, ULONG fault_length) {
++ BYTE storage[4096];ULONG avx_len=0;CONTEXT *c;CONTEXT_EX *ex;EXCEPTION_RECORD rec={0};ULONG64 mask;void *avx;NTSTATUS status;
++ status=RtlInitializeExtendedContext2(storage,CONTEXT_ALL|CONTEXT_XSTATE,&ex,7);
++ if(status)RtlRaiseStatus(status);
++ c=RtlLocateLegacyContext(ex,NULL);
++ /* Extended initialization already clears XState; only the legacy context remains. */
++ memset(c,0,sizeof(*c));
++ status=WINE_UNIX_CALL(unix_aoe_exception_context,c);
++ if(status)RtlRaiseStatus(status);
++ c->ContextFlags=CONTEXT_ALL|CONTEXT_XSTATE;
++ c->R15=r[0];c->R14=r[1];c->R13=r[2];c->R12=r[3];c->R11=r[4];c->R10=r[5];c->R9=r[6];c->R8=r[7];c->Rdi=r[8];c->Rsi=r[9];c->Rbp=r[10];c->Rbx=r[11];c->Rdx=r[12];c->Rcx=r[13];c->Rax=r[14];c->EFlags=(DWORD)r[15];c->Rip=r[16]-fault_length;c->Rsp=(ULONG64)(r+17);
++ memcpy(&c->FltSave,xs,512);memcpy(&c->MxCsr,xs+24,4);
++ avx=RtlLocateExtendedFeature(ex,2,&avx_len);if(!avx||avx_len!=256)RtlRaiseStatus(STATUS_INVALID_PARAMETER);
++ memcpy(&mask,xs+512,8);if(mask&4)memcpy(avx,xs+576,256);else memset(avx,0,256);
++ RtlSetExtendedFeaturesMask(ex,7);
++ rec.ExceptionCode=EXCEPTION_ILLEGAL_INSTRUCTION;rec.ExceptionAddress=(void *)c->Rip;
++ /* Match RtlRaiseException: enter Wine's handlers directly unless a debugger
++  * needs first-chance notification. NtContinue still restores the full context. */
++ if(!NtCurrentTeb()->Peb->BeingDebugged)status=dispatch_exception(&rec,c);
++ else status=NtRaiseException(&rec,c,TRUE);
++ for (;;) RtlRaiseStatus(status);
++}
++
++__ASM_GLOBAL_FUNC( __wine_aoe_softfault1,
++                   "pushfq\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %rax\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %rcx\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %rdx\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %rbx\n\t"
++                   __ASM_SEH(".seh_pushreg %rbx\n\t")
++                   "push %rbp\n\t"
++                   __ASM_SEH(".seh_pushreg %rbp\n\t")
++                   "push %rsi\n\t"
++                   __ASM_SEH(".seh_pushreg %rsi\n\t")
++                   "push %rdi\n\t"
++                   __ASM_SEH(".seh_pushreg %rdi\n\t")
++                   "push %r8\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %r9\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %r10\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %r11\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %r12\n\t"
++                   __ASM_SEH(".seh_pushreg %r12\n\t")
++                   "push %r13\n\t"
++                   __ASM_SEH(".seh_pushreg %r13\n\t")
++                   "push %r14\n\t"
++                   __ASM_SEH(".seh_pushreg %r14\n\t")
++                   "push %r15\n\t"
++                   __ASM_SEH(".seh_pushreg %r15\n\t")
++                   "mov %rsp,%r12\n\t"
++                   __ASM_SEH(".seh_setframe %r12,0\n\t")
++                   __ASM_SEH(".seh_endprologue\n\t")
++                   "cld\n\t"
++                   "sub $0x400,%rsp\n\t"
++                   "and $-64,%rsp\n\t"
++                   "mov $7,%eax\n\t"
++                   "xor %edx,%edx\n\t"
++                   "xsave64 64(%rsp)\n\t"
++                   "mov %r12,%rcx\n\t"
++                   "lea 64(%rsp),%rdx\n\t"
++                   "mov $1,%r8d\n\t"
++                   "call " __ASM_NAME("aoe_soft_dispatch") "\n\t"
++                   "ud2" );
++__ASM_GLOBAL_FUNC( __wine_aoe_softfault2,
++                   "pushfq\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %rax\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %rcx\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %rdx\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %rbx\n\t"
++                   __ASM_SEH(".seh_pushreg %rbx\n\t")
++                   "push %rbp\n\t"
++                   __ASM_SEH(".seh_pushreg %rbp\n\t")
++                   "push %rsi\n\t"
++                   __ASM_SEH(".seh_pushreg %rsi\n\t")
++                   "push %rdi\n\t"
++                   __ASM_SEH(".seh_pushreg %rdi\n\t")
++                   "push %r8\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %r9\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %r10\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %r11\n\t"
++                   __ASM_SEH(".seh_stackalloc 8\n\t")
++                   "push %r12\n\t"
++                   __ASM_SEH(".seh_pushreg %r12\n\t")
++                   "push %r13\n\t"
++                   __ASM_SEH(".seh_pushreg %r13\n\t")
++                   "push %r14\n\t"
++                   __ASM_SEH(".seh_pushreg %r14\n\t")
++                   "push %r15\n\t"
++                   __ASM_SEH(".seh_pushreg %r15\n\t")
++                   "mov %rsp,%r12\n\t"
++                   __ASM_SEH(".seh_setframe %r12,0\n\t")
++                   __ASM_SEH(".seh_endprologue\n\t")
++                   "cld\n\t"
++                   "sub $0x400,%rsp\n\t"
++                   "and $-64,%rsp\n\t"
++                   "mov $7,%eax\n\t"
++                   "xor %edx,%edx\n\t"
++                   "xsave64 64(%rsp)\n\t"
++                   "mov %r12,%rcx\n\t"
++                   "lea 64(%rsp),%rdx\n\t"
++                   "mov $2,%r8d\n\t"
++                   "call " __ASM_NAME("aoe_soft_dispatch") "\n\t"
++                   "ud2" );
++
++
+ __ASM_GLOBAL_FUNC( RtlCaptureContext,
+                    "pushfq\n\t"
+                    __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+diff --git a/dlls/ntdll/unix/aoe_build_guard.h b/dlls/ntdll/unix/aoe_build_guard.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/ntdll/unix/aoe_build_guard.h
+@@ -0,0 +1,171 @@
++/* AoE IV build eligibility for the experimental Highball engine proposal.
++ * Copyright 2026 Highball engine proposal contributors.
++ * LGPL-2.1-or-later. Hash the same file descriptor Wine will map, not a reopened path. */
++#ifndef HIGHBALL_AOE_BUILD_GUARD_H
++#define HIGHBALL_AOE_BUILD_GUARD_H
++#include <CommonCrypto/CommonDigest.h>
++#include <errno.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <stdio.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++static const unsigned char aoe_supported_sha256[32] = {
++    0x53,0x80,0xc5,0x77,0x80,0x55,0x65,0x81,0x7f,0x52,0x8a,0xf6,0xea,0xc3,0x85,0x26,
++    0x34,0x13,0xfa,0x68,0x15,0x55,0x3f,0x9a,0x31,0xfa,0x62,0x56,0x1c,0xb4,0x5e,0x8c
++};
++
++static int aoe_game_name(const char *path)
++{
++    const char *p, *name = path;
++    if (!path) return 0;
++    for (p = path; *p; p++) if (*p == '/' || *p == '\\') name = p + 1;
++    return !strcasecmp(name, "RelicCardinal.exe");
++}
++
++static int aoe_bootstrap_is_current(const char *name)
++{
++    char expected[64];
++    snprintf(expected, sizeof(expected), "x87sidecar.%ld", (long)getpid());
++    return name && !strcmp(name, expected);
++}
++
++/* Only the recipe's explicit opt-in can activate the Rosetta hooks. */
++static int aoe_patch_requested(void)
++{
++    const char *enabled = getenv("HB_AOE4");
++    const char *disabled = getenv("AOE4_DISABLED");
++    return enabled && !strcmp(enabled, "1") && (!disabled || strcmp(disabled, "1"));
++}
++
++static int aoe_same_file_state(const struct stat *first, const struct stat *second)
++{
++    struct stat before=*first, after=*second;
++    if (before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
++        before.st_size != after.st_size || before.st_mtime != after.st_mtime ||
++        before.st_ctime != after.st_ctime) return 0;
++#ifdef __APPLE__
++    if (before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec ||
++        before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec) return 0;
++#else
++    if (before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
++        before.st_ctim.tv_nsec != after.st_ctim.tv_nsec) return 0;
++#endif
++    return 1;
++}
++
++static int aoe_hash_fd(int fd, unsigned char digest[32])
++{
++    unsigned char buffer[65536];
++    struct stat before, after;
++    CC_SHA256_CTX context;
++    off_t offset = 0;
++    ssize_t count;
++
++    if (fstat(fd, &before) || !S_ISREG(before.st_mode) || before.st_size <= 0) return 0;
++    if (!CC_SHA256_Init(&context)) return 0;
++    for (;;)
++    {
++        count = pread(fd, buffer, sizeof(buffer), offset);
++        if (count < 0 && errno == EINTR) continue;
++        if (count < 0) return 0;
++        if (!count) break;
++        if (!CC_SHA256_Update(&context, buffer, (CC_LONG)count)) return 0;
++        offset += count;
++    }
++    if (offset != before.st_size || fstat(fd, &after)) return 0;
++    if (!aoe_same_file_state(&before,&after)) return 0;
++    return CC_SHA256_Final(digest, &context);
++}
++
++static int aoe_hash_fd_matches(int fd, const unsigned char expected[32])
++{
++    unsigned char digest[32];
++    return aoe_hash_fd(fd, digest) && !memcmp(digest, expected, 32);
++}
++
++/* Independent LGPL implementation; no MacGames application code is incorporated. */
++struct aoe_image_layout
++{
++    uint64_t base, image_size, text_start, text_end, data_start, data_end;
++    uint32_t text_offset, text_file_size;
++};
++static uint32_t aoe_u32(const unsigned char *p)
++{ return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24; }
++static unsigned aoe_u16(const unsigned char *p) { return p[0] | p[1]<<8; }
++static int aoe_read_layout(int fd, struct aoe_image_layout *layout)
++{
++    unsigned char bytes[65536];
++    ssize_t n = pread(fd, bytes, sizeof(bytes), 0);
++    size_t pe, opt, table, i;
++    unsigned count, optional_size, found = 0;
++    uint64_t text_size, rva;
++    memset(layout,0,sizeof(*layout));
++    if (n < 64 || bytes[0]!='M' || bytes[1]!='Z') return 0;
++    pe = aoe_u32(bytes+60);
++    if (pe > (size_t)n-24 || memcmp(bytes+pe,"PE\0\0",4) || aoe_u16(bytes+pe+4)!=0x8664) return 0;
++    count = aoe_u16(bytes+pe+6); optional_size = aoe_u16(bytes+pe+20);
++    opt = pe+24;
++    if (optional_size<112 || opt+optional_size>(size_t)n || aoe_u16(bytes+opt)!=0x20b) return 0;
++    layout->base = aoe_u32(bytes+opt+24) | (uint64_t)aoe_u32(bytes+opt+28)<<32;
++    layout->image_size = aoe_u32(bytes+opt+56);
++    if (layout->base!=0x140000000ULL || layout->image_size>0x40000000 || !layout->image_size) return 0;
++    table = opt+optional_size;
++    if (!count || count>96 || table+(size_t)count*40>(size_t)n) return 0;
++    for (i=0; i<count; ++i)
++    {
++        const unsigned char *section = bytes+table+i*40;
++        if (!memcmp(section,".data\0\0\0",8))
++        {
++            uint64_t data_rva=aoe_u32(section+12), data_size=aoe_u32(section+8);
++            if (layout->data_start || !(aoe_u32(section+36)&0x80000000) ||
++                !data_size || data_rva+data_size>layout->image_size) return 0;
++            layout->data_start=layout->base+data_rva;
++            layout->data_end=layout->data_start+data_size;
++        }
++        if (memcmp(section,".text\0\0\0",8)) continue;
++        if (found++) return 0;
++        text_size = aoe_u32(section+8); rva = aoe_u32(section+12);
++        if (!(aoe_u32(section+36)&0x20000000) || rva!=0x1000 || text_size<=0x500 ||
++            text_size>0x8000000 || rva+text_size>layout->image_size) return 0;
++        layout->text_start = layout->base+rva;
++        layout->text_end = layout->text_start+text_size-0x500;
++        layout->text_offset = aoe_u32(section+20);
++        layout->text_file_size = aoe_u32(section+16);
++        if (layout->text_file_size > text_size-0x500) layout->text_file_size = text_size-0x500;
++    }
++    return found==1;
++}
++static void aoe_digest_hex(const unsigned char digest[32], char text[65])
++{
++    unsigned i;
++    for (i=0; i<32; ++i) snprintf(text+2*i,3,"%02x",digest[i]);
++}
++
++/* Measured profiles for the 16 MiB / 32-byte ring, bound to executable SHA-256. */
++static int aoe_cache_profile(const char *digest, const struct aoe_image_layout *image,
++                            uint64_t *pointer)
++{
++    static const struct { const char *digest; uint64_t rva; } profiles[] =
++    {
++        { "5380c577805565817f528af6eac385263413fa6815553f9a31fa62561cb45e8c", 0x7af7ad0 },
++        { "e047891780ec9a01e39185803288578b8385419e93c97b2216ebd24ee2bc1469", 0x7c9f9d8 },
++    };
++    unsigned int i;
++    uint64_t rva;
++    for (i=0; i<sizeof(profiles)/sizeof(profiles[0]); ++i)
++    {
++        if (strcmp(profiles[i].digest,digest)) continue;
++        rva=profiles[i].rva;
++        if (rva<0x1000 || (rva&7) || image->image_size<8 || rva>image->image_size-8 ||
++            image->base+rva<image->data_start || image->data_end<8 ||
++            image->base+rva>image->data_end-8) return 0;
++        *pointer=image->base+rva;
++        return 1;
++    }
++    return 0;
++}
++#endif
+diff --git a/dlls/ntdll/unix/aoe_code_cache.h b/dlls/ntdll/unix/aoe_code_cache.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/ntdll/unix/aoe_code_cache.h
+@@ -0,0 +1,234 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * GameToMac Wine changes: Marc Ibrahim; extensions: NerRobDog.
++ * Source commit: 711c6fc7559a565c417aab4d52d84b09767a9c1d. */
++/* Experimental opt-in immutable cache; original generated bytes remain untouched. */
++#include <pthread.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <time.h>
++#include <stdio.h>
++#include <sys/stat.h>
++#include "aoe_relocate.h"
++#include "aoe_build_guard.h"
++extern BOOL aoe_game_verified;
++extern BOOL aoe_cache_auto_discovered;
++extern uint64_t aoe_cache_pointer_address;
++extern uint64_t aoe_cache_search_start, aoe_cache_search_end;
++#define AOE_CACHE_COUNT 262144u
++#define AOE_CACHE_TABLE (AOE_CACHE_COUNT*2)
++struct aoe_cache_entry { struct aoe_fragment_key key; uint64_t hash; uint32_t slot; };
++static pthread_mutex_t aoe_cache_lock=PTHREAD_MUTEX_INITIALIZER;
++static struct aoe_cache_entry *aoe_cache_entries;
++static BYTE *aoe_cache_code;
++static unsigned aoe_cache_used;
++static int aoe_cache_enabled,aoe_cache_attempted;
++static pthread_once_t aoe_cache_enable_once=PTHREAD_ONCE_INIT;
++static void aoe_cache_check_enabled(void)
++{
++    const char *cache = getenv("AOE4_CACHE");
++    aoe_cache_enabled = aoe_patch_requested() && (!cache || strcmp(cache, "0")) &&
++                        main_argc > 0 && aoe_game_name(main_argv[0]);
++}
++static uint64_t aoe_cache_local_stats[16],*aoe_cache_stats=aoe_cache_local_stats;
++/* NerRobDog: AOELAB_CODE_CACHE_DUMP=1 writes the first 4096 refused fragments (pc + raw bytes) to
++ * $AOELAB_COUNTERS_DIR/codecache-unkeyable-<pid>.txt for offline relocator work. */
++static int aoe_cache_dump_fd=-2;static unsigned aoe_cache_dump_left=4096;
++static void aoe_cache_dump_unkeyable(uint64_t pc,const BYTE *bytes,unsigned n)
++{
++ char line[160];int len;unsigned i;
++ if(aoe_cache_dump_fd==-2){
++  const char *directory=getenv("AOELAB_COUNTERS_DIR");char path[1024];
++  aoe_cache_dump_fd=-1;
++  if(getenv("AOELAB_CODE_CACHE_DUMP")&&directory&&directory[0]=='/'&&snprintf(path,sizeof(path),"%s/codecache-unkeyable-%u.txt",directory,(unsigned)getpid())<(int)sizeof(path))
++   aoe_cache_dump_fd=open(path,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
++ }
++ if(aoe_cache_dump_fd<0||!aoe_cache_dump_left)return;
++ aoe_cache_dump_left--;
++ len=snprintf(line,sizeof(line),"%llx",(unsigned long long)pc);
++ for(i=0;i<n&&len<(int)sizeof(line)-4;i++)len+=snprintf(line+len,sizeof(line)-len," %02x",bytes[i]);
++ if(len<(int)sizeof(line)-1)line[len++]='\n';
++ if(write(aoe_cache_dump_fd,line,len)<0)aoe_cache_dump_left=0;
++}
++static __thread uint64_t aoe_cache_thread_original,aoe_cache_thread_shadow;
++static __thread unsigned aoe_cache_thread_len;
++static void aoe_cache_count(unsigned n){__atomic_fetch_add(&__atomic_load_n(&aoe_cache_stats,__ATOMIC_RELAXED)[n],1,__ATOMIC_RELAXED);}
++
++#define AOE_RECENT_JUMP_BITS 12
++/* The shared entries are immutable after insertion. The per-thread index
++ * only points to entries already accepted by the full relocator. */
++static __thread const struct aoe_cache_entry *aoe_recent_jumps[1u << AOE_RECENT_JUMP_BITS];
++
++static BOOL aoe_cache_matches_jump(const struct aoe_cache_entry *entry, const BYTE *bytes,
++                                   unsigned prefix, uint64_t target)
++{
++    const struct aoe_fragment_key *key = &entry->key;
++
++    return key->count == 1 && key->len == prefix + 4 && key->offsets[0] == prefix &&
++           key->ends[0] == key->len && key->targets[0] == target &&
++           !memcmp(key->code, bytes, prefix);
++}
++
++static uint64_t aoe_cache_redirect(uint64_t pc, const struct aoe_cache_entry *entry)
++{
++    uint64_t target = (uint64_t)(aoe_cache_code + entry->slot * 64);
++
++    aoe_cache_thread_original = pc;
++    aoe_cache_thread_shadow = target;
++    aoe_cache_thread_len = entry->key.len;
++    aoe_cache_count(1);
++    return target;
++}
++
++static uint64_t aoe_cache_logical_pc(uint64_t pc)
++{
++ if(aoe_game_verified && aoe_cache_thread_shadow && pc>=aoe_cache_thread_shadow && pc<aoe_cache_thread_shadow+aoe_cache_thread_len){aoe_cache_count(7);return aoe_cache_thread_original+(pc-aoe_cache_thread_shadow);}return pc;
++}
++static void aoe_cache_init(void)
++{
++ SIZE_T size=AOE_CACHE_COUNT*64;void *addr=(void*)0x190000000ULL;const char *directory=getenv("AOELAB_COUNTERS_DIR");
++ aoe_cache_attempted=1;
++ if(NtAllocateVirtualMemory(GetCurrentProcess(),&addr,0,&size,MEM_RESERVE|MEM_COMMIT,PAGE_EXECUTE_READWRITE))return;
++ aoe_cache_entries=calloc(AOE_CACHE_TABLE,sizeof(*aoe_cache_entries));if(!aoe_cache_entries){size=0;NtFreeVirtualMemory(GetCurrentProcess(),&addr,&size,MEM_RELEASE);return;}aoe_cache_code=addr;
++ if(directory&&directory[0]=='/'){
++  mkdir(directory,0700);
++  char path[1024];int fd;void *map;
++  if(snprintf(path,sizeof(path),"%s/codecache-%u.bin",directory,(unsigned)getpid())<(int)sizeof(path) && (fd=open(path,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600))>=0){
++   if(!ftruncate(fd,4096)&&(map=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0))!=MAP_FAILED){uint64_t *p=map;p[0]=0x414f454341434831ULL;p[1]=1;p[2]=getpid();p[3]=16;__atomic_store_n(&aoe_cache_stats,p+4,__ATOMIC_RELAXED);}close(fd);
++  }
++ }
++}
++/* Calibration only: report candidates without ever redirecting execution. A pointer
++ * near a resumed PC is evidence to investigate, not proof of the ring contract. */
++static void aoe_cache_candidates(uint64_t pc)
++{
++ static unsigned scans;
++ static time_t last;
++ time_t now, previous;
++ uint64_t address;
++ unsigned reported=0;
++ if (!aoe_game_verified || aoe_cache_pointer_address || !getenv("AOE4_CACHE_DIAGNOSTICS") ||
++     !aoe_cache_search_start || aoe_cache_search_end<aoe_cache_search_start ||
++     aoe_cache_search_end-aoe_cache_search_start>0x4000000 ||
++     pc<0x140000000ULL || pc>=0x180000000ULL) return;
++ now=time(NULL);
++ previous=__atomic_exchange_n(&last,now,__ATOMIC_RELAXED);
++ if (previous==now || __atomic_fetch_add(&scans,1,__ATOMIC_RELAXED)>=64) return;
++ for (address=aoe_cache_search_start; address<aoe_cache_search_end; address+=4096)
++ {
++  uint64_t values[512];
++  SIZE_T bytes=aoe_cache_search_end-address<sizeof(values)?aoe_cache_search_end-address:sizeof(values);
++  unsigned i;
++  if (virtual_uninterrupted_read_memory((void*)(uintptr_t)address,values,bytes)!=bytes) continue;
++  for (i=0; i<bytes/8; ++i)
++  {
++   uint64_t ring=values[i];
++   if (ring && !(ring&31) && ring<=pc && pc-ring<0x1000000 && ++reported<=16)
++    fprintf(stderr,"AoE4 cache candidate ONLY: pointer_rva=0x%llx ring=0x%llx resumed_pc=0x%llx; validate before profiling\n",
++            (unsigned long long)(address+i*8-0x140000000ULL),(unsigned long long)ring,(unsigned long long)pc);
++  }
++ }
++ if (!reported) fprintf(stderr,"AoE4 cache diagnostics: no candidate for resumed PC 0x%llx\n",(unsigned long long)pc);
++
++}
++
++static int aoe_live_ring_matches(uint64_t ring)
++{
++ const uint64_t end=ring+0x1000000;
++ uint64_t address=ring;
++
++ while (address<end)
++ {
++  MEMORY_BASIC_INFORMATION info;
++  uint64_t base;
++  if (NtQueryVirtualMemory(GetCurrentProcess(),(void *)(uintptr_t)address,
++                          MemoryBasicInformation,&info,sizeof(info),NULL) ||
++      info.State!=MEM_COMMIT || info.Type!=MEM_PRIVATE || (uintptr_t)info.AllocationBase!=ring ||
++      (info.Protect!=PAGE_EXECUTE_READ && info.Protect!=PAGE_EXECUTE_READWRITE &&
++       info.Protect!=PAGE_EXECUTE_WRITECOPY)) return 0;
++  base=(uintptr_t)info.BaseAddress;
++  if (base>address || info.RegionSize<=address-base || info.RegionSize>UINT64_MAX-base) return 0;
++  address=base+info.RegionSize;
++ }
++ return 1;
++}
++
++static int aoe_auto_ring_ready(uint64_t ring)
++{
++ static uint64_t accepted, rejected;
++ if (__atomic_load_n(&accepted,__ATOMIC_RELAXED)==ring) return 1;
++ if (__atomic_load_n(&rejected,__ATOMIC_RELAXED)==ring) return 0;
++ if (!aoe_live_ring_matches(ring))
++ {
++  if (__atomic_exchange_n(&rejected,ring,__ATOMIC_RELAXED)!=ring)
++   fprintf(stderr,"AoE4 cache: discovered ring allocation failed validation at %#llx\n",(unsigned long long)ring);
++  return 0;
++ }
++ if (__atomic_exchange_n(&accepted,ring,__ATOMIC_RELAXED)!=ring)
++  fprintf(stderr,"AoE4 cache: discovered ring allocation accepted at %#llx\n",(unsigned long long)ring);
++ return 1;
++}
++
++static uint64_t aoe_cache_target(uint64_t pc)
++{
++ UINT_PTR ring=0;
++ uint64_t hash=1469598103934665603ULL,jump_target=0,jump_hash;
++ BYTE original[32],emitted[40],*jump;
++ struct aoe_fragment_key key;
++ const struct aoe_cache_entry *entry=NULL,*recent;
++ unsigned available,i,index,prefix=0,jump_index=0;
++ int32_t displacement;
++ if(!aoe_game_verified)return pc;
++ if(!aoe_game_verified)return pc;
++ if(!aoe_cache_pointer_address){aoe_cache_candidates(pc);return pc;}
++ pthread_once(&aoe_cache_enable_once,aoe_cache_check_enabled);
++ if(!aoe_cache_enabled || pc<0x140000000ULL || pc>=0x180000000ULL)return pc;
++ available=virtual_read_aoe_fragment((const void*)(uintptr_t)aoe_cache_pointer_address,pc,&ring,original);
++ if(!available)return pc;
++ if(aoe_cache_auto_discovered && ((ring&0xfff) || !aoe_auto_ring_ready(ring)))return pc;
++ /* Most generated slots end in a near jump. Look up the instruction
++  * bytes and absolute destination so the ring's changing PC can be reused. */
++ if(available>=5 && (jump=memchr(original,0xe9,available-4)))
++ {
++    prefix=jump-original+1;
++    memcpy(&displacement,jump+1,sizeof(displacement));
++    jump_target=pc+prefix+4+displacement;
++    if(jump_target>=pc && jump_target-pc<available)prefix=0;
++    else
++    {
++        jump_hash=jump_target;
++        for(i=0;i<prefix;i++)jump_hash=(jump_hash^original[i])*1099511628211ULL;
++        jump_index=jump_hash>>(64-AOE_RECENT_JUMP_BITS);
++        recent=__atomic_load_n(&aoe_recent_jumps[jump_index],__ATOMIC_RELAXED);
++        if(recent && aoe_cache_matches_jump(recent,original,prefix,jump_target))
++        {
++            aoe_cache_count(0);
++            aoe_cache_count(2);
++            aoe_cache_count(5);
++            return aoe_cache_redirect(pc,recent);
++        }
++    }
++ }
++ if(!aoe_fragment_key(original,available,pc,&key)){aoe_cache_count(4);pthread_mutex_lock(&aoe_cache_lock);aoe_cache_dump_unkeyable(pc,original,available);pthread_mutex_unlock(&aoe_cache_lock);return pc;}
++ for(i=0;i<sizeof(key);i++){hash^=((BYTE*)&key)[i];hash*=1099511628211ULL;}if(!hash)hash=1;
++ pthread_mutex_lock(&aoe_cache_lock);
++ if(!aoe_cache_attempted)aoe_cache_init();aoe_cache_count(0);
++ if(!aoe_cache_code)goto done;
++ index=hash&(AOE_CACHE_TABLE-1);
++ for(i=0;i<64;i++,index=(index+1)&(AOE_CACHE_TABLE-1)){
++  struct aoe_cache_entry *e=&aoe_cache_entries[index];
++  if(e->hash==hash&&!memcmp(&e->key,&key,sizeof(key))){aoe_cache_count(2);entry=e;break;}
++  if(!e->hash){
++   BYTE *target;if(aoe_cache_used==AOE_CACHE_COUNT){aoe_cache_count(6);break;}target=aoe_cache_code+aoe_cache_used*64;
++   if(!aoe_fragment_emit(&key,(uint64_t)target,emitted)){aoe_cache_count(6);break;}
++   memcpy(target,emitted,40);e->key=key;e->slot=aoe_cache_used++;e->hash=hash;aoe_cache_count(3);__atomic_store_n(&aoe_cache_stats[8],aoe_cache_used,__ATOMIC_RELAXED);entry=e;break;
++  }
++ }
++ if(i==64)aoe_cache_count(6);
++done:
++ pthread_mutex_unlock(&aoe_cache_lock);
++ if(!entry)return pc;
++ if(prefix && aoe_cache_matches_jump(entry,original,prefix,jump_target))
++    __atomic_store_n(&aoe_recent_jumps[jump_index],entry,__ATOMIC_RELAXED);
++ return aoe_cache_redirect(pc,entry);
++}
+diff --git a/dlls/ntdll/unix/aoe_hde64.h b/dlls/ntdll/unix/aoe_hde64.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/ntdll/unix/aoe_hde64.h
+@@ -0,0 +1,195 @@
++/*
++ * ﻿MinHook - The Minimalistic API Hooking Library for x64/x86
++ * Copyright (C) 2009-2017 Tsuda Kageyu.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER
++ * OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * ================================================================================
++ * Portions of this software are Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * ================================================================================
++ * Hacker Disassembler Engine 32 C
++ * Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * -------------------------------------------------------------------------------
++ * Hacker Disassembler Engine 64 C
++ * Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++/*
++ * Hacker Disassembler Engine 64
++ * Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * All rights reserved.
++ *
++ * hde64.h: C/C++ header file
++ *
++ */
++
++#ifndef _HDE64_H_
++#define _HDE64_H_
++
++/* stdint.h - C99 standard header
++ * http://en.wikipedia.org/wiki/stdint.h
++ *
++ * if your compiler doesn't contain "stdint.h" header (for
++ * example, Microsoft Visual C++), you can download file:
++ *   http://www.azillionmonkeys.com/qed/pstdint.h
++ * and change next line to:
++ *   #include <stdint.h>
++ */
++#include <stdint.h>
++
++#define F_MODRM         0x00000001
++#define F_SIB           0x00000002
++#define F_IMM8          0x00000004
++#define F_IMM16         0x00000008
++#define F_IMM32         0x00000010
++#define F_IMM64         0x00000020
++#define F_DISP8         0x00000040
++#define F_DISP16        0x00000080
++#define F_DISP32        0x00000100
++#define F_RELATIVE      0x00000200
++#define F_ERROR         0x00001000
++#define F_ERROR_OPCODE  0x00002000
++#define F_ERROR_LENGTH  0x00004000
++#define F_ERROR_LOCK    0x00008000
++#define F_ERROR_OPERAND 0x00010000
++#define F_PREFIX_REPNZ  0x01000000
++#define F_PREFIX_REPX   0x02000000
++#define F_PREFIX_REP    0x03000000
++#define F_PREFIX_66     0x04000000
++#define F_PREFIX_67     0x08000000
++#define F_PREFIX_LOCK   0x10000000
++#define F_PREFIX_SEG    0x20000000
++#define F_PREFIX_REX    0x40000000
++#define F_PREFIX_ANY    0x7f000000
++
++#define PREFIX_SEGMENT_CS   0x2e
++#define PREFIX_SEGMENT_SS   0x36
++#define PREFIX_SEGMENT_DS   0x3e
++#define PREFIX_SEGMENT_ES   0x26
++#define PREFIX_SEGMENT_FS   0x64
++#define PREFIX_SEGMENT_GS   0x65
++#define PREFIX_LOCK         0xf0
++#define PREFIX_REPNZ        0xf2
++#define PREFIX_REPX         0xf3
++#define PREFIX_OPERAND_SIZE 0x66
++#define PREFIX_ADDRESS_SIZE 0x67
++
++#pragma pack(push,1)
++
++typedef struct {
++    uint8_t len;
++    uint8_t p_rep;
++    uint8_t p_lock;
++    uint8_t p_seg;
++    uint8_t p_66;
++    uint8_t p_67;
++    uint8_t rex;
++    uint8_t rex_w;
++    uint8_t rex_r;
++    uint8_t rex_x;
++    uint8_t rex_b;
++    uint8_t opcode;
++    uint8_t opcode2;
++    uint8_t modrm;
++    uint8_t modrm_mod;
++    uint8_t modrm_reg;
++    uint8_t modrm_rm;
++    uint8_t sib;
++    uint8_t sib_scale;
++    uint8_t sib_index;
++    uint8_t sib_base;
++    union {
++        uint8_t imm8;
++        uint16_t imm16;
++        uint32_t imm32;
++        uint64_t imm64;
++    } imm;
++    union {
++        uint8_t disp8;
++        uint16_t disp16;
++        uint32_t disp32;
++    } disp;
++    uint32_t flags;
++} hde64s;
++
++#pragma pack(pop)
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* __cdecl */
++unsigned int hde64_disasm(const void *code, hde64s *hs);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _HDE64_H_ */
+diff --git a/dlls/ntdll/unix/aoe_hde_impl.h b/dlls/ntdll/unix/aoe_hde_impl.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/ntdll/unix/aoe_hde_impl.h
+@@ -0,0 +1,418 @@
++/*
++ * ﻿MinHook - The Minimalistic API Hooking Library for x64/x86
++ * Copyright (C) 2009-2017 Tsuda Kageyu.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER
++ * OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * ================================================================================
++ * Portions of this software are Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * ================================================================================
++ * Hacker Disassembler Engine 32 C
++ * Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * -------------------------------------------------------------------------------
++ * Hacker Disassembler Engine 64 C
++ * Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++/*
++ * Hacker Disassembler Engine 64 C
++ * Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * All rights reserved.
++ *
++ */
++
++#if defined(_M_X64) || defined(__x86_64__)
++
++#include <string.h>
++#include "aoe_hde64.h"
++#include "aoe_hde_table.h"
++
++unsigned int hde64_disasm(const void *code, hde64s *hs)
++{
++    uint8_t x, c, *p = (uint8_t *)code, cflags, opcode, pref = 0;
++    uint8_t *ht = hde64_table, m_mod, m_reg, m_rm, disp_size = 0;
++    uint8_t op64 = 0;
++
++    memset(hs, 0, sizeof(hde64s));
++
++    for (x = 16; x; x--)
++        switch (c = *p++) {
++            case 0xf3:
++                hs->p_rep = c;
++                pref |= PRE_F3;
++                break;
++            case 0xf2:
++                hs->p_rep = c;
++                pref |= PRE_F2;
++                break;
++            case 0xf0:
++                hs->p_lock = c;
++                pref |= PRE_LOCK;
++                break;
++            case 0x26: case 0x2e: case 0x36:
++            case 0x3e: case 0x64: case 0x65:
++                hs->p_seg = c;
++                pref |= PRE_SEG;
++                break;
++            case 0x66:
++                hs->p_66 = c;
++                pref |= PRE_66;
++                break;
++            case 0x67:
++                hs->p_67 = c;
++                pref |= PRE_67;
++                break;
++            default:
++                goto pref_done;
++        }
++  pref_done:
++
++    hs->flags = (uint32_t)pref << 23;
++
++    if (!pref)
++        pref |= PRE_NONE;
++
++    if ((c & 0xf0) == 0x40) {
++        hs->flags |= F_PREFIX_REX;
++        if ((hs->rex_w = (c & 0xf) >> 3) && (*p & 0xf8) == 0xb8)
++            op64++;
++        hs->rex_r = (c & 7) >> 2;
++        hs->rex_x = (c & 3) >> 1;
++        hs->rex_b = c & 1;
++        if (((c = *p++) & 0xf0) == 0x40) {
++            opcode = c;
++            goto error_opcode;
++        }
++    }
++
++    if ((hs->opcode = c) == 0x0f) {
++        hs->opcode2 = c = *p++;
++        ht += DELTA_OPCODES;
++    } else if (c >= 0xa0 && c <= 0xa3) {
++        op64++;
++        if (pref & PRE_67)
++            pref |= PRE_66;
++        else
++            pref &= ~PRE_66;
++    }
++
++    opcode = c;
++    cflags = ht[ht[opcode / 4] + (opcode % 4)];
++
++    if (cflags == C_ERROR) {
++      error_opcode:
++        hs->flags |= F_ERROR | F_ERROR_OPCODE;
++        cflags = 0;
++        if ((opcode & -3) == 0x24)
++            cflags++;
++    }
++
++    x = 0;
++    if (cflags & C_GROUP) {
++        uint16_t t;
++        t = *(uint16_t *)(ht + (cflags & 0x7f));
++        cflags = (uint8_t)t;
++        x = (uint8_t)(t >> 8);
++    }
++
++    if (hs->opcode2) {
++        ht = hde64_table + DELTA_PREFIXES;
++        if (ht[ht[opcode / 4] + (opcode % 4)] & pref)
++            hs->flags |= F_ERROR | F_ERROR_OPCODE;
++    }
++
++    if (cflags & C_MODRM) {
++        hs->flags |= F_MODRM;
++        hs->modrm = c = *p++;
++        hs->modrm_mod = m_mod = c >> 6;
++        hs->modrm_rm = m_rm = c & 7;
++        hs->modrm_reg = m_reg = (c & 0x3f) >> 3;
++
++        if (x && ((x << m_reg) & 0x80))
++            hs->flags |= F_ERROR | F_ERROR_OPCODE;
++
++        if (!hs->opcode2 && opcode >= 0xd9 && opcode <= 0xdf) {
++            uint8_t t = opcode - 0xd9;
++            if (m_mod == 3) {
++                ht = hde64_table + DELTA_FPU_MODRM + t*8;
++                t = ht[m_reg] << m_rm;
++            } else {
++                ht = hde64_table + DELTA_FPU_REG;
++                t = ht[t] << m_reg;
++            }
++            if (t & 0x80)
++                hs->flags |= F_ERROR | F_ERROR_OPCODE;
++        }
++
++        if (pref & PRE_LOCK) {
++            if (m_mod == 3) {
++                hs->flags |= F_ERROR | F_ERROR_LOCK;
++            } else {
++                uint8_t *table_end, op = opcode;
++                if (hs->opcode2) {
++                    ht = hde64_table + DELTA_OP2_LOCK_OK;
++                    table_end = ht + DELTA_OP_ONLY_MEM - DELTA_OP2_LOCK_OK;
++                } else {
++                    ht = hde64_table + DELTA_OP_LOCK_OK;
++                    table_end = ht + DELTA_OP2_LOCK_OK - DELTA_OP_LOCK_OK;
++                    op &= -2;
++                }
++                for (; ht != table_end; ht++)
++                    if (*ht++ == op) {
++                        if (!((*ht << m_reg) & 0x80))
++                            goto no_lock_error;
++                        else
++                            break;
++                    }
++                hs->flags |= F_ERROR | F_ERROR_LOCK;
++              no_lock_error:
++                ;
++            }
++        }
++
++        if (hs->opcode2) {
++            switch (opcode) {
++                case 0x20: case 0x22:
++                    m_mod = 3;
++                    if (m_reg > 4 || m_reg == 1)
++                        goto error_operand;
++                    else
++                        goto no_error_operand;
++                case 0x21: case 0x23:
++                    m_mod = 3;
++                    if (m_reg == 4 || m_reg == 5)
++                        goto error_operand;
++                    else
++                        goto no_error_operand;
++            }
++        } else {
++            switch (opcode) {
++                case 0x8c:
++                    if (m_reg > 5)
++                        goto error_operand;
++                    else
++                        goto no_error_operand;
++                case 0x8e:
++                    if (m_reg == 1 || m_reg > 5)
++                        goto error_operand;
++                    else
++                        goto no_error_operand;
++            }
++        }
++
++        if (m_mod == 3) {
++            uint8_t *table_end;
++            if (hs->opcode2) {
++                ht = hde64_table + DELTA_OP2_ONLY_MEM;
++                table_end = ht + sizeof(hde64_table) - DELTA_OP2_ONLY_MEM;
++            } else {
++                ht = hde64_table + DELTA_OP_ONLY_MEM;
++                table_end = ht + DELTA_OP2_ONLY_MEM - DELTA_OP_ONLY_MEM;
++            }
++            for (; ht != table_end; ht += 2)
++                if (*ht++ == opcode) {
++                    if ((*ht++ & pref) && !((*ht << m_reg) & 0x80))
++                        goto error_operand;
++                    else
++                        break;
++                }
++            goto no_error_operand;
++        } else if (hs->opcode2) {
++            switch (opcode) {
++                case 0x50: case 0xd7: case 0xf7:
++                    if (pref & (PRE_NONE | PRE_66))
++                        goto error_operand;
++                    break;
++                case 0xd6:
++                    if (pref & (PRE_F2 | PRE_F3))
++                        goto error_operand;
++                    break;
++                case 0xc5:
++                    goto error_operand;
++            }
++            goto no_error_operand;
++        } else
++            goto no_error_operand;
++
++      error_operand:
++        hs->flags |= F_ERROR | F_ERROR_OPERAND;
++      no_error_operand:
++
++        c = *p++;
++        if (m_reg <= 1) {
++            if (opcode == 0xf6)
++                cflags |= C_IMM8;
++            else if (opcode == 0xf7)
++                cflags |= C_IMM_P66;
++        }
++
++        switch (m_mod) {
++            case 0:
++                if (pref & PRE_67) {
++                    if (m_rm == 6)
++                        disp_size = 2;
++                } else
++                    if (m_rm == 5)
++                        disp_size = 4;
++                break;
++            case 1:
++                disp_size = 1;
++                break;
++            case 2:
++                disp_size = 2;
++                if (!(pref & PRE_67))
++                    disp_size <<= 1;
++                break;
++        }
++
++        if (m_mod != 3 && m_rm == 4) {
++            hs->flags |= F_SIB;
++            p++;
++            hs->sib = c;
++            hs->sib_scale = c >> 6;
++            hs->sib_index = (c & 0x3f) >> 3;
++            if ((hs->sib_base = c & 7) == 5 && !(m_mod & 1))
++                disp_size = 4;
++        }
++
++        p--;
++        switch (disp_size) {
++            case 1:
++                hs->flags |= F_DISP8;
++                hs->disp.disp8 = *p;
++                break;
++            case 2:
++                hs->flags |= F_DISP16;
++                hs->disp.disp16 = *(uint16_t *)p;
++                break;
++            case 4:
++                hs->flags |= F_DISP32;
++                hs->disp.disp32 = *(uint32_t *)p;
++                break;
++        }
++        p += disp_size;
++    } else if (pref & PRE_LOCK)
++        hs->flags |= F_ERROR | F_ERROR_LOCK;
++
++    if (cflags & C_IMM_P66) {
++        if (cflags & C_REL32) {
++            if (pref & PRE_66) {
++                hs->flags |= F_IMM16 | F_RELATIVE;
++                hs->imm.imm16 = *(uint16_t *)p;
++                p += 2;
++                goto disasm_done;
++            }
++            goto rel32_ok;
++        }
++        if (op64) {
++            hs->flags |= F_IMM64;
++            hs->imm.imm64 = *(uint64_t *)p;
++            p += 8;
++        } else if (!(pref & PRE_66)) {
++            hs->flags |= F_IMM32;
++            hs->imm.imm32 = *(uint32_t *)p;
++            p += 4;
++        } else
++            goto imm16_ok;
++    }
++
++
++    if (cflags & C_IMM16) {
++      imm16_ok:
++        hs->flags |= F_IMM16;
++        hs->imm.imm16 = *(uint16_t *)p;
++        p += 2;
++    }
++    if (cflags & C_IMM8) {
++        hs->flags |= F_IMM8;
++        hs->imm.imm8 = *p++;
++    }
++
++    if (cflags & C_REL32) {
++      rel32_ok:
++        hs->flags |= F_IMM32 | F_RELATIVE;
++        hs->imm.imm32 = *(uint32_t *)p;
++        p += 4;
++    } else if (cflags & C_REL8) {
++        hs->flags |= F_IMM8 | F_RELATIVE;
++        hs->imm.imm8 = *p++;
++    }
++
++  disasm_done:
++
++    if ((hs->len = (uint8_t)(p-(uint8_t *)code)) > 15) {
++        hs->flags |= F_ERROR | F_ERROR_LENGTH;
++        hs->len = 15;
++    }
++
++    return (unsigned int)hs->len;
++}
++
++#endif // defined(_M_X64) || defined(__x86_64__)
+diff --git a/dlls/ntdll/unix/aoe_hde_table.h b/dlls/ntdll/unix/aoe_hde_table.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/ntdll/unix/aoe_hde_table.h
+@@ -0,0 +1,157 @@
++/*
++ * ﻿MinHook - The Minimalistic API Hooking Library for x64/x86
++ * Copyright (C) 2009-2017 Tsuda Kageyu.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER
++ * OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * ================================================================================
++ * Portions of this software are Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * ================================================================================
++ * Hacker Disassembler Engine 32 C
++ * Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * -------------------------------------------------------------------------------
++ * Hacker Disassembler Engine 64 C
++ * Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++/*
++ * Hacker Disassembler Engine 64 C
++ * Copyright (c) 2008-2009, Vyacheslav Patkov.
++ * All rights reserved.
++ *
++ */
++
++#define C_NONE    0x00
++#define C_MODRM   0x01
++#define C_IMM8    0x02
++#define C_IMM16   0x04
++#define C_IMM_P66 0x10
++#define C_REL8    0x20
++#define C_REL32   0x40
++#define C_GROUP   0x80
++#define C_ERROR   0xff
++
++#define PRE_ANY  0x00
++#define PRE_NONE 0x01
++#define PRE_F2   0x02
++#define PRE_F3   0x04
++#define PRE_66   0x08
++#define PRE_67   0x10
++#define PRE_LOCK 0x20
++#define PRE_SEG  0x40
++#define PRE_ALL  0xff
++
++#define DELTA_OPCODES      0x4a
++#define DELTA_FPU_REG      0xfd
++#define DELTA_FPU_MODRM    0x104
++#define DELTA_PREFIXES     0x13c
++#define DELTA_OP_LOCK_OK   0x1ae
++#define DELTA_OP2_LOCK_OK  0x1c6
++#define DELTA_OP_ONLY_MEM  0x1d8
++#define DELTA_OP2_ONLY_MEM 0x1e7
++
++unsigned char hde64_table[] = {
++  0xa5,0xaa,0xa5,0xb8,0xa5,0xaa,0xa5,0xaa,0xa5,0xb8,0xa5,0xb8,0xa5,0xb8,0xa5,
++  0xb8,0xc0,0xc0,0xc0,0xc0,0xc0,0xc0,0xc0,0xc0,0xac,0xc0,0xcc,0xc0,0xa1,0xa1,
++  0xa1,0xa1,0xb1,0xa5,0xa5,0xa6,0xc0,0xc0,0xd7,0xda,0xe0,0xc0,0xe4,0xc0,0xea,
++  0xea,0xe0,0xe0,0x98,0xc8,0xee,0xf1,0xa5,0xd3,0xa5,0xa5,0xa1,0xea,0x9e,0xc0,
++  0xc0,0xc2,0xc0,0xe6,0x03,0x7f,0x11,0x7f,0x01,0x7f,0x01,0x3f,0x01,0x01,0xab,
++  0x8b,0x90,0x64,0x5b,0x5b,0x5b,0x5b,0x5b,0x92,0x5b,0x5b,0x76,0x90,0x92,0x92,
++  0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x6a,0x73,0x90,
++  0x5b,0x52,0x52,0x52,0x52,0x5b,0x5b,0x5b,0x5b,0x77,0x7c,0x77,0x85,0x5b,0x5b,
++  0x70,0x5b,0x7a,0xaf,0x76,0x76,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,
++  0x5b,0x5b,0x86,0x01,0x03,0x01,0x04,0x03,0xd5,0x03,0xd5,0x03,0xcc,0x01,0xbc,
++  0x03,0xf0,0x03,0x03,0x04,0x00,0x50,0x50,0x50,0x50,0xff,0x20,0x20,0x20,0x20,
++  0x01,0x01,0x01,0x01,0xc4,0x02,0x10,0xff,0xff,0xff,0x01,0x00,0x03,0x11,0xff,
++  0x03,0xc4,0xc6,0xc8,0x02,0x10,0x00,0xff,0xcc,0x01,0x01,0x01,0x00,0x00,0x00,
++  0x00,0x01,0x01,0x03,0x01,0xff,0xff,0xc0,0xc2,0x10,0x11,0x02,0x03,0x01,0x01,
++  0x01,0xff,0xff,0xff,0x00,0x00,0x00,0xff,0x00,0x00,0xff,0xff,0xff,0xff,0x10,
++  0x10,0x10,0x10,0x02,0x10,0x00,0x00,0xc6,0xc8,0x02,0x02,0x02,0x02,0x06,0x00,
++  0x04,0x00,0x02,0xff,0x00,0xc0,0xc2,0x01,0x01,0x03,0x03,0x03,0xca,0x40,0x00,
++  0x0a,0x00,0x04,0x00,0x00,0x00,0x00,0x7f,0x00,0x33,0x01,0x00,0x00,0x00,0x00,
++  0x00,0x00,0xff,0xbf,0xff,0xff,0x00,0x00,0x00,0x00,0x07,0x00,0x00,0xff,0x00,
++  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,
++  0x00,0x00,0x00,0xbf,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x7f,0x00,0x00,
++  0xff,0x40,0x40,0x40,0x40,0x41,0x49,0x40,0x40,0x40,0x40,0x4c,0x42,0x40,0x40,
++  0x40,0x40,0x40,0x40,0x40,0x40,0x4f,0x44,0x53,0x40,0x40,0x40,0x44,0x57,0x43,
++  0x5c,0x40,0x60,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,
++  0x40,0x40,0x64,0x66,0x6e,0x6b,0x40,0x40,0x6a,0x46,0x40,0x40,0x44,0x46,0x40,
++  0x40,0x5b,0x44,0x40,0x40,0x00,0x00,0x00,0x00,0x06,0x06,0x06,0x06,0x01,0x06,
++  0x06,0x02,0x06,0x06,0x00,0x06,0x00,0x0a,0x0a,0x00,0x00,0x00,0x02,0x07,0x07,
++  0x06,0x02,0x0d,0x06,0x06,0x06,0x0e,0x05,0x05,0x02,0x02,0x00,0x00,0x04,0x04,
++  0x04,0x04,0x05,0x06,0x06,0x06,0x00,0x00,0x00,0x0e,0x00,0x00,0x08,0x00,0x10,
++  0x00,0x18,0x00,0x20,0x00,0x28,0x00,0x30,0x00,0x80,0x01,0x82,0x01,0x86,0x00,
++  0xf6,0xcf,0xfe,0x3f,0xab,0x00,0xb0,0x00,0xb1,0x00,0xb3,0x00,0xba,0xf8,0xbb,
++  0x00,0xc0,0x00,0xc1,0x00,0xc7,0xbf,0x62,0xff,0x00,0x8d,0xff,0x00,0xc4,0xff,
++  0x00,0xc5,0xff,0x00,0xff,0xff,0xeb,0x01,0xff,0x0e,0x12,0x08,0x00,0x13,0x09,
++  0x00,0x16,0x08,0x00,0x17,0x09,0x00,0x2b,0x09,0x00,0xae,0xff,0x07,0xb2,0xff,
++  0x00,0xb4,0xff,0x00,0xb5,0xff,0x00,0xc3,0x01,0x00,0xc7,0xff,0xbf,0xe7,0x08,
++  0x00,0xf0,0x02,0x00
++};
+diff --git a/dlls/ntdll/unix/aoe_relocate.h b/dlls/ntdll/unix/aoe_relocate.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/ntdll/unix/aoe_relocate.h
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * GameToMac Wine changes: Marc Ibrahim; extensions: NerRobDog.
++ * Source commit: 711c6fc7559a565c417aab4d52d84b09767a9c1d. */
++/* Experimental conservative relocation of straight-line generated fragments.
++ *
++ * NerRobDog 2026-09-09: near conditional branches (0F 8x rel32) that leave the block are
++ * relocatable too: the block continues on the fall-through path and the rel32 is
++ * patched like any other relocation. Only the 6-byte form is accepted so the cached
++ * copy keeps the original byte layout (aoe_cache_logical_pc maps shadow<->original by
++ * offset). Short Jcc (70..7F rel8), calls, loops, jumps into the block, prefixed
++ * branches and more than 8 relocations are still refused. */
++#include <stdint.h>
++#include <string.h>
++#include <limits.h>
++#include "aoe_hde_impl.h"
++#define AOE_FRAGMENT_MAX 40
++struct aoe_fragment_key { uint8_t code[AOE_FRAGMENT_MAX], len, count, offsets[8], ends[8]; uint64_t targets[8]; };
++static int aoe_plain_instruction(const hde64s *h)
++{
++ unsigned op=h->opcode;
++ if(h->p_rep||h->p_67||h->p_lock)return 0;
++ if(op==0x0f)return (h->opcode2>=0x40&&h->opcode2<=0x4f)||(h->opcode2>=0x90&&h->opcode2<=0x9f)||h->opcode2==0xaf||h->opcode2==0xb6||h->opcode2==0xb7||h->opcode2==0xbe||h->opcode2==0xbf;
++ if((op>=0x50&&op<=0x5f)||(op>=0xb0&&op<=0xbf)||op==0x90||op==0x98||op==0x99)return 1;
++ if(op<=0x3d && (op&7)<=5)return 1;
++ switch(op){case 0x63:case 0x68:case 0x69:case 0x6a:case 0x6b:case 0x80:case 0x81:case 0x83:case 0x84:case 0x85:case 0x86:case 0x87:case 0x88:case 0x89:case 0x8a:case 0x8b:case 0x8d:case 0x8f:case 0xc0:case 0xc1:case 0xc6:case 0xc7:case 0xd0:case 0xd1:case 0xd2:case 0xd3:case 0xf6:case 0xf7:case 0xfe:return 1;case 0xff:return h->modrm_reg<=1;default:return 0;}
++}
++/* Near Jcc 0F 80..8F rel32 only (layout-preserving); short Jcc is left to the generic refusal. */
++static int aoe_near_jcc(const hde64s *h){return h->opcode==0x0f&&h->opcode2>=0x80&&h->opcode2<=0x8f;}
++static int aoe_fragment_key(const uint8_t *source,unsigned available,uint64_t pc,struct aoe_fragment_key *k)
++{
++ unsigned offset=0,out=0,steps;memset(k,0,sizeof(*k));
++ for(steps=0;steps<16 && offset<available;steps++){
++  uint8_t scratch[32]={0};hde64s h;unsigned imm=0,disp;uint64_t target;
++  memcpy(scratch,source+offset,available-offset<16?available-offset:16);hde64_disasm(scratch,&h);
++  if(!h.len||h.len>available-offset||(h.flags&F_ERROR)||h.p_67||h.p_rep||h.p_lock)return 0;
++  if(h.opcode==0xeb)return 0;
++  if(h.opcode==0xe9){
++   if(h.p_66||h.p_seg||h.rex||k->count==8||out+5>AOE_FRAGMENT_MAX)return 0;
++   target=pc+offset+h.len+(h.opcode==0xe9?(int64_t)(int32_t)h.imm.imm32:(int64_t)(int8_t)h.imm.imm8);
++   /* Avoid branches into this block; they need a complete control-flow map. */
++   if(target>=pc&&target<pc+available)return 0;
++   k->code[out]=0xe9;k->offsets[k->count]=out+1;k->ends[k->count]=out+5;k->targets[k->count++]=target;k->len=out+5;return 1;
++  }
++  if(aoe_near_jcc(&h)){
++   /* conditional branch leaving the block: relocate rel32, block continues on the fall-through path */
++   if(h.p_66||h.p_seg||h.rex||h.len!=6||k->count==8||out+6>AOE_FRAGMENT_MAX)return 0;
++   target=pc+offset+h.len+(int64_t)(int32_t)h.imm.imm32;
++   if(target>=pc&&target<pc+available)return 0;
++   k->code[out]=0x0f;k->code[out+1]=h.opcode2;k->offsets[k->count]=out+2;k->ends[k->count]=out+6;k->targets[k->count++]=target;
++   out+=6;offset+=6;continue;
++  }
++  if(out+h.len>AOE_FRAGMENT_MAX)return 0;
++  memcpy(k->code+out,source+offset,h.len);
++  if(h.opcode==0xc3||h.opcode==0xc2){if(h.p_66||h.p_seg||h.rex)return 0;k->len=out+h.len;return 1;}
++  if((h.flags&F_RELATIVE)||!aoe_plain_instruction(&h))return 0;
++  if((h.flags&F_MODRM)&&h.modrm_mod==0&&h.modrm_rm==5){
++   if(h.p_seg||!(h.flags&F_DISP32)||k->count==8)return 0;
++   if(h.flags&F_IMM8)imm+=1;if(h.flags&F_IMM16)imm+=2;if(h.flags&F_IMM32)imm+=4;if(h.flags&F_IMM64)imm+=8;
++   if(h.len<imm+4)return 0;disp=out+h.len-imm-4;
++   target=pc+offset+h.len+(int64_t)(int32_t)h.disp.disp32;
++   memset(k->code+disp,0,4);k->offsets[k->count]=disp;k->ends[k->count]=out+h.len;k->targets[k->count++]=target;
++  }
++  out+=h.len;offset+=h.len;
++ }
++ return 0;
++}
++static int aoe_fragment_emit(const struct aoe_fragment_key *k,uint64_t pc,uint8_t output[AOE_FRAGMENT_MAX])
++{
++ unsigned i;memcpy(output,k->code,AOE_FRAGMENT_MAX);
++ for(i=0;i<k->count;i++){int64_t delta=(int64_t)k->targets[i]-(int64_t)(pc+k->ends[i]);int32_t d;if(delta<INT32_MIN||delta>INT32_MAX)return 0;d=delta;memcpy(output+k->offsets[i],&d,4);}return 1;
++}
+diff --git a/dlls/ntdll/unix/aoe_ring_discovery.h b/dlls/ntdll/unix/aoe_ring_discovery.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/ntdll/unix/aoe_ring_discovery.h
+@@ -0,0 +1,114 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef HIGHBALL_AOE_RING_DISCOVERY_H
++#define HIGHBALL_AOE_RING_DISCOVERY_H
++
++#include "aoe_build_guard.h"
++
++#define AOE_RING_SIZE 0x1000000
++
++static uint64_t aoe_rip_relative(uint64_t next_pc, const unsigned char *displacement)
++{
++    return next_pc + (int32_t)aoe_u32(displacement);
++}
++
++static int aoe_is_ring_pointer(const struct aoe_image_layout *image, uint64_t address)
++{
++    return image->data_end > image->data_start && image->data_end-image->data_start >= 8 &&
++           !(address & 7) && address >= image->data_start && address <= image->data_end-8;
++}
++
++/* The writer wraps at 2^19 slots, shifts by five and adds the RIP-relative ring base.
++ * Both measured builds use EBX for the index and RBX for the address. */
++static uint64_t aoe_ring_writer(const unsigned char *code, size_t size, uint64_t pc)
++{
++    static const unsigned char writer[] = {
++        0x81,0xe3,0xff,0xff,0x07,0x00, /* and ebx, 0x7ffff */
++        0x48,0xc1,0xe3,0x05,           /* shl rbx, 5 */
++        0x48,0x03,0x1d                 /* add rbx, [rip+disp32] */
++    };
++    if (size < sizeof(writer)+4 || memcmp(code,writer,sizeof(writer))) return 0;
++    return aoe_rip_relative(pc+sizeof(writer)+4,code+sizeof(writer));
++}
++
++/* The initializer allocates 16 MiB plus a page with MEM_RESERVE|MEM_COMMIT and RWX,
++ * stores the returned address, and retries if it was null. Match the forms with the
++ * allocation size in r14 or r15 and require them to agree across the sequence. */
++#define AOE_RING_INITIALIZER_SIZE 47
++static uint64_t aoe_ring_initializer(const unsigned char *code, size_t size, uint64_t pc,
++                                     const struct aoe_image_layout *image)
++{
++    static const unsigned char alloc_flags[] = {
++        0x41,0xb9,0x40,0x00,0x00,0x00, /* mov r9d, PAGE_EXECUTE_READWRITE */
++        0x41,0xb8,0x00,0x30,0x00,0x00  /* mov r8d, MEM_RESERVE|MEM_COMMIT */
++    };
++    static const unsigned char call_and_store[] = {
++        0x48,0x8b,0xf8,0x48,0x89,0x05 /* mov rdi, rax; mov [rip+disp32], rax */
++    };
++    static const unsigned char retry[] = {0x48,0x85,0xc0,0x74,0xd7};
++    uint64_t target;
++    unsigned int reg;
++
++    if (size < AOE_RING_INITIALIZER_SIZE || code[0] != 0x41 ||
++        (code[1] != 0xbe && code[1] != 0xbf) || aoe_u32(code+2) != AOE_RING_SIZE+0x1000)
++        return 0;
++    reg = code[1] & 7;
++    if (code[6] != 0x49 || code[7] != 0x03 || code[8] != (0xd8 | reg) ||
++        memcmp(code+9,alloc_flags,sizeof(alloc_flags)) ||
++        code[21] != 0x49 || code[22] != 0x8b || code[23] != (0xd0 | reg) ||
++        memcmp(code+24,"\x48\x8b\xcb\xe8",4) ||
++        memcmp(code+32,call_and_store,sizeof(call_and_store)) ||
++        memcmp(code+42,retry,sizeof(retry))) return 0;
++
++    target = aoe_rip_relative(pc+32,code+28);
++    if (target < image->text_start || target >= image->text_end) return 0;
++    return aoe_rip_relative(pc+42,code+38);
++}
++
++/* Read from the same file descriptor Wine will map. Exactly one writer and exactly
++ * one initializer must reference the same aligned slot in the game's writable .data. */
++static uint64_t aoe_discover_ring_pointer(int fd, const struct aoe_image_layout *image, off_t file_size)
++{
++    enum { chunk_size = 65536 };
++    unsigned char code[chunk_size + AOE_RING_INITIALIZER_SIZE - 1];
++    uint64_t writer = 0, initializer = 0;
++    size_t offset;
++
++    if (file_size <= 0 || image->text_offset < 0x200 || !image->text_file_size ||
++        (uint64_t)image->text_offset+image->text_file_size > (uint64_t)file_size) return 0;
++    for (offset=0; offset<image->text_file_size; offset+=chunk_size)
++    {
++        size_t remaining = image->text_file_size-offset;
++        size_t size = remaining < sizeof(code) ? remaining : sizeof(code);
++        size_t starts = remaining < chunk_size ? remaining : chunk_size;
++        size_t done = 0, i;
++
++        while (done < size)
++        {
++            ssize_t count = pread(fd,code+done,size-done,(off_t)image->text_offset+offset+done);
++            if (count < 0 && errno == EINTR) continue;
++            if (count <= 0) return 0;
++            done += count;
++        }
++        for (i=0; i<starts; i++)
++        {
++            uint64_t pc = image->text_start+offset+i, candidate;
++            if (code[i] == 0x81)
++            {
++                candidate = aoe_ring_writer(code+i,size-i,pc);
++                if (!aoe_is_ring_pointer(image,candidate)) continue;
++                if (writer) return 0;
++                writer = candidate;
++            }
++            else if (code[i] == 0x41)
++            {
++                candidate = aoe_ring_initializer(code+i,size-i,pc,image);
++                if (!aoe_is_ring_pointer(image,candidate)) continue;
++                if (initializer) return 0;
++                initializer = candidate;
++            }
++        }
++    }
++    return writer == initializer ? writer : 0;
++}
++
++#endif
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -25,6 +25,8 @@
+ #include "config.h"
+
+ #include <assert.h>
++#include <ctype.h>
++#include <stdint.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdarg.h>
+@@ -100,6 +102,91 @@
+
+ WINE_DEFAULT_DEBUG_CHANNEL(module);
+ WINE_DECLARE_DEBUG_CHANNEL(syscall);
++
++#if defined(__APPLE__) && defined(__x86_64__)
++#include "aoe_ring_discovery.h"
++extern BOOL aoe_game_verified;
++extern BOOL aoe_cache_auto_discovered;
++extern uint64_t aoe_cache_pointer_address;
++extern uint64_t aoe_cache_search_start, aoe_cache_search_end;
++static BOOL aoe_attaching;
++static void x87_cooperative_handshake(void);
++
++static int aoe_rosetta_supported(void)
++{
++    char release[64];
++    size_t size = sizeof(release);
++    int translated = 0;
++    if (sysctlbyname("kern.osrelease", release, &size, NULL, 0) || !size || size > sizeof(release)) return 0;
++    release[sizeof(release) - 1] = 0;
++    /* macOS 26 is Darwin 25. The recovered Rosetta hook was not validated below it. */
++    if (strtoul(release, NULL, 10) < 25) return 0;
++    size = sizeof(translated);
++    return !sysctlbyname("sysctl.proc_translated", &translated, &size, NULL, 0) && translated == 1;
++}
++
++static int aoe_inspect_game(int fd, char digest[65], struct aoe_image_layout *image)
++{
++    unsigned char bytes[32];
++    struct stat before,after;
++    if (fstat(fd,&before) || !aoe_read_layout(fd,image) || !aoe_hash_fd(fd,bytes) ||
++        fstat(fd,&after) || !aoe_same_file_state(&before,&after)) return 0;
++    aoe_digest_hex(bytes,digest);
++    return 1;
++}
++
++static NTSTATUS aoe_check_image_handle(const char *name, HANDLE handle)
++{
++    int fd, needs_close;
++    NTSTATUS status;
++    struct aoe_image_layout image;
++    struct stat before, after;
++    uint64_t pointer = 0;
++    BOOL automatic = FALSE;
++    char digest[65];
++    const char *expected, *cache;
++    BOOL cache_requested;
++    if (!aoe_attaching || !aoe_game_name(name)) return STATUS_SUCCESS;
++    expected=getenv("AOE4_EXPECTED_SHA256");
++    cache=getenv("AOE4_CACHE");
++    cache_requested=!cache || strcmp(cache,"0");
++    if ((status=server_get_unix_fd(handle,FILE_READ_DATA,&fd,&needs_close,NULL,NULL))) return status;
++    if (fstat(fd,&before) || !aoe_inspect_game(fd,digest,&image) || !expected || strcmp(digest,expected))
++        status=STATUS_INVALID_IMAGE_HASH;
++    else if (cache_requested)
++    {
++        aoe_cache_profile(digest,&image,&pointer);
++        if (!pointer)
++        {
++            pointer=aoe_discover_ring_pointer(fd,&image,before.st_size);
++            automatic=!!pointer;
++        }
++        if (fstat(fd,&after) || !aoe_same_file_state(&before,&after)) status=STATUS_INVALID_IMAGE_HASH;
++    }
++    if (needs_close) close(fd);
++    if (status)
++    {
++        ERR("AoE4 executable changed between launch and SEC_IMAGE or failed layout checks\n");
++        return status;
++    }
++    aoe_game_verified=TRUE;
++    aoe_cache_search_start=image.data_start; aoe_cache_search_end=image.data_end;
++    aoe_cache_pointer_address=pointer;
++    aoe_cache_auto_discovered=automatic;
++    if (!cache_requested)
++        ERR("AoE4 cache explicitly disabled; softfault/x87 selection unchanged\n");
++    else if (!pointer)
++        ERR("AoE4 cache unavailable: no measured profile or recognized ring for SHA256 %s\n",digest);
++    else if (automatic)
++        ERR("AoE4 cache ring discovered: SHA256 %s, pointer RVA %#llx; awaiting live allocation\n",
++            digest,(unsigned long long)(pointer-image.base));
++    else ERR("AoE4 cache profile accepted: SHA256 %s, ring pointer %llx\n",digest,
++             (unsigned long long)pointer);
++    return STATUS_SUCCESS;
++}
++
++#endif
++
+
+ #if defined __i386__ || defined __x86_64__
+ #define SO_DLLS_SUPPORTED
+@@ -1471,6 +1558,13 @@
+ #endif
+
+
++
++uint64_t aoe_cache_pointer_address, aoe_cache_search_start, aoe_cache_search_end;
++BOOL aoe_cache_auto_discovered;
++BOOL aoe_game_verified; /* Remains false until the actual executable passes the build guard. */
++#ifdef __x86_64__
++extern NTSTATUS aoe_exception_context(void *args);
++#endif
+ static const unixlib_entry_t unix_call_funcs[] =
+ {
+     load_so_dll,
+@@ -1483,6 +1577,7 @@
+     system_time_precise,
+ #if defined(__x86_64__)
+     pe_module_loaded,
++    aoe_exception_context,
+ #endif
+ };
+
+@@ -1518,6 +1613,7 @@
+     system_time_precise,
+ #if defined(__x86_64__)
+     wow64_pe_module_loaded,
++    NULL, /* AoE IV is x64; no 32-bit software exception thunk. */
+ #endif
+ };
+
+@@ -1569,6 +1665,14 @@
+         return STATUS_DLL_NOT_FOUND;
+     }
+
++#if defined(__APPLE__) && defined(__x86_64__)
++    /* Verify the same open file used by SEC_IMAGE. No path reopen / replacement race. */
++    if ((status = aoe_check_image_handle(name, handle)))
++    {
++        NtClose(handle);
++        return status;
++    }
++#endif
+     size.QuadPart = 0;
+     status = NtCreateSection( mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY |
+                               SECTION_MAP_READ | SECTION_MAP_EXECUTE,
+@@ -1867,6 +1971,11 @@
+             info->Machine = native_machine;
+             status = STATUS_SUCCESS;
+         }
++#if defined(__APPLE__) && defined(__x86_64__)
++        if (aoe_game_verified && aoe_game_name(unix_name) &&
++            (status || info->Machine != IMAGE_FILE_MACHINE_AMD64 || *module != (void *)0x140000000ULL))
++            fatal_error("AoE IV experimental patches require the verified x64 image at 0x140000000\n");
++#endif
+         NtClose( mapping );
+     }
+     else if (status == STATUS_INVALID_IMAGE_NOT_MZ && loadorder != LO_NATIVE)
+@@ -2141,6 +2250,29 @@
+     if (status) fatal_error( "failed to load %s error %x\n", name, status );
+     free( name );
+     load_ntdll_functions( module );
++#if defined(__APPLE__) && defined(__x86_64__)
++    if (aoe_game_verified && aoe_attaching)
++    {
++        const IMAGE_EXPORT_DIRECTORY *exports = get_module_data_dir(module, IMAGE_DIRECTORY_ENTRY_EXPORT, NULL);
++        void *targets[2] = {(void *)find_named_export(module,exports,"__wine_aoe_softfault1"),(void *)find_named_export(module,exports,"__wine_aoe_softfault2")};
++        void *bridge = (void *)0x180000000ULL;
++        SIZE_T bridge_size = 4096;
++        ULONG old_protect;
++        unsigned int i;
++        if (!targets[0] || !targets[1]) fatal_error("software fault entries missing\n");
++        status = NtAllocateVirtualMemory(GetCurrentProcess(),&bridge,0,&bridge_size,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
++        if (status || bridge != (void *)0x180000000ULL) fatal_error("cannot reserve software fault bridge (%x)\n",status);
++        for (i=0;i<2;i++)
++        {
++            BYTE *entry=(BYTE *)bridge+16*i;
++            entry[0]=0xff;entry[1]=0x25;
++            memset(entry+2,0,4);memcpy(entry+6,&targets[i],8);
++            entry[14]=entry[15]=0xcc;
++        }
++        status = NtProtectVirtualMemory(GetCurrentProcess(),&bridge,&bridge_size,PAGE_EXECUTE_READ,&old_protect);
++        if (status) fatal_error("cannot protect software fault bridge (%x)\n",status);
++    }
++#endif
+     if (is_arm64ec()) redirect_ntdll_functions( module );
+ }
+
+@@ -2336,6 +2468,17 @@
+     init_thread_stack( teb, 0, 0, 0 );
+     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+     load_ntdll();
++#if defined(__APPLE__) && defined(__x86_64__)
++    /* AoE's decoder may call into ntdll, so attach only after the validated bridge exists. */
++    if (aoe_attaching)
++    {
++        if (!aoe_game_verified) fatal_error("AoE IV softfault attach requires a verified game image\n");
++        if (!aoe_bootstrap_is_current(getenv("X87_SIDECAR_BOOTSTRAP")))
++            fatal_error("AoE IV softfault attach requires this process's cooperative bootstrap\n");
++        x87_cooperative_handshake();
++        if (getenv("X87_SIDECAR_BOOTSTRAP")) fatal_error("AoE IV cooperative attach did not complete\n");
++    }
++#endif
+     load_wow64_ntdll( main_image_info.Machine );
+     load_apiset_dll();
+
+@@ -2816,8 +2959,14 @@
+      * notification to the reply port instead, which has a different id and
+      * size. */
+     memset( &rep, 0, sizeof(rep) );
+-    kr = mach_msg( &rep.reply.header, MACH_RCV_MSG, 0, sizeof(rep), reply,
+-                   MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL );
++#if defined(__x86_64__)
++    if (aoe_attaching)
++        kr = mach_msg( &rep.reply.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(rep), reply,
++                       30000, MACH_PORT_NULL );
++    else
++#endif
++        kr = mach_msg( &rep.reply.header, MACH_RCV_MSG, 0, sizeof(rep), reply,
++                       MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL );
+     if (verbose) ERR( "x87 coop: handshake reply kr=0x%x id=0x%x size=%u\n", kr,
+                       rep.reply.header.msgh_id, rep.reply.header.msgh_size );
+
+@@ -2846,6 +2995,14 @@
+     /* Destroy the reply port, so that a late reply finds no receiver. */
+     if (reply != MACH_PORT_NULL) mach_port_mod_refs( mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, -1 );
+     if (service != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), service );
++#if defined(__x86_64__)
++    if (aoe_attaching && (reason[0] || kr!=KERN_SUCCESS ||
++        rep.reply.header.msgh_id!=X87_COOP_MSGH_ID+1 ||
++        rep.reply.header.msgh_size!=sizeof(rep.reply) ||
++        !rep.reply.icache_addr[0] || !rep.reply.icache_len[0] ||
++        !rep.reply.icache_addr[1] || !rep.reply.icache_len[1]))
++        fatal_error("AoE4 cooperative attach failed: %s (%x)\n",reason,kr);
++#endif
+     if (reason[0]) x87_coop_unhooked( reason );
+     unsetenv( X87_COOP_ENV );
+ }
+@@ -2857,18 +3014,126 @@
+  *
+  * Main entry point called by the wine loader.
+  */
++#if defined(__APPLE__) && defined(__x86_64__)
++/* Re-enter the x64 Wine loader through the pinned AoE-aware helper. */
++static void aoe_exec_sidecar(const char *sidecar, const char *loader, int argc, char **argv)
++{
++    char **args;
++    unsigned int i;
++    args=calloc(argc+3,sizeof(*args));
++    if (!args) fatal_error("cannot allocate software fault launch arguments\n");
++    args[0]=(char *)sidecar;args[1]="--cooperative";args[2]=(char *)loader;
++    for(i=1;i<argc;i++)args[i+2]=argv[i];
++    /* The sidecar exec discards Wine preloader reservations. Re-enter the
++     * normal preloader before server initialization, including Steam children. */
++    unsetenv("WINELOADERNOEXEC");
++    execv(sidecar,args);
++    fatal_error("cannot launch software fault translator: %s\n",strerror(errno));
++}
++
++static int aoe_open_game_argument(const char *argument)
++{
++    char path[4096], *tail;
++    size_t i;
++    if (strlen(argument)>=sizeof(path)) return -1;
++    if (argument[0] && argument[1]==':' && (argument[2]=='/' || argument[2]=='\\'))
++    {
++        if (snprintf(path,sizeof(path),"%s/dosdevices/%c:%s",config_dir,
++                     tolower((unsigned char)argument[0]),argument+2)>=(int)sizeof(path)) return -1;
++    }
++    else strcpy(path,argument);
++    for (tail=path; *tail; ++tail) if (*tail=='\\') *tail='/';
++    i=strlen(path);
++    if (!i) return -1;
++    return open(path,O_RDONLY);
++}
++
++static void aoe_reexec_sidecar(int argc, char **argv)
++{
++    const char *loader=getenv("WINELOADER");
++    char *root, *sidecar;
++    struct stat st;
++    char digest[65], address[32];
++    struct aoe_image_layout image;
++    int fd, ok;
++    if (aoe_attaching || argc<2 || !aoe_game_name(argv[1]) || !aoe_patch_requested()) return;
++    if (!aoe_rosetta_supported())
++    {
++        WARN("AoE4 hooks require Rosetta on macOS 26 or newer\n");
++        return;
++    }
++    if (!loader) loader=wineloader; /* init_paths resolved the engine's own loader */
++    if (!loader || loader[0]!='/' || access(loader,X_OK))
++        fatal_error("AoE4 loader must be an absolute executable path\n");
++    fd=aoe_open_game_argument(argv[1]);
++    ok=fd>=0 && aoe_inspect_game(fd,digest,&image);
++    if (fd>=0) close(fd);
++    if (!ok)
++    {
++        ERR("AoE4 executable could not be verified; continuing with the stock Wine launch\n");
++        return;
++    }
++    /* init_paths resolved this ntdll from the selected Highball engine. */
++    root = remove_tail(ntdll_dir, "/engine/lib/wine/x86_64-unix");
++    if (!root) fatal_error("cannot locate the Highball engine for the AoE IV fix\n");
++    sidecar = build_path(root, "x87sidecar/x87sidecar");
++    free(root);
++    if (stat(sidecar, &st) || !S_ISREG(st.st_mode) || access(sidecar, X_OK))
++        fatal_error("AoE IV needs the engine helper at %s; reinstall this engine\n", sidecar);
++    setenv("AOE4_EXPECTED_SHA256",digest,1);
++    setenv("AOELAB_SOFTFAULT_BRIDGE","1",1);
++    snprintf(address,sizeof(address),"0x%llx",(unsigned long long)image.text_start);
++    setenv("AOE_SOFTFAULT_PC",address,1);
++    snprintf(address,sizeof(address),"0x%llx",(unsigned long long)image.text_end);
++    setenv("AOE_SOFTFAULT_END",address,1);
++    setenv("AOE_SOFTFAULT_TARGET1","0x180000000",1);
++    setenv("AOE_SOFTFAULT_TARGET","0x180000010",1);
++    if (getenv("AOE4_X87") && !strcmp(getenv("AOE4_X87"),"0")) setenv("X87_ALWAYS_NONE","1",1);
++    else unsetenv("X87_ALWAYS_NONE"); /* the packaged decoder composes both paths */
++    ERR("AoE4 verified executable: SHA256 %s, softfault end %s, combined x87 enabled\n",digest,address);
++    aoe_exec_sidecar(sidecar,loader,argc,argv);
++}
++
++static void aoe_init_bootstrap(int argc, char **argv)
++{
++    static const char *const names[] = { "AOELAB_SOFTFAULT_BRIDGE", "AOE_SOFTFAULT_PC",
++        "AOE_SOFTFAULT_END", "AOE_SOFTFAULT_TARGET1", "AOE_SOFTFAULT_TARGET", "X87_ALWAYS_NONE", "AOE4_EXPECTED_SHA256" };
++    unsigned int i;
++    if (!getenv("AOELAB_SOFTFAULT_BRIDGE")) return;
++    if (argc>1 && aoe_game_name(argv[1]) && aoe_patch_requested() && aoe_rosetta_supported() &&
++        aoe_bootstrap_is_current(getenv("X87_SIDECAR_BOOTSTRAP")))
++    {
++        aoe_attaching=TRUE;
++        return;
++    }
++    /* A Windows child can inherit the parent game's Unix environment. */
++    for (i=0; i<ARRAY_SIZE(names); i++) unsetenv(names[i]);
++    if (!aoe_bootstrap_is_current(getenv("X87_SIDECAR_BOOTSTRAP"))) unsetenv("X87_SIDECAR_BOOTSTRAP");
++}
++
++#endif
++
+ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
+ {
+     main_argc = argc;
+     main_argv = argv;
++#if defined(__APPLE__) && defined(__x86_64__)
++    aoe_init_bootstrap(argc,argv);
++#endif
+
+ #ifdef __APPLE__
+     /* CW HACK: if we were launched under `x87sidecar --cooperative`, hand our
+      * task port to the sidecar and wait for its x87 JIT hook before running. */
+-    x87_cooperative_handshake();
++#if defined(__x86_64__)
++    if (!aoe_attaching)
++#endif
++        x87_cooperative_handshake();
+ #endif
+
+     init_paths();
++#if defined(__APPLE__) && defined(__x86_64__)
++    aoe_reexec_sidecar(argc,argv);
++#endif
+     if (!getenv( "WINELOADERNOEXEC" ) || argc <= 1) check_command_line( argc, argv );
+     unsetenv( "WINELOADERNOEXEC" );
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -866,6 +870,26 @@
+ }
+
+
++#ifdef __APPLE__
++#include "aoe_code_cache.h"
++#else
++static inline uint64_t aoe_cache_logical_pc(uint64_t pc) { return pc; }
++static inline uint64_t aoe_cache_target(uint64_t pc) { return pc; }
++#endif
++
++NTSTATUS aoe_exception_context(void *args)
++{
++    CONTEXT *context = args;
++    struct amd64_thread_data *data = amd64_thread_data();
++    context->SegCs = cs64_sel;
++    context->SegSs = context->SegDs = context->SegEs = context->SegGs = ds64_sel;
++    context->SegFs = data->fs;
++    context->Dr0 = data->dr0; context->Dr1 = data->dr1;
++    context->Dr2 = data->dr2; context->Dr3 = data->dr3;
++    context->Dr6 = data->dr6; context->Dr7 = data->dr7;
++    return STATUS_SUCCESS;
++}
++
+ static inline void set_sigcontext( const CONTEXT *context, ucontext_t *sigcontext )
+ {
+     RAX_sig(sigcontext) = context->Rax;
+@@ -984,7 +1008,7 @@
+     context->R13    = R13_sig(sigcontext);
+     context->R14    = R14_sig(sigcontext);
+     context->R15    = R15_sig(sigcontext);
+-    context->Rip    = RIP_sig(sigcontext);
++    context->Rip    = aoe_cache_logical_pc(RIP_sig(sigcontext));
+     context->SegCs  = CS_sig(sigcontext);
+     context->SegFs  = FS_sig(sigcontext);
+     context->EFlags = EFL_sig(sigcontext);
+@@ -1118,6 +1142,7 @@
+  */
+ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+ {
++
+     NTSTATUS ret = STATUS_SUCCESS;
+     DWORD flags = context->ContextFlags & ~CONTEXT_AMD64;
+     BOOL self = (handle == GetCurrentThread());
+@@ -1190,7 +1215,7 @@
+     if (flags & CONTEXT_CONTROL)
+     {
+         frame->rsp    = context->Rsp;
+-        frame->rip    = context->Rip;
++        frame->rip    = aoe_cache_target(context->Rip);
+         frame->eflags = context->EFlags;
+     }
+     if (flags & CONTEXT_FLOATING_POINT)
+@@ -1256,7 +1281,7 @@
+     if (needed_flags & CONTEXT_CONTROL)
+     {
+         context->Rsp    = frame->rsp;
+-        context->Rip    = frame->rip;
++        context->Rip    = aoe_cache_logical_pc(frame->rip);
+         context->EFlags = frame->eflags;
+         context->SegCs  = cs64_sel;
+         context->SegSs  = ds64_sel;
+@@ -1664,7 +1689,7 @@
+ {
+     struct xcontext context;
+
+-    rec->ExceptionAddress = (void *)RIP_sig(sigcontext);
++    rec->ExceptionAddress = (void *)aoe_cache_logical_pc(RIP_sig(sigcontext));
+     save_context( &context, sigcontext );
+     setup_raise_exception( sigcontext, rec, &context );
+ }
+@@ -2420,7 +2445,7 @@
+     extern const void *__wine_syscall_dispatcher_gs_load_ptr;
+     extern const void *__wine_unix_call_dispatcher_gs_load_ptr;
+
+-    const void *rip = (void *)RIP_sig(ucontext);
++    const void *rip = (void *)aoe_cache_logical_pc(RIP_sig(ucontext));
+     BYTE instr[16];
+     unsigned int i, len, prefix_count = 0;
+     TEB *teb = NtCurrentTeb();
+@@ -2537,17 +2562,46 @@
+  *
+  * Handler for SIGSEGV and related errors.
+  */
++
++#ifdef __APPLE__
++/* Only this exact load instruction may recover without touching Wine's VM
++ * metadata. An exception in the game or anywhere else follows the stock path. */
++__ASM_GLOBAL_FUNC( aoe_nofault_copy,
++                   "movq %rdx,%rcx\n\t"
++                   "L_aoe_nofault_load:\n\t"
++                   "rep movsb\n\t"
++                   "movl $1,%eax\n\t"
++                   "ret\n\t"
++                   "L_aoe_nofault_failed:\n\t"
++                   "xorl %eax,%eax\n\t"
++                   "ret" )
++#endif
++
+ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     ucontext_t *ucontext = init_handler( sigcontext );
+     EXCEPTION_RECORD rec = { 0 };
+     struct xcontext context;
++#ifdef __APPLE__
++    ULONG_PTR copy_pc, failed_pc;
++#endif
+
+ #ifdef __APPLE__
+     if (foreign_thread_fault( signal, TRUE )) return;
+ #endif
+
+-    rec.ExceptionAddress = (void *)RIP_sig(ucontext);
++#ifdef __APPLE__
++    __asm__ volatile( "leaq L_aoe_nofault_load(%%rip),%0" : "=r"(copy_pc) );
++    if ((signal == SIGSEGV || signal == SIGBUS) && RIP_sig(ucontext) == copy_pc)
++    {
++        __asm__ volatile( "leaq L_aoe_nofault_failed(%%rip),%0" : "=r"(failed_pc) );
++        RIP_sig(ucontext) = failed_pc;
++        leave_handler( ucontext );
++        return;
++    }
++#endif
++
++    rec.ExceptionAddress = (void *)aoe_cache_logical_pc(RIP_sig(ucontext));
+     save_context( &context, ucontext );
+
+     switch(TRAP_sig(ucontext))
+@@ -2649,7 +2703,7 @@
+
+     if (handle_syscall_trap( ucontext, siginfo )) return;
+
+-    rec.ExceptionAddress = (void *)RIP_sig(ucontext);
++    rec.ExceptionAddress = (void *)aoe_cache_logical_pc(RIP_sig(ucontext));
+     save_context( &context, ucontext );
+
+     switch (TRAP_sig(ucontext))
+@@ -2678,7 +2732,7 @@
+ static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     ucontext_t *ucontext = init_handler( sigcontext );
+-    EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(ucontext) };
++    EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)aoe_cache_logical_pc(RIP_sig(ucontext)) };
+     struct xcontext context;
+
+ #ifdef __APPLE__
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -308,6 +308,10 @@
+ extern BOOL virtual_check_buffer_for_read( const void *ptr, SIZE_T size );
+ extern BOOL virtual_check_buffer_for_write( void *ptr, SIZE_T size );
+ extern SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T size );
++#if defined(__APPLE__) && defined(__x86_64__)
++extern SIZE_T virtual_read_aoe_fragment( const void *ring_address, UINT_PTR pc, UINT_PTR *ring, BYTE *bytes );
++extern BOOL aoe_nofault_copy( void *dst, const void *src, SIZE_T length );
++#endif
+ extern NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZE_T size );
+ extern void virtual_set_force_exec( BOOL enable );
+ extern void virtual_enable_write_exceptions( BOOL enable );
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -170,6 +170,45 @@
+ static struct wine_rb_tree views_tree;
+ static pthread_mutex_t virtual_mutex;
+
++#if defined(__APPLE__) && defined(__x86_64__)
++static BOOL aoe_vm_tracking;
++static UINT64 aoe_vm_epoch;
++static __thread unsigned aoe_vm_depth;
++#endif
++
++/* Keep the epoch odd for the entire outermost VM critical section, including
++ * protection changes made by signal handlers. Never retain file_view pointers. */
++static void lock_virtual(void)
++{
++    mutex_lock( &virtual_mutex );
++#if defined(__APPLE__) && defined(__x86_64__)
++    if (aoe_vm_tracking && !aoe_vm_depth++)
++        __atomic_add_fetch( &aoe_vm_epoch, 1, __ATOMIC_ACQ_REL );
++#endif
++}
++
++static void unlock_virtual(void)
++{
++#if defined(__APPLE__) && defined(__x86_64__)
++    if (aoe_vm_tracking && !--aoe_vm_depth)
++        __atomic_add_fetch( &aoe_vm_epoch, 1, __ATOMIC_RELEASE );
++#endif
++    mutex_unlock( &virtual_mutex );
++}
++
++static void enter_virtual_section(sigset_t *sigset)
++{
++    pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
++    lock_virtual();
++}
++
++static void leave_virtual_section(sigset_t *sigset)
++{
++    unlock_virtual();
++    pthread_sigmask( SIG_SETMASK, sigset, NULL );
++}
++
++
+ static const UINT page_shift = 12;
+ static const UINT_PTR page_mask = 0xfff;
+ static const UINT_PTR granularity_mask = 0xffff;
+@@ -819,7 +858,7 @@
+     void *ret = NULL;
+     struct builtin_module *builtin;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+     {
+         if (builtin->module != module) continue;
+@@ -827,7 +866,7 @@
+         if (ret) builtin->refcount++;
+         break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+
+@@ -842,7 +881,7 @@
+     NTSTATUS status = STATUS_DLL_NOT_FOUND;
+     struct builtin_module *builtin;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+     {
+         if (builtin->module != module) continue;
+@@ -859,7 +898,7 @@
+         }
+         break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -873,7 +912,7 @@
+     NTSTATUS status = STATUS_SUCCESS;
+     struct builtin_module *builtin;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+     {
+         if (builtin->module != module) continue;
+@@ -881,7 +920,7 @@
+         else status = STATUS_IMAGE_ALREADY_LOADED;
+         break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -1417,12 +1456,12 @@
+     struct file_view *view;
+
+     TRACE( "Dump of all virtual memory views:\n" );
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+     {
+         dump_view( view );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ }
+ #endif
+
+@@ -3419,7 +3458,7 @@
+         SERVER_END_REQ;
+     }
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     status = map_image_view( &view, image_info, size, limit_low, limit_high, alloc_type );
+     if (status) goto done;
+@@ -3456,7 +3495,7 @@
+     else delete_view( view );
+
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     if (needs_close) close( unix_fd );
+     if (shared_needs_close) close( shared_fd );
+     return status;
+@@ -3563,7 +3602,7 @@
+
+     if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
+     if (res) goto done;
+@@ -3597,7 +3636,7 @@
+     else delete_view( view );
+
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     if (needs_close) close( unix_handle );
+     return res;
+ }
+@@ -3650,6 +3689,21 @@
+     int i;
+     pthread_mutexattr_t attr;
+
++#if defined(__APPLE__) && defined(__x86_64__)
++    /* Set before guest threads exist. Actual reads also require the verified
++     * AoE profile/ring checks in aoe_code_cache.h. */
++    if (getenv( "HB_AOE4" ) && !strcmp( getenv( "HB_AOE4" ), "1" ))
++    {
++        const char *name, *slash;
++        for (i = 0; i < main_argc && i < 2; ++i)
++        {
++            name = main_argv[i];
++            if ((slash = strrchr( name, '/' ))) name = slash + 1;
++            if ((slash = strrchr( name, '\\' ))) name = slash + 1;
++            if (!strcasecmp( name, "RelicCardinal.exe" )) aoe_vm_tracking = TRUE;
++        }
++    }
++#endif
+     pthread_mutexattr_init( &attr );
+     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
+     pthread_mutex_init( &virtual_mutex, &attr );
+@@ -3872,7 +3926,7 @@
+     void *base = wine_server_get_ptr( info->base );
+     int i;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     status = create_view( &view, base, size, SEC_IMAGE | SEC_FILE | VPROT_SYSTEM |
+                           VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY | VPROT_EXEC );
+     if (!status)
+@@ -3909,7 +3963,7 @@
+         }
+         else delete_view( view );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+
+     return status;
+ }
+@@ -4083,7 +4137,7 @@
+     NTSTATUS status = STATUS_SUCCESS;
+     SIZE_T block_size = signal_stack_mask + 1;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (next_free_teb)
+     {
+         ptr = next_free_teb;
+@@ -4099,7 +4153,7 @@
+             if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, user_space_wow_limit,
+                                                    &total, MEM_RESERVE, PAGE_READWRITE )))
+             {
+-                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++                leave_virtual_section( &sigset );
+                 return status;
+             }
+             teb_block = ptr;
+@@ -4116,7 +4170,7 @@
+         *(void **)ptr = next_free_teb;
+         next_free_teb = ptr;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -4155,14 +4209,14 @@
+         NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
+     }
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     signal_free_thread( teb );
+     list_remove( &thread_data->entry );
+     ptr = teb;
+     if (!is_win64) ptr = (char *)ptr - teb_offset;
+     *(void **)ptr = next_free_teb;
+     next_free_teb = ptr;
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ }
+
+
+@@ -4271,10 +4325,10 @@
+     if (is_win64 && !is_wow64()) return STATUS_NOT_IMPLEMENTED;
+     if (sel1 >> 16 || sel2 >> 16) return STATUS_INVALID_LDT_DESCRIPTOR;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (sel1) ldt_update_entry( sel1, entry1 );
+     if (sel2) ldt_update_entry( sel2, entry2 );
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return STATUS_SUCCESS;
+ }
+
+@@ -4302,7 +4356,7 @@
+
+     if (index < TLS_MINIMUM_AVAILABLE)
+     {
+-        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++        enter_virtual_section( &sigset );
+         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
+         {
+             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+@@ -4313,14 +4367,14 @@
+ #endif
+             teb->TlsSlots[index] = 0;
+         }
+-        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++        leave_virtual_section( &sigset );
+     }
+     else
+     {
+         index -= TLS_MINIMUM_AVAILABLE;
+         if (index >= 8 * sizeof(peb->TlsExpansionBitmapBits)) return STATUS_INVALID_PARAMETER;
+
+-        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++        enter_virtual_section( &sigset );
+         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
+         {
+             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+@@ -4335,7 +4389,7 @@
+ #endif
+             if (teb->TlsExpansionSlots) teb->TlsExpansionSlots[index] = 0;
+         }
+-        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++        leave_virtual_section( &sigset );
+     }
+     return STATUS_SUCCESS;
+ }
+@@ -4359,7 +4413,7 @@
+     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */
+     size = ROUND_SIZE( 0, size, granularity_mask );
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
+                        limit_low, limit_high, 0 );
+@@ -4386,7 +4440,7 @@
+     stack->StackBase = (char *)view->base + view->size;
+     stack->StackLimit = (char *)view->base + (guard_page ? 2 * host_page_size : 0);
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -4550,7 +4604,7 @@
+     char *page = ROUND_ADDR( addr, host_page_mask );
+     BYTE vprot;
+
+-    mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
++    lock_virtual();  /* no need for signal masking inside signal handler */
+     vprot = get_host_page_vprot( page );
+
+ #ifdef __APPLE__
+@@ -4621,7 +4675,7 @@
+ #ifdef __APPLE__
+ done:
+ #endif
+-    mutex_unlock( &virtual_mutex );
++    unlock_virtual();
+     rec->ExceptionCode = ret;
+     return ret;
+ }
+@@ -4661,13 +4715,13 @@
+     else if (stack < stack_info.limit)
+     {
+         char *page = ROUND_ADDR( stack, host_page_mask );
+-        mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
++        lock_virtual();  /* no need for signal masking inside signal handler */
+         if ((get_host_page_vprot( page ) & VPROT_GUARD) && grow_thread_stack( page, &stack_info ))
+         {
+             rec->ExceptionCode = STATUS_STACK_OVERFLOW;
+             rec->NumberParameters = 0;
+         }
+-        mutex_unlock( &virtual_mutex );
++        unlock_virtual();
+     }
+ #if defined(VALGRIND_MAKE_MEM_UNDEFINED)
+     VALGRIND_MAKE_MEM_UNDEFINED( stack, size );
+@@ -4716,14 +4770,14 @@
+
+     if (!size) return wine_server_call( req_ptr );
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!(ret = check_write_access( addr, size, &has_write_watch )))
+     {
+         ret = server_call_unlocked( req );
+         if (has_write_watch) update_write_watches( addr, size, wine_server_reply_size( req ));
+     }
+     else memset( &req->u.reply, 0, sizeof(req->u.reply) );
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+
+@@ -4740,14 +4794,14 @@
+     ssize_t ret = read( fd, addr, size );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!check_write_access( addr, size, &has_write_watch ))
+     {
+         ret = read( fd, addr, size );
+         err = errno;
+         if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     errno = err;
+     return ret;
+ }
+@@ -4765,14 +4819,14 @@
+     ssize_t ret = pread( fd, addr, size, offset );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!check_write_access( addr, size, &has_write_watch ))
+     {
+         ret = pread( fd, addr, size, offset );
+         err = errno;
+         if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     errno = err;
+     return ret;
+ }
+@@ -4791,7 +4845,7 @@
+     ssize_t ret = recvmsg( fd, hdr, flags );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     for (i = 0; i < hdr->msg_iovlen; i++)
+         if (check_write_access( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, &has_write_watch ))
+             break;
+@@ -4803,7 +4857,7 @@
+     if (has_write_watch)
+         while (i--) update_write_watches( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, 0 );
+
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     errno = err;
+     return ret;
+ }
+@@ -4818,10 +4872,10 @@
+     BOOL ret = FALSE;
+     sigset_t sigset;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if ((view = find_view( addr, size )))
+         ret = !(view->protect & VPROT_SYSTEM);  /* system views are not visible to the app */
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+
+@@ -4890,6 +4944,30 @@
+     }
+     __ENDTRY
+     return TRUE;
++}
++
++
++static SIZE_T read_memory_locked( const void *addr, void *buffer, SIZE_T size )
++{
++    struct file_view *view;
++    SIZE_T bytes_read = 0;
++
++    if ((view = find_view( addr, size )))
++    {
++        if (!(view->protect & VPROT_SYSTEM))
++        {
++            while (bytes_read < size && (get_unix_prot( get_host_page_vprot( addr )) & PROT_READ))
++            {
++                SIZE_T block_size = min( size - bytes_read, host_page_size - ((UINT_PTR)addr & host_page_mask) );
++                memcpy( buffer, addr, block_size );
++
++                addr   = (const void *)((const char *)addr + block_size);
++                buffer = (void *)((char *)buffer + block_size);
++                bytes_read += block_size;
++            }
++        }
++    }
++    return bytes_read;
+ }
+
+
+@@ -4902,31 +4980,153 @@
+  */
+ SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T size )
+ {
+-    struct file_view *view;
++    SIZE_T bytes_read;
+     sigset_t sigset;
+-    SIZE_T bytes_read = 0;
+
+     if (!size) return 0;
+-
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+-    if ((view = find_view( addr, size )))
+-    {
+-        if (!(view->protect & VPROT_SYSTEM))
+-        {
+-            while (bytes_read < size && (get_unix_prot( get_host_page_vprot( addr )) & PROT_READ))
+-            {
+-                SIZE_T block_size = min( size - bytes_read, host_page_size - ((UINT_PTR)addr & host_page_mask) );
+-                memcpy( buffer, addr, block_size );
+-
+-                addr   = (const void *)((const char *)addr + block_size);
+-                buffer = (void *)((char *)buffer + block_size);
+-                bytes_read += block_size;
+-            }
+-        }
+-    }
++    bytes_read = read_memory_locked( addr, buffer, size );
+     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+     return bytes_read;
+ }
++
++
++#if defined(__APPLE__) && defined(__x86_64__)
++/* Keep the ring and fragment reads in one VM section. The VM lock protects
++ * mappings, so sample the bytes twice to detect concurrent game writes. */
++static SIZE_T read_aoe_fragment_locked( const void *ring_address, UINT_PTR pc, UINT_PTR *ring, BYTE *bytes )
++{
++    static const UINT_PTR ring_size = 0x1000000;
++    BYTE check[32];
++    UINT_PTR current_ring;
++    SIZE_T length = 0;
++    sigset_t sigset;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    if (read_memory_locked( ring_address, ring, sizeof(*ring) ) == sizeof(*ring) &&
++        *ring && !(*ring & 31) && *ring <= ~(UINT_PTR)0 - ring_size &&
++        pc >= *ring && pc - *ring < ring_size)
++    {
++        length = sizeof(check) - (pc - *ring) % sizeof(check);
++        if (read_memory_locked( (const void *)pc, bytes, length ) != length)
++            length = 0;
++        else
++        {
++            __atomic_signal_fence( __ATOMIC_SEQ_CST );
++            /* The successful read validated this range under the same VM lock. */
++            memcpy( check, (const void *)pc, length );
++            if (memcmp( bytes, check, length ) ||
++                read_memory_locked( ring_address, &current_ring, sizeof(current_ring) ) != sizeof(current_ring) ||
++                current_ring != *ring) length = 0;
++        }
++    }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    return length;
++}
++#ifdef __APPLE__
++/* Each cached range was checked while holding the VM lock. No view pointers
++ * survive unlocking. VM critical sections conservatively invalidate the epoch;
++ * only the audited read-only snapshot helpers bypass it. A fault at our private
++ * copy instruction returns failure before Wine can consume PAGE_GUARD. */
++struct aoe_validated_page
++{
++    UINT64 epoch;
++    UINT_PTR pointer_address, ring, page;
++    BOOL valid;
++};
++static __thread struct aoe_validated_page aoe_page;
++static __thread volatile sig_atomic_t aoe_read_busy;
++
++static BOOL aoe_page_readable( UINT_PTR address )
++{
++    struct file_view *view = find_view( (const void *)address, host_page_size );
++    return view && !(view->protect & VPROT_SYSTEM) &&
++           (get_unix_prot( get_host_page_vprot( (const void *)address )) & PROT_READ);
++}
++
++SIZE_T virtual_read_aoe_fragment( const void *pointer, UINT_PTR pc, UINT_PTR *ring, BYTE *bytes )
++{
++    UINT_PTR observed, check_ring;
++    UINT64 epoch;
++    SIZE_T length = 0;
++    BYTE check[32];
++    sigset_t sigset;
++
++    if (!aoe_vm_tracking || aoe_read_busy)
++        return read_aoe_fragment_locked( pointer, pc, ring, bytes );
++    aoe_read_busy = 1;
++    __atomic_signal_fence( __ATOMIC_SEQ_CST );
++    epoch = __atomic_load_n( &aoe_vm_epoch, __ATOMIC_ACQUIRE );
++    if (!(epoch & 1) && aoe_page.valid && aoe_page.epoch == epoch &&
++        aoe_page.pointer_address == (UINT_PTR)pointer &&
++        aoe_nofault_copy( &observed, pointer, sizeof(observed) ) && observed == aoe_page.ring)
++    {
++        if (pc < observed || pc - observed >= 0x1000000)
++        {
++            __atomic_thread_fence( __ATOMIC_ACQUIRE );
++            if (__atomic_load_n( &aoe_vm_epoch, __ATOMIC_ACQUIRE ) == epoch)
++            {
++                *ring = observed;
++                aoe_read_busy = 0;
++                return 0;
++            }
++        }
++        length = 32 - (pc - observed) % 32;
++        if (aoe_page.page == (pc & ~host_page_mask) && pc >= observed && pc - observed < 0x1000000 &&
++            aoe_nofault_copy( bytes, (const void *)pc, length ) &&
++            aoe_nofault_copy( check, (const void *)pc, length ) &&
++            aoe_nofault_copy( &check_ring, pointer, sizeof(check_ring) ) &&
++            check_ring == observed && !memcmp( bytes, check, length ))
++        {
++            __atomic_thread_fence( __ATOMIC_ACQUIRE );
++            if (__atomic_load_n( &aoe_vm_epoch, __ATOMIC_ACQUIRE ) == epoch)
++            {
++                *ring = observed;
++                aoe_read_busy = 0;
++                return length;
++            }
++        }
++    }
++    length = 0;
++    /* Read-only scope: the writer wrappers cannot run concurrently with it. */
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    if (read_memory_locked( pointer, ring, sizeof(*ring) ) == sizeof(*ring) &&
++        *ring && !(*ring & 31) && *ring <= ~(UINT_PTR)0 - 0x1000000 &&
++        pc >= *ring && pc - *ring < 0x1000000)
++    {
++        length = 32 - (pc - *ring) % 32;
++        if (read_memory_locked( (const void *)pc, bytes, length ) != length)
++            length = 0;
++        else
++        {
++            __atomic_signal_fence( __ATOMIC_SEQ_CST );
++            memcpy( check, (const void *)pc, length );
++            if (memcmp( bytes, check, length ) ||
++                read_memory_locked( pointer, &check_ring, sizeof(check_ring) ) != sizeof(check_ring) ||
++                check_ring != *ring) length = 0;
++        }
++        if (length && !aoe_vm_depth && aoe_page_readable( pc & ~host_page_mask ))
++        {
++            aoe_page.epoch = __atomic_load_n( &aoe_vm_epoch, __ATOMIC_ACQUIRE );
++            aoe_page.pointer_address = (UINT_PTR)pointer;
++            aoe_page.ring = *ring;
++            aoe_page.page = pc & ~host_page_mask;
++            aoe_page.valid = TRUE;
++        }
++    }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    __atomic_signal_fence( __ATOMIC_SEQ_CST );
++    aoe_read_busy = 0;
++    return length;
++}
++#else
++SIZE_T virtual_read_aoe_fragment( const void *pointer, UINT_PTR pc, UINT_PTR *ring, BYTE *bytes )
++{
++    return read_aoe_fragment_locked( pointer, pc, ring, bytes );
++}
++#endif
++
++#endif
+
+
+ /***********************************************************************
+@@ -4944,13 +5144,13 @@
+
+     if (!size) return STATUS_SUCCESS;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!(ret = check_write_access( addr, size, &has_write_watch )))
+     {
+         memcpy( addr, buffer, size );
+         if (has_write_watch) update_write_watches( addr, size, size );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+
+@@ -4965,7 +5165,7 @@
+     struct file_view *view;
+     sigset_t sigset;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!force_exec_prot != !enable)  /* change all existing views */
+     {
+         force_exec_prot = enable;
+@@ -4978,7 +5178,7 @@
+             mprotect_range( view->base, view->size, commit, 0 );
+         }
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ }
+
+
+@@ -4990,7 +5190,7 @@
+     struct file_view *view;
+     sigset_t sigset;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!enable_write_exceptions && enable)  /* change all existing views */
+     {
+         WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+@@ -4998,7 +5198,7 @@
+                 mprotect_range( view->base, view->size, 0, 0 );
+     }
+     enable_write_exceptions = enable;
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+ }
+
+
+@@ -5187,7 +5387,7 @@
+
+     /* Reserve the memory */
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     if ((type & MEM_RESERVE) || !base)
+     {
+@@ -5241,7 +5441,7 @@
+
+     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+
+     if (status == STATUS_SUCCESS)
+     {
+@@ -5495,7 +5695,7 @@
+     if (size) size = ROUND_SIZE( addr, size, page_mask );
+     base = ROUND_ADDR( addr, page_mask );
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     /* avoid freeing the DOS area when a broken app passes a NULL pointer */
+     if (!base)
+@@ -5540,7 +5740,7 @@
+         *addr_ptr = base;
+         *size_ptr = size;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -5595,7 +5795,7 @@
+     size = ROUND_SIZE( addr, size, page_mask );
+     base = ROUND_ADDR( addr, page_mask );
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     if ((view = find_view( base, size )))
+     {
+@@ -5621,7 +5821,7 @@
+
+     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+
+     if (status == STATUS_SUCCESS)
+     {
+@@ -5722,7 +5922,7 @@
+
+     /* Find the view containing the address */
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     view = get_memory_region_size( base, &alloc_base, &alloc_end, &fake_reserved );
+
+     /* Fill the info structure */
+@@ -5762,7 +5962,7 @@
+         else if (view->protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) info->Type = MEM_MAPPED;
+         else info->Type = MEM_PRIVATE;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+
+     return STATUS_SUCCESS;
+ }
+@@ -5834,7 +6034,7 @@
+
+     if (is_beyond_limit( base, 1, working_set_limit )) return STATUS_INVALID_PARAMETER;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     if ((view = get_memory_region_size( base, &region_start, &region_end, &fake_reserved )))
+     {
+@@ -5861,7 +6061,7 @@
+     {
+         if (!fake_reserved)
+         {
+-            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++            leave_virtual_section( &sigset );
+             return STATUS_INVALID_ADDRESS;
+         }
+         info->AllocationBase = region_start;
+@@ -5871,7 +6071,7 @@
+         info->CommitSize = 0;
+     }
+
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+
+     if (res_len) *res_len = sizeof(*info);
+     return STATUS_SUCCESS;
+@@ -6063,7 +6263,7 @@
+     start = ref[0].addr;
+     end = ref[count - 1].addr + page_size;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     init_fill_working_set_info_data( &data, end );
+
+     view = find_view_range( start, end - start );
+@@ -6094,7 +6294,7 @@
+
+     free_fill_working_set_info_data( &data );
+     if (ref != ref_buffer) free( ref );
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+
+     if (res_len)
+         *res_len = len;
+@@ -6475,7 +6675,7 @@
+         return status;
+     }
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!(view = find_view( addr, 0 )) || is_view_valloc( view )) goto done;
+
+     if (flags & MEM_PRESERVE_PLACEHOLDER && !(view->protect & VPROT_PLACEHOLDER))
+@@ -6494,7 +6694,7 @@
+             {
+                 TRACE( "not freeing in-use builtin %p\n", view->base );
+                 builtin->refcount--;
+-                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++                leave_virtual_section( &sigset );
+                 return STATUS_SUCCESS;
+             }
+         }
+@@ -6514,7 +6714,7 @@
+     }
+     else FIXME( "failed to unmap %p %x\n", view->base, status );
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -6666,7 +6866,7 @@
+         return result.virtual_flush.status;
+     }
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     if (!(view = find_view( addr, *size_ptr ))) status = STATUS_INVALID_PARAMETER;
+     else
+     {
+@@ -6677,7 +6877,7 @@
+             status = STATUS_NOT_MAPPED_DATA;
+ #endif
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -6704,7 +6904,7 @@
+     TRACE( "%p %x %p-%p %p %lu\n", process, flags, base, (char *)base + size,
+            addresses, *count );
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     if (is_write_watch_range( base, size ))
+     {
+@@ -6736,7 +6936,7 @@
+     }
+     else status = STATUS_INVALID_PARAMETER;
+
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -6757,14 +6957,14 @@
+
+     if (!size) return STATUS_INVALID_PARAMETER;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     if (is_write_watch_range( base, size ))
+         reset_write_watches( base, size );
+     else
+         status = STATUS_INVALID_PARAMETER;
+
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -6910,7 +7110,7 @@
+
+     TRACE("%p %p\n", addr1, addr2);
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+
+     view1 = find_view( addr1, 0 );
+     view2 = find_view( addr2, 0 );
+@@ -6934,7 +7134,7 @@
+         SERVER_END_REQ;
+     }
+
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return status;
+ }
+
+@@ -6976,7 +7176,7 @@
+     sigset_t sigset;
+     NTSTATUS ret = STATUS_SUCCESS;
+
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    enter_virtual_section( &sigset );
+     for (i = 0; i < count; i++)
+     {
+         void *base = ROUND_ADDR( addresses[i].VirtualAddress, page_mask );
+@@ -6992,7 +7192,7 @@
+         else if (set_page_vprot_exec_write_protect( base, size ))
+             mprotect_range( base, size, 0, 0 );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    leave_virtual_section( &sigset );
+     return ret;
+ }
+
+diff --git a/dlls/ntdll/unixlib.h b/dlls/ntdll/unixlib.h
+--- a/dlls/ntdll/unixlib.h
++++ b/dlls/ntdll/unixlib.h
+@@ -84,6 +84,7 @@
+     unix_system_time_precise,
+ #if defined(__x86_64__)
+     unix_pe_module_loaded,
++    unix_aoe_exception_context,
+ #endif
+ };
+

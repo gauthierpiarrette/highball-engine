@@ -19,9 +19,9 @@
   },
   "x87sidecar": {
     "repo": "https://github.com/athei/x87sidecar",
-    "tag": "v1.9.0",
-    "commit": "0b7c5e54dad37f6ed8374b91443e2d2083652452",
+    "tag": "v1.9.1",
+    "commit": "03581e1b5e8465c9e78cea7c20652736a0e02f0a",
     "license": "MIT",
-    "note": "athei's x87sidecar, built from source for the Wine 11 engines; Wine's side (cooperative attach, ROSETTA_X87_PATH) is patches/0012 since r12."
+    "note": "Shared engine helper for ordinary x87 translation and the opt-in AoE IV decoder. The workflow applies x87sidecar/patches in order."
   }
 }

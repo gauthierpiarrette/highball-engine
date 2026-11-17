@@ -15,17 +15,18 @@ Simulator 2024), and to nothing else.
 
 ## Patches at a glance
 
-102 patches across five folders. Each folder's README starts with a table, one line per
+136 patches across six folders. Each folder's README starts with a table, one line per
 patch: what it fixes, the game or program that needed it, what kind of change it is, and where it
 stands upstream. The paragraphs under each table give the details and the measurements.
 
 | Folder | Patches | On top of | Engine line |
 |---|---|---|---|
-| [`patches/`](patches/) | 24 | CodeWeavers' CrossOver 26.3 Wine source | Intel (Wine 11, `x64-crossover26.3-r*`) |
-| [`patches-arm64/`](patches-arm64/) | 25 | WineHQ Wine 11.18 | arm64 |
-| [`fex/patches/`](fex/patches/) | 23 | FEX 2610 | arm64 |
-| [`moltenvk-arm64/`](moltenvk-arm64/) | 16 + 4 | MoltenVK 1.4.2 and the SPIRV-Cross it pins | arm64 |
-| [`renderers-arm64/`](renderers-arm64/) | 7 + 3 | vkd3d-proton 3.0.1 and DXVK | arm64 |
+| [`patches/`](patches/) | 30 | CodeWeavers' CrossOver 26.3 Wine source | Intel (Wine 11, `x64-crossover26.3-r*`) |
+| [`x87sidecar/patches/`](x87sidecar/patches/) | 3 | x87sidecar v1.9.1 | Intel (Wine 11 on Rosetta) |
+| [`patches-arm64/`](patches-arm64/) | 34 | WineHQ Wine 11.18 | arm64 |
+| [`fex/patches/`](fex/patches/) | 34 | FEX 2610 | arm64 |
+| [`moltenvk-arm64/`](moltenvk-arm64/) | 17 + 4 | MoltenVK 1.4.2 and the SPIRV-Cross it pins | arm64 |
+| [`renderers-arm64/`](renderers-arm64/) | 10 + 1 + 3 | vkd3d-proton 3.0.1, dxil-spirv and DXVK | arm64 |
 
 The kinds used in the tables:
 
