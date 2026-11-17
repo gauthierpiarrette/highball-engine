@@ -21,8 +21,8 @@ stands upstream. The paragraphs under each table give the details and the measur
 
 | Folder | Patches | On top of | Engine line |
 |---|---|---|---|
-| [`patches/`](patches/) | 30, including [AoE IV](patches/0032-aoe4-rosetta-profile-cache.patch) | CodeWeavers' CrossOver 26.3 Wine source | Intel (Wine 11, `x64-crossover26.3-r*`) |
-| [`x87sidecar/patches/`](x87sidecar/patches/) | 3 ([SMC](x87sidecar/patches/0001-split-self-modifying-x87-runs.patch), [FILD](x87sidecar/patches/0002-keep-fild-m64-exact.patch), [AoE IV decoder](x87sidecar/patches/0003-aoe4-decoder.patch)) | x87sidecar v1.9.1 | Intel (Wine 11 on Rosetta) |
+| [`patches/`](patches/) | 30 | CodeWeavers' CrossOver 26.3 Wine source | Intel (Wine 11, `x64-crossover26.3-r*`) |
+| [`x87sidecar/patches/`](x87sidecar/patches/) | 3 | x87sidecar v1.9.1 | Intel (Wine 11 on Rosetta) |
 | [`patches-arm64/`](patches-arm64/) | 34 | WineHQ Wine 11.18 | arm64 |
 | [`fex/patches/`](fex/patches/) | 34 | FEX 2610 | arm64 |
 | [`moltenvk-arm64/`](moltenvk-arm64/) | 17 + 4 | MoltenVK 1.4.2 and the SPIRV-Cross it pins | arm64 |
