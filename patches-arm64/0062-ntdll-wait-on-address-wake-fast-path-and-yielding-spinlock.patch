@@ -1,0 +1,100 @@
+ntdll: a wake by address with nobody waiting skips the bucket lock, and the bucket spinlock yields.
+
+A live profile of Forza Horizon 6 on an M5 Max (2026-11-17) had six to eight of its job threads in a five-instruction
+loop of `ntdll.dll` most of the time: `spin_lock` in `RtlWakeAddressSingle`. `RtlWaitOnAddress` and the wakes hash an
+address to one of 256 queues, each guarded by a spinlock that only ever spins, and every wake took it, waiters or not.
+`0062` counts the waiters of a queue (incremented before the value comparison, with full barriers on both sides, so a
+wake either sees the waiter or the waiter sees the new value) and returns from a wake when there are none; the spinlock
+tests before it sets and yields the core after 256 spins, so a preempted holder no longer keeps every other thread
+spinning for its time slice. A WaitOnAddress/WakeByAddressSingle producer-consumer test lost no wakeups and went from
+2.5 to 7.6 million items a second with 16 producers and from 1.8 to 7.6 million with 24; a wake with nobody waiting from
+38 to 33 ns. In the game the overlay's CPU time dropped by about 2 ms (GPU 11.0 ms, CPU 8.7 ms afterwards).
+
+Upstream: not sent.
+
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index ca6dd4a..433a643 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -833,6 +833,7 @@ struct futex_queue
+ {
+     struct list queue;
+     LONG lock;
++    LONG waiters; /* Highball: threads in RtlWaitOnAddress on this bucket; wakes skip the lock when 0 */
+ };
+ 
+ static struct futex_queue futex_queues[256];
+@@ -846,8 +847,22 @@ static struct futex_queue *get_futex_queue( const void *addr )
+ 
+ static void spin_lock( LONG *lock )
+ {
++    unsigned int spins = 0;
++
++    /* Highball: test before test-and-set, and give the core away after a while: a holder that was preempted
++     * otherwise keeps every other thread spinning for its whole time slice. */
+     while (InterlockedCompareExchange( lock, -1, 0 ))
+-        YieldProcessor();
++    {
++        do
++        {
++            if (++spins >= 256)
++            {
++                NtYieldExecution();
++                spins = 0;
++            }
++            else YieldProcessor();
++        } while (ReadNoFence( lock ));
++    }
+ }
+ 
+ static void spin_unlock( LONG *lock )
+@@ -890,6 +905,11 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     entry.addr = addr;
+     entry.tid = GetCurrentThreadId();
+ 
++    /* Highball: announce the waiter before reading the value; a waker writes the value before reading the count
++     * (both with full barriers), so either the waker sees the count or this thread sees the new value. */
++    InterlockedIncrement( &queue->waiters );
++    MemoryBarrier();
++
+     spin_lock( &queue->lock );
+ 
+     /* Do the comparison inside of the spinlock, to reduce spurious wakeups. */
+@@ -897,6 +917,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     if (!compare_addr( addr, cmp, size ))
+     {
+         spin_unlock( &queue->lock );
++        InterlockedDecrement( &queue->waiters );
+         return STATUS_SUCCESS;
+     }
+ 
+@@ -916,6 +937,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+             list_remove( &entry.entry );
+         spin_unlock( &queue->lock );
+     }
++    InterlockedDecrement( &queue->waiters );
+ 
+     TRACE("returning %#lx\n", ret);
+ 
+@@ -937,6 +959,10 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+ 
+     if (!addr) return;
+ 
++    /* Highball: nobody waits on this bucket, nothing to wake (see RtlWaitOnAddress for the ordering) */
++    MemoryBarrier();
++    if (!ReadNoFence( &queue->waiters )) return;
++
+     spin_lock( &queue->lock );
+ 
+     if (!queue->queue.next)
+@@ -977,6 +1003,10 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+ 
+     if (!addr) return;
+ 
++    /* Highball: nobody waits on this bucket, nothing to wake (see RtlWaitOnAddress for the ordering) */
++    MemoryBarrier();
++    if (!ReadNoFence( &queue->waiters )) return;
++
+     spin_lock( &queue->lock );
+ 
+     if (!queue->queue.next)
