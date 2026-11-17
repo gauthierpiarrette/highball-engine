@@ -23,6 +23,14 @@ with two sets of patches, applied in this order:
     constant buffer reads, 24.4 to 21 ms there, and null constant buffer descriptors then read a buffer of zeros. A read
     past a bound constant buffer returns the memory after it instead of zero. Also 256 command buffer records, so
     `MESA_KK_DEBUG=cbs` logs all of a frame's.
+  - `0011` HDR swapchains reach the display as HDR. The Metal layer asked for extended dynamic range only for float
+    formats, so an HDR10 (PQ) swapchain in a 10-bit integer format was shown as SDR: washed out, grey. EDR is now on
+    for HDR10 and HLG too, and a PQ or extended-linear sRGB (scRGB) layer gets HDR10 metadata when the program sets
+    none (peak `HB_HDR_MAX_NITS`, 1000 by default; optical output scale 100 for PQ, 80 for scRGB; HLG gets Apple's HLG
+    metadata), so macOS tone-maps highlights into the panel's headroom instead of clipping them. HDR metadata a program
+    does set is passed with a scale of 100 instead of 1. Forza Horizon 6 (PQ) and EA SPORTS FC 27 (scRGB) on an M5 Max,
+    macOS 27.2: correct HDR, highlights no longer clipped (2026-11-17). Needs vkd3d-proton to enable
+    VK_EXT_swapchain_colorspace, or the surface offers sRGB only.
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.
