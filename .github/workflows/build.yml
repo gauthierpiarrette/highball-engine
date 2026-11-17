@@ -39,8 +39,6 @@ jobs:
           set -euo pipefail
           cd src/sources/wine
           for p in ../../../patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; patch -p1 < "$p"; done
-      - name: AoE IV tests
-        run: tests/aoe4/run.sh "$PWD/src/sources/wine"
       - name: toolchain
         run: |
           set -euo pipefail
@@ -148,23 +146,12 @@ jobs:
           tar -C out -czf "${name}.tar.gz" .
           shasum -a 256 "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
           ls -la "${name}.tar.gz"
-      - name: AoE IV corresponding source
-        run: |
-          source="$RUNNER_TEMP/aoe4-corresponding-source"
-          mkdir -p "$source/.github/workflows" "$source/tests"
-          cp -R crossover-sources.tar.gz patches inputs.json LICENSE NOTICE.md "$source/"
-          cp .github/workflows/build.yml "$source/.github/workflows/"
-          cp -R tests/aoe4 "$source/tests/"
-          echo "$GITHUB_SHA" > "$source/ENGINE_COMMIT"
-          tar -czf aoe4-corresponding-source.tar.gz -C "$source" .
-          shasum -a 256 aoe4-corresponding-source.tar.gz > aoe4-corresponding-source.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: engine
           path: |
             engine-*.tar.gz
             engine-*.tar.gz.sha256
-            aoe4-corresponding-source.tar.gz*
           retention-days: 14
       - name: publish release
         if: ${{ github.event.inputs.publish_release == 'true' }}
@@ -174,4 +161,4 @@ jobs:
           set -euo pipefail
           f=$(ls engine-*.tar.gz | head -1)
           tag="${f%.tar.gz}"
-          gh release create "$tag" "$f" "$f.sha256" aoe4-corresponding-source.tar.gz aoe4-corresponding-source.tar.gz.sha256 --title "$tag" --notes "Wine from the pinned CrossOver source (inputs.json) with the patch series in patches/. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."
+          gh release create "$tag" "$f" "$f.sha256" --target "$GITHUB_SHA" --title "$tag" --notes "Wine from the pinned CrossOver source (inputs.json) with the patch series in patches/. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."

@@ -6,9 +6,6 @@ The Wine 11 engine pins [athei/x87sidecar **v1.9.1**](https://github.com/athei/x
 |---|---|---|---|
 | 0001 | Splits x87 runs on self-modifying pages and reuses target buffers | Shared x87 | Upstream backport [#54](https://github.com/athei/x87sidecar/pull/54) |
 | 0002 | Preserves exact 64-bit integer loads in optimized x87 runs | Shared x87 | Upstream backport [#57](https://github.com/athei/x87sidecar/pull/57) |
-| 0003 | Adds software-fault decoding for a bounded guest code range | AoE IV | Marc Ibrahim, [GameToMac port](https://github.com/NerRobDog/x87sidecar/commit/4b6bad8) |
-| 0004 | Composes both decoders and fixes deferred stack pops on FBLD | AoE IV composition and shared x87 correctness | [MacGames patches](https://github.com/tarikbc/macgames/tree/1579841b15ce569807b92af95b478c752c26df3d/patches/x87sidecar) |
-| 0005 | Adds regression fixtures for software faults and ordinary decoder aliases | Helper tests | [AoE fork](https://github.com/himbeles/x87sidecar-aoe4/commit/f02887422ec3a671718261e1a31cb0e1c232bbbe) |
-| 0006 | Requires the game opt-in before selecting the AoE decoder | AoE IV | Highball integration |
+| 0003 | Adds the opt-in AoE IV decoder, the shared x87 FBLD correction and their regression fixtures | AoE IV and shared x87 correctness | Marc Ibrahim’s [GameToMac decoder](https://github.com/NerRobDog/x87sidecar/commit/4b6bad8), [MacGames patches](https://github.com/tarikbc/macgames/tree/1579841b15ce569807b92af95b478c752c26df3d/patches/x87sidecar), [AoE fork](https://github.com/himbeles/x87sidecar-aoe4/commit/f028874) |
 
 Wine patch 0012 handles ordinary x87 launches. For AoE IV, patch 0032 verifies the game image and supplies the decoder addresses when the recipe enables `HB_AOE4=1`. The general x87 backports and FBLD correction apply in ordinary x87 mode too.
