@@ -56,6 +56,6 @@ of the final combined PR head. Smaller stutters remain in Late Siege.
 ## Credits
 
 Wine thunks/cache: [Marc Ibrahim's LGPL source, mirrored by NerRobDog](https://github.com/NerRobDog/wine-aoe4/tree/711c6fc7559a565c417aab4d52d84b09767a9c1d).
-MIT helper: [himbeles/x87sidecar](https://github.com/himbeles/x87sidecar/tree/4babc6e8da78feda25ffda8264d0bf178c5a27fa), based on NerRobDog, athei and Lifeisawful.
-MIT decoder composition, GS fallback and FBLD fixes: [MacGames](https://github.com/tarikbc/macgames/tree/1579841b15ce569807b92af95b478c752c26df3d/patches/x87sidecar).
+MIT helper: [himbeles/x87sidecar](https://github.com/himbeles/x87sidecar/tree/f02887422ec3a671718261e1a31cb0e1c232bbbe), based on [athei/x87sidecar](https://github.com/athei/x87sidecar).
+MIT decoder composition and FBLD fixes: [MacGames](https://github.com/tarikbc/macgames/tree/1579841b15ce569807b92af95b478c752c26df3d/patches/x87sidecar).
 Source pins are in [inputs.json](../../inputs.json); [licenses](licenses/) accompany the engine.

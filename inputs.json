@@ -26,8 +26,8 @@
   },
   "aoe4Sidecar": {
     "repo": "https://github.com/himbeles/x87sidecar",
-    "commit": "4babc6e8da78feda25ffda8264d0bf178c5a27fa",
+    "commit": "f02887422ec3a671718261e1a31cb0e1c232bbbe",
     "license": "MIT",
-    "note": "AoE IV combined software-fault and x87 decoder, built from pinned source in the Wine workflow."
+    "note": "AoE IV helper based on athei/x87sidecar, built from pinned source in the Wine workflow."
   }
 }
