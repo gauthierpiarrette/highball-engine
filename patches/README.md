@@ -39,6 +39,7 @@ yet. The paragraphs under the table give the details and the measurements.
 | `0027` ntdll-dll-redirection-dotlocal-folder | A program's DLLs kept in its `<exe>.local` folder were never found, so it stopped before its first window. | Fahrenheit: Indigo Prophecy Remastered | general | not sent, upstream lacks it too | Highball |
 | `0028` ntdll-crash-on-faults-in-foreign-threads | A fault inside Apple's Metal or D3DMetal threads froze the game forever instead of crashing it. | GravityMark (Direct3D 12 on D3DMetal) | macOS | not sent | cyber-prinzesse (#23) |
 | `0030` gdi32-d3dkmt-set-process-scheduling-priority-class | Steam's client service ended the moment it set its GPU scheduling class, and a game's Steam overlay could freeze it. | Steam (SteamService.dll), Satisfactory's overlay (#699) | missing function | not sent | |
+| [`0032` aoe4-rosetta-profile-cache](0032-aoe4-rosetta-profile-cache.patch) | Handles software faults and caches generated code under Rosetta. | Age of Empires IV | macOS (opt-in: `HB_AOE4=1`) | not sent to WineHQ | Marc Ibrahim, NerRobDog and Highball |
 
 `0004` was an overlay-window attempt at what `0007` fixes. It was replaced the next day and its number was not reused.
 
