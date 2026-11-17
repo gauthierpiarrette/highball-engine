@@ -42,6 +42,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0041` ntdll-arm64ec-the-x64-state-on-an-unhandled-exception | A crash log named the instruction but not the x64 registers. | Microsoft Flight Simulator 2024 | diagnostics | |
 | `0042` ntdll-arm64ec-rtliseccode-above-the-user-address-space | A thread could fault in a loop until its stack ran out. | Microsoft Flight Simulator 2024 | general | |
 | `0043` ntdll-arm64ec-a-program-sees-its-own-page-protection | Programs saw the emulator's page protection, so restoring it made their own pages fault. | Microsoft Flight Simulator 2024, copy protections | x86-64 fidelity | pairs with FEX 0022 |
+| `0064` gdi32-d3dkmt-set-process-scheduling-priority-class | Steam's client service ended on an unimplemented import, Steam's main loop stalled and the game froze when its overlay opened. | the Steam overlay | general | the Intel line's 0030 |
 
 ## Details
 
@@ -330,3 +331,11 @@ roam and normal exit, many sessions between 2026-10-29 and 2026-10-31. The stall
 protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the panel showed 8995 of 8997 frames at an even
 2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
 from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.
+
+### D3DKMTSetProcessSchedulingPriorityClass (0064)
+
+The Intel line's `0030` for this line, unchanged. On the arm64 engine r5 (M5 Max, macOS 27.2, 2026-11-17) the same
+"unimplemented function GDI32.dll.D3DKMTSetProcessSchedulingPriorityClass, aborting" from Steam's 32-bit service came
+right before an `assert_steam.exe` dump ("CSteamEngine::BMainLoop appears to have stalled > 15 seconds") each time the
+overlay opened in Forza Horizon 6; the overlay stayed empty and the game froze. With the patch a 32-bit test finds the
+export and gets STATUS_SUCCESS, and the overlay draws and closes normally.
