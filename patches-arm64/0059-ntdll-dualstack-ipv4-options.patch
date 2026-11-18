@@ -11,14 +11,25 @@ on CrossOver Preview 41303, 2026-11-13). On Highball's arm64 route (arm64-kk-win
 macOS 27.3 beta, 2026-11-14) online play fails the same way: no UDP socket of the game stays open.
 
 When the host refuses IP_DONTFRAGMENT, IP_TTL, IP_MULTICAST_TTL or IP_MULTICAST_LOOP on an AF_INET6 socket
-with EINVAL, ntdll sets or reads its IPv6 counterpart (IPV6_DONTFRAG, IPV6_UNICAST_HOPS,
-IPV6_MULTICAST_HOPS, IPV6_MULTICAST_LOOP) instead. On macOS the counterpart reaches IPv4-mapped traffic: a
-datagram sent to ::ffff:127.0.0.1 with IPV6_UNICAST_HOPS 200 reaches an IPv4 socket with TTL 200 (64 by
-default), natively and under Rosetta. It also reaches the socket's IPv6 traffic, which an IPv4 option
-does not on Windows. Read back before anything set it, the hop limit answers -1 ("the system default"); IP_TTL
-then reports the TTL in use (net.inet.ip.ttl, 64) and IP_MULTICAST_TTL 1, as Windows reports its own defaults,
-instead of 4294967295. A host that accepts the IPv4 option never takes this path, nor does an AF_INET socket
-or any error but EINVAL. IP_TOS is left alone: no program here needs it, and Windows ignores it by default.
+with EINVAL, ntdll sets or reads its IPv6 counterpart (IPV6_DONTFRAG, IPV6_UNICAST_HOPS, IPV6_MULTICAST_HOPS,
+IPV6_MULTICAST_LOOP) instead. On macOS the counterpart reaches IPv4-mapped traffic: a datagram sent to
+::ffff:127.0.0.1 with IPV6_UNICAST_HOPS 200 reaches an IPv4 socket with TTL 200 (64 by default), natively and
+under Rosetta. It also reaches the socket's IPv6 traffic, which on Windows, an IPv4 version would not. For
+IP_TTL and multicast options only a header field changes, but IPV6_DONTFRAG changes what a send is permitted
+to do: after IP_DONTFRAGMENT 1, a datagram larger than the path MTU sent to an IPv6 peer fails with
+WSAEMSGSIZE (10040), whereas Windows leaves the socket's IPv6 traffic alone and fragments it. When sent to an
+IPv4-mapped peer it fails the same way, which is what IP_DONTFRAGMENT asks for. Read back before anything set
+it, the hop limit answers -1 ("the system default"); IP_TTL then reports the TTL in use (net.inet.ip.ttl, 64)
+and IP_MULTICAST_TTL 1, as Windows reports its own defaults, instead of 4294967295. A host that accepts the
+IPv4 option never takes this path, nor does an AF_INET socket or any error but EINVAL. IP_TOS is left alone:
+no program here needs it, and Windows ignores it by default.
+
+Measured over loopback (MTU 16384) with a dual-stack socket and SO_SNDBUF 65535 (macOS caps a UDP datagram at
+9216 bytes otherwise): a 20000-byte datagram to ::1 or to ::ffff:127.0.0.1 is sent without IP_DONTFRAGMENT and
+fails with 10040 with it, on x64-crossover26.3-r32 and arm64-kk-wine11.18-r4 with this patch; 12000 bytes is
+sent either way. Natively, IPV6_DONTFRAG gives EMSGSIZE in the same cases, arm64 and under Rosetta. On a real
+network the limit is the path MTU, at least 1280 bytes for IPv6. A program that sets IP_DONTFRAGMENT sizes its
+datagrams to stay under it, so only a datagram it would not send anyway is refused.
 
 Checked with a test program that opens the socket as the game does, reads three of the options before anything
 sets them, then sets and reads back all four, sends to ::ffff:127.0.0.1 and checks an AF_INET socket's own
