@@ -33,7 +33,7 @@ datagrams to stay under it, so only a datagram it would not send anyway is refus
 
 Checked with a test program that opens the socket as the game does, reads three of the options before anything
 sets them, then sets and reads back all four, sends to ::ffff:127.0.0.1 and checks an AF_INET socket's own
-options (26 checks; MacGameFix's engine/tests/dualstack-udp/udpopts.c). On x64-crossover26.3-r33 it fails 12
+options (26 checks; tests/dualstack-udp/udpopts.c). On x64-crossover26.3-r33 it fails 12
 (these and SIO_UDP_NETRESET); with this patch and 0035, none. The same change is MacGameFix's wine-11.21 0026
 (MathiasKowoll/MacGameFix#73, by the same author), where FH6 played online on CrossOver Preview 41303. Not
 sent upstream.

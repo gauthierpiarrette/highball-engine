@@ -328,7 +328,7 @@ emulated code straight from the syscall instead of through a signal. Both are of
 as its IPv6 counterpart, and SIO_UDP_NETRESET is accepted (upstream Wine 19d5fbd382, in 11.19, after this line's
 11.18). Forza Horizon 6 sets both kinds on its UDP game socket before matchmaking and closed the socket when they
 failed, so online play never started on this line either (arm64-kk-wine11.18-r4, M5 Pro, macOS 27.3 beta,
-2026-11-14). The test program in `0059`, built for arm64, fails 12 of 26 checks on r4 and none with both patches.
+2026-11-14). The test program (`tests/dualstack-udp`), built for arm64, fails 12 of 26 checks on r4 and none with both patches.
 
 ### Forza Horizon 6
 
