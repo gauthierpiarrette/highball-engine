@@ -95,10 +95,10 @@ index 00000000000..4c6acb802ab
 +#endif
 diff --git a/src/kosmickrisp/bridge/mtl_metalfx.m b/src/kosmickrisp/bridge/mtl_metalfx.m
 new file mode 100644
-index 00000000000..0d3ec535331
+index 00000000000..2bb7bb6fc50
 --- /dev/null
 +++ b/src/kosmickrisp/bridge/mtl_metalfx.m
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,312 @@
 +/*
 + * Copyright 2026 Highball
 + * SPDX-License-Identifier: MIT
@@ -215,10 +215,12 @@ index 00000000000..0d3ec535331
 +         max_scale = min_scale;
 +      desc.inputContentMinScale = min_scale;
 +      desc.inputContentMaxScale = max_scale;
++#if defined(__MAC_27_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_27_0
 +      if (@available(macOS 27.0, *)) {
 +         desc.outputResolutionMotionVectorsEnabled = output_motion;
 +         desc.jitteredMotionVectorsEnabled = jittered;
 +      }
++#endif
 +      if (reactive) {
 +         desc.reactiveMaskTextureEnabled = YES;
 +         desc.reactiveMaskTextureFormat = fmt[MTL_METALFX_REACTIVE];
@@ -363,6 +365,7 @@ index 00000000000..0d3ec535331
 +         t.jitterOffsetX = s->jitter_x;
 +         t.jitterOffsetY = s->jitter_y;
 +         t.preExposure = pre_exposure;
++#if defined(__MAC_27_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_27_0
 +         if (@available(macOS 27.0, *)) {
 +            if (s->has_offsets) {
 +               t.colorContentOffsetX = s->offset_x[MTL_METALFX_COLOR];
@@ -377,6 +380,7 @@ index 00000000000..0d3ec535331
 +               }
 +            }
 +         }
++#endif
 +         [t encodeToCommandBuffer:cb];
 +      } else {
 +         id<MTL4FXTemporalDenoisedScaler> d = (id<MTL4FXTemporalDenoisedScaler>)scaler;
