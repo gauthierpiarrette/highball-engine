@@ -31,12 +31,10 @@ index 8dd2cc10..9bb0c786 100644
 +++ b/libs/vkd3d/swapchain.c
 @@ -1278,7 +1278,10 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetColorSpace(IDXGIVkSwapCha
      struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
-     TRACE("iface %p, ColorSpace %u.
-", iface, ColorSpace);
+     TRACE("iface %p, ColorSpace %u.\n", iface, ColorSpace);
      if (!dxgi_vk_swap_chain_supports_color_space(chain, ColorSpace))
 +    {
-+        WARN("Color space %#x is not supported by the surface.
-", ColorSpace);
++        WARN("Color space %#x is not supported by the surface.\n", ColorSpace);
          return E_INVALIDARG;
 +    }
  
