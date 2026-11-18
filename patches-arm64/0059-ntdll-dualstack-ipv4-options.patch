@@ -28,8 +28,9 @@ Measured over loopback (MTU 16384) with a dual-stack socket and SO_SNDBUF 65535 
 9216 bytes otherwise): a 20000-byte datagram to ::1 or to ::ffff:127.0.0.1 is sent without IP_DONTFRAGMENT and
 fails with 10040 with it, on x64-crossover26.3-r32 and arm64-kk-wine11.18-r4 with this patch; 12000 bytes is
 sent either way. Natively, IPV6_DONTFRAG gives EMSGSIZE in the same cases, arm64 and under Rosetta. On a real
-network the limit is the path MTU, at least 1280 bytes for IPv6. A program that sets IP_DONTFRAGMENT sizes its
-datagrams to stay under it, so only a datagram it would not send anyway is refused.
+network the limit is the path MTU, at least 1280 bytes for IPv6. This assumes a program that sets
+IP_DONTFRAGMENT sizes its datagrams to stay under that limit, so that only a datagram it would not send anyway
+is refused; FH6's datagram sizes were not measured.
 
 Checked with a test program that opens the socket as the game does, reads three of the options before anything
 sets them, then sets and reads back all four, sends to ::ffff:127.0.0.1 and checks an AF_INET socket's own
