@@ -1,0 +1,57 @@
+From: alexandreunitypro (MetalHorizon launcher's Wine patch 0002), ported by TxCsOffc <243226414+TxCsOffc@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:00:00 +0500
+Subject: [PATCH] winhttp: a WebSocket owns its connection
+
+Forza Horizon 6's online services (PlayFab lobby, Xbox real-time activity) run over WebSockets. Six threads spun on
+"recv error 10035" (WSAEWOULDBLOCK), about 15,000 calls a second each, from the moment the WebSockets opened until the
+server reset them. The connection stayed on the request after the upgrade, so a later read of the empty 101 response
+reached finished_reading, which put it back in the keep-alive pool, and the next request to that host reused it while
+the WebSocket was still reading from it: netconn_is_alive made it non-blocking and consumed its TLS records. The
+WebSocket now takes the connection away from the request. WinHttpWriteData on the request after the upgrade then
+finds no connection, so write_data returns ERROR_WINHTTP_INCORRECT_HANDLE_STATE instead of reaching netconn_send with
+a NULL connection, as reads of such a request already do.
+
+The first version also made blocking receives wait on WSAEWOULDBLOCK (net.c). It is dropped: with Wine's server
+applying SO_RCVTIMEO to a blocking socket, that wait could only fire in a race with set_blocking. With this patch
+alone, an M5 Max, macOS 27.2 (2026-11-19), WINEDEBUG=warn+winhttp, a session of Forza Horizon 6 online (lobby,
+Horizon Life, other players on the map) logged 141 "recv error 10035" in total, where it logged about 15,000 a second
+per WebSocket thread before; the game's online features worked. It changes every winhttp WebSocket user on the line;
+Microsoft Flight Simulator 2024's Xbox services were not tried (we do not have the game), and no CPU figure was taken.
+
+Source and licence: the change is MetalHorizon's patch 0002 (github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher),
+ported by hand because Wine 11.18 moved WinHttpWebSocketCompleteUpgrade to dlls/winhttp/socket.c; the write_data
+check is ours. That repository is GPL-3.0 and its patch carries no licence or author line, so its author has been asked
+to allow it under LGPL-2.1 or later, as Wine; this patch should not be merged before he answers.
+
+Upstream: not sent.
+
+diff --git a/dlls/winhttp/request.c b/dlls/winhttp/request.c
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -3625,7 +3625,8 @@ static DWORD write_data( struct request *request, const void *buffer, DWORD to_w
+     DWORD ret;
+     int num_bytes;
+ 
+-    ret = netconn_send( request->netconn, buffer, to_write, &num_bytes, NULL );
++    if (!request->netconn) ret = ERROR_WINHTTP_INCORRECT_HANDLE_STATE;
++    else ret = netconn_send( request->netconn, buffer, to_write, &num_bytes, NULL );
+ 
+     if (async)
+     {
+diff --git a/dlls/winhttp/socket.c b/dlls/winhttp/socket.c
+--- a/dlls/winhttp/socket.c
++++ b/dlls/winhttp/socket.c
+@@ -163,8 +163,12 @@ HINTERNET WINAPI WinHttpWebSocketCompleteUpgrade( HINTERNET hrequest, DWORD_PTR
+     InitializeSRWLock( &socket->send_lock );
+     init_queue( &socket->send_q );
+     init_queue( &socket->recv_q );
+-    netconn_addref( request->netconn );
++    /* The connection now belongs to the WebSocket alone. Left on the request, a later read of the (empty) 101
++     * response reaches finished_reading, which puts it back in the keep-alive pool: the next request to that
++     * host then reuses it while the WebSocket is still reading from it (netconn_is_alive makes it non-blocking
++     * and consumes its TLS records). (MetalHorizon patch 0002, ported to Wine 11.18.) */
+     socket->netconn = request->netconn;
++    request->netconn = NULL;
+ 
+     netconn_set_timeout( socket->netconn, FALSE, socket->keepalive_interval );
+ 

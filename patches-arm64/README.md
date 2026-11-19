@@ -42,7 +42,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0041` ntdll-arm64ec-the-x64-state-on-an-unhandled-exception | A crash log named the instruction but not the x64 registers. | Microsoft Flight Simulator 2024 | diagnostics | |
 | `0042` ntdll-arm64ec-rtliseccode-above-the-user-address-space | A thread could fault in a loop until its stack ran out. | Microsoft Flight Simulator 2024 | general | |
 | `0043` ntdll-arm64ec-a-program-sees-its-own-page-protection | Programs saw the emulator's page protection, so restoring it made their own pages fault. | Microsoft Flight Simulator 2024, copy protections | x86-64 fidelity | pairs with FEX 0022 |
-| `0061` winhttp-websocket-owns-its-connection-and-blocking-receives-block | WebSocket threads spun on WSAEWOULDBLOCK, about 15,000 receives a second each. | Forza Horizon 6 online services | general | from the MetalHorizon launcher's 0002, ported to 11.18 |
+| `0061` winhttp-websocket-owns-its-connection | WebSocket threads spun on WSAEWOULDBLOCK, about 15,000 receives a second each. | every winhttp WebSocket user (Forza Horizon 6 online services) | general | MetalHorizon launcher's 0002 (alexandreunitypro), ported to 11.18; licence for LGPL asked of its author |
 
 ## Details
 
@@ -332,11 +332,14 @@ protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the pane
 2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
 from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.
 
-### WebSocket receives (0061)
+### WebSocket connection (0061)
 
-From the MetalHorizon launcher's Wine patch 0002 (github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher, LGPL-2.1).
-Forza Horizon 6's PlayFab and Xbox real-time activity WebSockets spun on WSAEWOULDBLOCK, about 15,000 receives a second
-per thread: the connection stayed on the request after the upgrade and went back to the keep-alive pool, and a receive
-meant to block failed at once. The WebSocket now owns its connection and a blocking receive waits, honouring
-SO_RCVTIMEO. Checked on an M5 Max, macOS 27.2 (2026-11-15): the "recv error 10035" warnings are gone. Numbered after
-#40's 0059 and 0060, which carry the socket options.
+From the MetalHorizon launcher's Wine patch 0002 (alexandreunitypro, github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher),
+ported to 11.18. That repository is GPL-3.0 and the patch has no licence line; its author has been asked to allow it
+under LGPL-2.1 or later, and it should not be merged before he answers. Forza Horizon 6's PlayFab and Xbox real-time
+activity WebSockets spun on WSAEWOULDBLOCK, about 15,000 receives a second per thread: the connection stayed on the
+request after the upgrade, went back to the keep-alive pool and was reused by the next request while the WebSocket
+read from it. The WebSocket now owns its connection, and WinHttpWriteData on the upgraded request returns
+ERROR_WINHTTP_INCORRECT_HANDLE_STATE. The first version's blocking-receive wait in net.c is dropped; with this alone
+an online session logged 141 "recv error 10035" in total (M5 Max, macOS 27.2, 2026-11-19). Microsoft Flight Simulator
+2024 not tried. Numbered after #40's 0059 and 0060, which carry the socket options.
