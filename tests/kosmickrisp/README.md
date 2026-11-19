@@ -14,11 +14,15 @@ VK_DRIVER_FILES=<build>/src/kosmickrisp/vulkan/kosmickrisp_mesa_devenv_icd.aarch
 
 `empty-renderings.c` records renderings with no draw and checks a pixel of the attachment after each:
 a CLEAR rendering clears, an empty LOAD/STORE rendering keeps the contents, a SUSPENDING + RESUMING pair keeps them,
-empty / CLEAR / empty in one command buffer ends with the CLEAR colour, and an empty 4x MSAA rendering with a resolve
-attachment still resolves. Exit status is the failure count.
+empty / CLEAR / empty in one command buffer ends with the CLEAR colour, an empty 4x MSAA rendering with a resolve
+attachment still resolves, an empty rendering that loads colour and clears a D32_SFLOAT_S8_UINT depth/stencil
+attachment clears both aspects and keeps the colour, one that only loads colour, depth and stencil keeps all three, and
+an occlusion query begun and ended inside an empty rendering is available with 0 samples. Exit status is the failure
+count.
 
 On an M5 Max, macOS 27.2 (2026-11-15) all six pass with patch 0010, with `HB_KK_SKIP_EMPTY_PASSES=1` and without it, on the
-highball series (Mesa `ce576c29`, steamac, highball 0001 to 0010). It does not check that a skipped rendering saves
+highball series (Mesa `ce576c29`, steamac, highball 0001 to 0010). The depth/stencil and occlusion query cases
+were added on 2026-11-19 and pass both ways on the same series (13 checks). It does not check that a skipped rendering saves
 GPU time; that was measured in Forza Horizon 6 (see the KosmicKrisp README).
 
 ## Storage buffer robustness (patch 0009)
