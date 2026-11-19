@@ -26,6 +26,7 @@ $CC -o "$OUT/globalroot.exe" "$HERE/globalroot.c" -lpsapi
 $CC -o "$OUT/topdown.exe" "$HERE/topdown.c"
 $CC -o "$OUT/regiontest.exe" "$HERE/regiontest.c"
 $CC -o "$OUT/cowtest.exe" "$HERE/cowtest.c"
+$CC -o "$OUT/wpmtest.exe" "$HERE/wpmtest.c"
 $CC -shared -o "$OUT/imagequery-helper.dll" "$HERE/imagequery_dll.c" "$HERE/imagequery_asm.S"
 $CC -o "$OUT/imagequery.exe" "$HERE/imagequery.c"
 $CC -o "$OUT/imagemap.exe" "$HERE/imagemap.c"

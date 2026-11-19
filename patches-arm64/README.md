@@ -420,3 +420,11 @@ NtReadVirtualMemory already reads it. An x64 test that rewrites the first five b
 CreateDXGIFactory1 and Sleep through WriteProcessMemory got ERROR_ACCESS_DENIED before and succeeds after (M5 Max,
 macOS 27.2, 2026-11-17). The overlay also needs 0064, and its swap chain hooks need DXVK's methods to be detourable
 on ARM64EC, which is a separate change.
+
+The memcpy can fault: with 0019, WRITECOPY image pages stay read-execute on the host until written, and the fault is
+resolved inside the uninterrupted section only because virtual_mutex is recursive and SIGSEGV is not blocked there.
+Pages FEX write-traps while the program sees them writable (0043) are refused by the direct write, so ntdll's ARM64EC
+NtWriteVirtualMemory gives such a page the program's protection back through NtProtectVirtualMemory (the emulator
+drops its translations of it) and writes again. Every program that patches itself through WriteProcessMemory, DRM,
+anti-cheat and mod loaders included, goes from failing to succeeding. `tests/x64-fidelity/wpmtest.c`: 10/2 with the
+unix part alone, 12/0 with both (M5 Max, macOS 27.2, 2026-11-19); memtest, smcdata and smcretire unchanged.
