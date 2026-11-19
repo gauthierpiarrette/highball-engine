@@ -60,11 +60,14 @@ with two sets of patches, applied in this order:
     are against `HB_VKD3D_TILER=1` without the skip; what both switches together gain over neither is not measured yet.
     `tests/kosmickrisp/empty-renderings.c` checks colour, depth and stencil clears and loads, suspend/resume, an MSAA
     resolve and an occlusion query inside an empty rendering, with the switch and without it.
-  - `0012` the memory heap's budget is 90% of the Metal device's recommended working set, as its size already is. It
-    was 90% of the memory macOS reported available, which with a game, Steam and a browser open was about 10 GB on a
-    48 GB Mac, and games sized their texture streaming to it: Forza Horizon 6 left tyres and fine detail at low
-    resolution on many cars, and they came back with this patch (M5 Max, 2026-11-17). The working set scales with the
-    Mac, about 9.6 GB on a 16 GB one.
+  - `0012` `HB_KK_HEAP_BUDGET=1` (off by default, asked for per game, read once) makes the memory heap's budget 90% of
+    the Metal device's recommended working set; the heap's size is 100% of it. By default the budget stays Mesa's: the
+    smaller of the heap size and 90% of the memory macOS reports available, plus what the program already uses. With a
+    game, Steam and a browser open that was about 10 GB on a 48 GB Mac, and Forza Horizon 6 sized its texture
+    streaming to it, leaving tyres and fine detail at low resolution on many cars; they came back with the switch (M5
+    Max, 2026-11-17). The switch ignores memory pressure: on a 16 GB Mac a game would be told it has about 9.6 GB of
+    GPU memory out of shared memory whatever else is running, the stall pattern DXVK's `0002` caps, so it is for
+    recipes of games that need it on Macs with memory to spare, and has not been tried on a 16 GB Mac.
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.
