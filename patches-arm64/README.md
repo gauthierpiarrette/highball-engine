@@ -356,7 +356,8 @@ again when it translates code from it again. The callback runs during the call o
 lock, because FEX calls `NtProtectVirtualMemory` while it holds its own lock for code invalidation. Under a lock
 (`virtual_mutex` in `NtGetWriteWatch` or `NtQueryVirtualMemory`, `dir_mutex` in `NtQueryDirectoryFile`) the page
 opens on the Unix side, and the dispatcher runs the same callback when the call returns. A call without such a
-write pays nothing. A reply that wineserver writes straight into such a page (`NtQueryObject`, some
+write runs no callback, but each Unix lock now also calls `pthread_getspecific` for the count (`VirtualQuery`
+in a loop: 0.7% slower than r5). A reply that wineserver writes straight into such a page (`NtQueryObject`, some
 `NtQueryInformationProcess` classes, registry queries) still ends the thread; that is not covered. macOS only.
 
 A first way, FEX's notice after the marked calls only (as `BTCpu64NotifyReadFile` does for `NtReadFile`), passed
