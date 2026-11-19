@@ -42,7 +42,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0041` ntdll-arm64ec-the-x64-state-on-an-unhandled-exception | A crash log named the instruction but not the x64 registers. | Microsoft Flight Simulator 2024 | diagnostics | |
 | `0042` ntdll-arm64ec-rtliseccode-above-the-user-address-space | A thread could fault in a loop until its stack ran out. | Microsoft Flight Simulator 2024 | general | |
 | `0043` ntdll-arm64ec-a-program-sees-its-own-page-protection | Programs saw the emulator's page protection, so restoring it made their own pages fault. | Microsoft Flight Simulator 2024, copy protections | x86-64 fidelity | pairs with FEX 0022 |
-| `0062` ntdll-wait-on-address-wake-fast-path-and-yielding-spinlock | Forza Horizon 6's job threads spent most of their time spinning on a futex bucket's spinlock in RtlWakeAddressSingle, taken even with nobody waiting. | programs that wake by address from many threads (Forza Horizon 6) | performance | general |
+| `0062` ntdll-wait-on-address-wake-fast-path-and-yielding-spinlock | Forza Horizon 6's job threads spent most of their time spinning on a futex bucket's spinlock in RtlWakeAddressSingle, taken even with nobody waiting. | programs that wake by address from many threads (Forza Horizon 6) | performance | not sent |
 
 ## Details
 
@@ -340,6 +340,7 @@ address to one of 256 queues, each guarded by a spinlock that only ever spins, a
 `0062` counts the waiters of a queue (incremented before the value comparison, with full barriers on both sides, so a
 wake either sees the waiter or the waiter sees the new value) and returns from a wake when there are none; the spinlock
 tests before it sets and yields the core after 256 spins, so a preempted holder no longer keeps every other thread
-spinning for its time slice. A WaitOnAddress/WakeByAddressSingle producer-consumer test lost no wakeups and went from
-2.5 to 7.6 million items a second with 16 producers and from 1.8 to 7.6 million with 24; a wake with nobody waiting from
-38 to 33 ns. In the game the overlay's CPU time dropped by about 2 ms (GPU 11.0 ms, CPU 8.7 ms afterwards).
+spinning for its time slice. `tests/x64-fidelity/wakestress.c` (8 consumers, two runs each, M5 Max, macOS 27.2,
+2026-11-19) lost no wakeups before or after and went from 3.7-4.1 to 7.4-9.9 million items a second with 4 producers,
+from 2.2-2.9 to 11.4-11.6 million with 16 and from 2.4-2.6 to 11.4-11.5 million with 24; a wake with nobody waiting from
+33 to 27 ns. In the game the overlay's CPU time dropped by about 2 ms (GPU 11.0 ms, CPU 8.7 ms afterwards).
