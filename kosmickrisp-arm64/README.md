@@ -34,7 +34,9 @@ with two sets of patches, applied in this order:
     metadata) unless the program sets its own. The optical output scale is 100 on both paths, the default metadata and
     the metadata a program sets (which was 1): Apple maps 1.0 to 100 nits, and the scale only matters for float
     buffers, so this changes scRGB only. Forza Horizon 6 (PQ) on an M5 Max, macOS 27.2: correct HDR, highlights no
-    longer clipped (2026-11-17). Needs vkd3d-proton to enable VK_EXT_swapchain_colorspace, or the surface offers sRGB
+    longer clipped (2026-11-17); EA SPORTS FC 27 (scRGB) with `HB_HDR_SCRGB_METADATA=1` and the scale of 100: correct
+    HDR and brightness (2026-11-19). An SDR game with an FP16 swap chain was not tried; without the switch it gets no
+    metadata from this patch. Needs vkd3d-proton to enable VK_EXT_swapchain_colorspace, or the surface offers sRGB
     only.
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
