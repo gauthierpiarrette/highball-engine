@@ -6,6 +6,12 @@ DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 (HDR10) or G10_NONE_P709 (scRGB) fail
 went on rendering HDR wrote PQ values into an sRGB swapchain: a washed-out grey picture. The extension is optional, so
 nothing changes where it is missing; an unsupported color space is now logged.
 
+It reaches every game with an FP16 swapchain, not only HDR ones: DXVK's dxgi puts every R16G16B16A16_FLOAT swapchain
+in scRGB whenever the presenter accepts that color space, which it now does on KosmicKrisp. What the display does with
+scRGB is up to the driver (KosmicKrisp 0011 gives it default HDR metadata only when asked). HDR10 still needs
+DXVK_HDR=1: DXVK only accepts the HDR10 color space with enableHDR set. It changes the MoltenVK route as well, which
+was not tried with Microsoft Flight Simulator 2024 (we do not have it).
+
 Checked on an M5 Max, macOS 27.2, KosmicKrisp (2026-11-17): Forza Horizon 6 sets color space 12 (HDR10) and EA SPORTS
 FC 27 color space 1 (scRGB), both accepted, both shown as HDR. Builds with the renderers' llvm-mingw for x86-64 on top
 of 0001 to 0012.
