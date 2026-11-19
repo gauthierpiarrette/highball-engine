@@ -7,9 +7,9 @@ had them blocked in read() under wine_server_call from NtWaitForSingleObject, Nt
 (The Rosetta line showed the same warning in October whenever a bottle's sync was none.)
 
 This is msync (Marc-Aurel Zent, CodeWeavers; Mach semaphores plus a shared-memory object table), as CrossOver 26 hosts
-it on Wine's inproc sync, taken from the standalone patch koels-net/mcsoda patches/0002-msync-from-crossover-11.0 and
-ported to upstream Wine 11.18:
-- dlls/ntdll/unix/msync.[ch] and server/msync.[ch] are as in that patch.
+it on Wine's inproc sync, taken from CrossOver 26.3.0's published sources (the crossover-sources-26.3.0.tar.gz that
+inputs.json already pins for the Intel line, sources/wine) and ported to upstream Wine 11.18:
+- dlls/ntdll/unix/msync.[ch] and server/msync.[ch] are byte-identical to that tarball's.
 - ntdll: msync_init() after server_init_process(); sync.c gets an __APPLE__ branch that maps the inproc linux_*_obj
   helpers to msync_*_obj (WaitAll is passed through, msync grants it itself); an inproc sync's "fd" is its msync
   slot index, released with msync_close().
@@ -19,7 +19,15 @@ ported to upstream Wine 11.18:
 - protocol: get_inproc_sync_fd's reply carries the slot index (shm_idx) instead of passing an fd
   (SERVER_PROTOCOL_VERSION 963, regenerated with tools/make_requests). The source patch returned the alert slot in
   one reply field and read another on the client; both sides now use get_inproc_alert_fd's handle field.
-Off unless WINEMSYNC=1, which Highball already sets for a bottle whose sync is msync.
+- thread.c: a thread's alert_fd is a slot number under msync, not a file, so pthread_exit_wrapper no longer closes it
+  then (Wine 11.18 would close an unrelated descriptor with that number). CrossOver has the same unguarded line; a
+  test of 2,000 threads taking an alertable wait and exiting, with a file and an event in use between them, passed
+  with and without the guard, so the guard is a precaution, not a fix for something seen.
+It runs only with WINEMSYNC=1, but msync is Highball's default sync, so in practice every arm64 bottle gets it,
+Microsoft Flight Simulator 2024's included, which nobody has tried with it yet (we have neither that game nor a 16 GB
+Mac to try it on).
+Upstream Wine is already at protocol 963 with a different request layout, so the next rebase onto a newer Wine has to
+renumber the protocol and regenerate the requests.
 
 Checked on an M5 Max, macOS 27.2 (2026-11-15), on a clone of engine arm64-kk-wine11.18-r5 with this ntdll.so and
 wineserver, a test program: event ping-pong between two threads 18.0 -> 7.2 us per round trip; 8 threads on a semaphore
@@ -34,8 +42,8 @@ fixes (Steam's service ending on a missing gdi32 export), not a wait. Highball's
 note that Steam's web helper hung under msync on Wine 10 did not reproduce here.
 
 Source and licence: msync is CodeWeavers' code (Marc-Aurel Zent) from CrossOver's Wine tree, which CodeWeavers
-publishes under Wine's LGPL-2.1. It was taken from github.com/koels-net/mcsoda, patches/0002-msync-from-crossover-11.0.patch
-(that repository states no licence of its own; the files keep their CrossOver/Wine copyright headers).
+publishes under Wine's LGPL-2.1 or later in crossover-sources-26.3.0.tar.gz (sha256 ac99c8ca...6872, as in
+inputs.json); the four msync files here are byte-identical to that tarball's and keep their copyright headers.
 
 Upstream: not sent.
 
@@ -2572,3 +2580,28 @@ index 58d67c7..6215555 100644
      else
      {
          reply->handle = get_thread_id( current ) | 1; /* arbitrary token */
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 8461482..eab13cb 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -76,6 +76,9 @@
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++#ifdef __APPLE__
++#include "msync.h"
++#endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(thread);
+ WINE_DECLARE_DEBUG_CHANNEL(seh);
+@@ -1116,6 +1119,10 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
+ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+ {
+     struct thread_data *data = get_thread_data();
++#ifdef __APPLE__
++    /* under msync alert_fd is a slot of the server's table, not a file descriptor */
++    if (!do_msync())
++#endif
+     close( data->alert_fd );
+     close( data->wait_fd[0] );
+     close( data->wait_fd[1] );
