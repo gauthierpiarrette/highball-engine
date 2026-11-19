@@ -22,7 +22,8 @@ count.
 
 On an M5 Max, macOS 27.2 (2026-11-15) all six pass with patch 0010, with `HB_KK_SKIP_EMPTY_PASSES=1` and without it, on the
 highball series (Mesa `ce576c29`, steamac, highball 0001 to 0010). The depth/stencil and occlusion query cases
-were added on 2026-11-19 and pass both ways on the same series (13 checks). It does not check that a skipped rendering saves
+were added on 2026-11-19 and pass both ways (13 checks) on that series plus the HDR, heap budget and MetalFX
+patches (0011 to 0013), which do not touch renderings. It does not check that a skipped rendering saves
 GPU time; that was measured in Forza Horizon 6 (see the KosmicKrisp README).
 
 ## Storage buffer robustness (patch 0009)
