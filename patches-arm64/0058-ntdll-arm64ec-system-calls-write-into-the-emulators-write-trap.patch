@@ -33,8 +33,9 @@ page opens, and the translations go again (a translation made in between traps t
   lock (for example virtual_mutex in NtQueryVirtualMemory, NtGetWriteWatch and NtFreeVirtualMemory, or dir_mutex
   in NtQueryDirectoryFile) the page opens on the Unix side and is recorded for the thread, and a flag in the
   syscall frame (RESTORE_FLAGS_HB_NOTIFY) makes the dispatcher run the same callback for those pages when the call
-  returns, with no lock held. A call without such a write pays nothing. Until the call returns, another thread
-  can run old code from such a page, as with BTCpu64NotifyReadFile.
+  returns, with no lock held. A call without such a write runs no callback, but each mutex_lock and mutex_unlock
+  now also calls pthread_getspecific for the lock count (VirtualQuery in a loop is 0.7% slower, see below). Until
+  the call returns, another thread can run old code from such a page, as with BTCpu64NotifyReadFile.
 - Not covered: data that wineserver writes straight into a trapped page (a server reply such as NtQueryObject
   with ObjectNameInformation, NtQueryInformationProcess with ProcessImageFileName, or a registry query) fails in
   read_reply_data with EFAULT and still ends the thread. Asynchronous I/O that completes later is not covered
