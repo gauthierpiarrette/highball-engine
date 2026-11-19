@@ -42,7 +42,11 @@ so no FPCR write happens on those calls or on calls into FEX's helpers. On an M5
 4.3 ns, QueryPerformanceCounter 40 to 20 ns, scalar SSE unchanged, SSE MIN/MAX 1.80 to 2.27 ns. Wine's CRT math gave
 bit-identical results over 10,610 calls with NEP left set; leaving AH set as well changed them (sinh(-1) came out
 positive), which is why the JIT drops AH instead. The x64 fidelity programs give the same results except x87test's
-`mxcsr.ftz.flags` (no PE after a flushed underflow without AH). Forza Horizon 6 played normally with it.
+`mxcsr.ftz.flags` (no PE after a flushed underflow without AH). Forza Horizon 6 played normally with it. Under the
+switch a program also sees DAZ whenever it sets FTZ (FZ flushes inputs too with AH clear), a positive default NaN
+where x86's is negative, and FIZ set in FEX's helpers; and NEP reaches native code, macOS code included, where LLVM
+assumes scalar SIMD&FP results zero the upper lanes, so native code other than the CRT math that was checked can
+compute different results. Without the switch every exit pays one load for the mask and nothing else changes.
 
 0019 and 0020 were on by default when they were added. 0023 does not build FEX's own Linux helper as it stands (see
 its paragraph). With no switch set, 0023 behaves as 0001 to 0022.
