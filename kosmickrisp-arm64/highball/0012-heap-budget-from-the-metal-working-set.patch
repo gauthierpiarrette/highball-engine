@@ -2,18 +2,19 @@ diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulka
 index b559d4e7198..cefaf1e8310 100644
 --- a/src/kosmickrisp/vulkan/kk_physical_device.c
 +++ b/src/kosmickrisp/vulkan/kk_physical_device.c
-@@ -1124,13 +1124,8 @@ static uint64_t
+@@ -1063,6 +1063,15 @@ static uint64_t
  kk_get_sysmem_heap_budget(struct kk_physical_device *pdev)
  {
     uint64_t heap_size = kk_get_sysmem_heap_size(pdev);
--   uint64_t used = kk_get_sysmem_heap_used(pdev);
++   static int hb_heap_budget = -1;
++
++   if (hb_heap_budget < 0) {
++      const char *hb = getenv("HB_KK_HEAP_BUDGET");
++      hb_heap_budget = hb && hb[0] == '1';
++   }
++   if (hb_heap_budget)
++      return heap_size / 10 * 9;
++
+    uint64_t used = kk_get_sysmem_heap_used(pdev);
  
--   /* Budget is calculated using the default Mesa logic, based on available
--    * system memory. Available memory is reduced to 90% to avoid thrashing. */
--   const float available_percent = 0.9f;
--   return vk_physical_device_heap_budget_from_system(
--      &pdev->vk, available_percent, heap_size, used);
-+   return heap_size / 10 * 9;
- }
- 
- static void
+    /* Budget is calculated using the default Mesa logic, based on available
