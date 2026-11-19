@@ -1,3 +1,34 @@
+From: TxCsOffc <243226414+TxCsOffc@users.noreply.github.com>
+Subject: [PATCH] ARM64EC: opt-in lazy AFP, no FPCR writes on calls between x64 and ARM64EC code
+
+Each call between x64 and ARM64EC code wrote FPCR twice: ExitFunctionEC cleared AH and NEP on the way out and the
+JIT set them again on the way in, and so did every call into FEX's helpers. An FPCR write stalls Apple cores; in
+saved Forza Horizon 6 profiles the write in ExitFunctionEC was FEX's hottest instruction, about 19% of a hot thread.
+
+HB_FEX_LAZY_AFP=1 makes the JIT use NEP but not AH: x86 MIN/MAX and RCP/RSQRT are emulated as on hosts without AFP,
+and RPRES is not used, since it needs AH. ExitFunctionEC then leaves NEP set and clears only the trap enables, and
+only when one is armed, so neither native calls nor helper calls write FPCR. Without the switch, the exit mask is
+the three old ones in one load, and the JIT is unchanged, so everyone pays one load per exit.
+
+Under the switch the program sees these differences:
+
+- With AH clear, FPCR.FZ flushes denormal inputs as well as outputs, so a program that sets MXCSR.FTZ without DAZ
+  also gets DAZ. x87test's mxcsr.ftz.flags shows the related one: no PE after a flushed underflow.
+- The default NaN is positive, where x86's indefinite NaN is negative.
+- NEP stays set in native code. That includes macOS code, since Wine's unix call dispatcher does not touch FPCR, not
+  only ARM64EC code. With NEP set, a scalar SIMD&FP instruction keeps the upper lanes of its destination instead of
+  zeroing them, and LLVM assumes they are zeroed, so compiled code that relies on that, in Wine, the CRT or a macOS
+  library, can compute different results. Wine's CRT math gave bit-identical results over 10,610 calls with NEP set,
+  but that does not cover other native code. Leaving AH set the same way did change the CRT's results (sinh(-1)
+  came out positive), which is why the switch drops AH rather than keeping it.
+- FIZ, set from MXCSR.DAZ, stays set while FEX's own helpers run.
+
+On an M5 Max, macOS 27.2 (2026-11-17): a native call 24.0 to 4.3 ns, QueryPerformanceCounter 40 to 20 ns, scalar SSE
+unchanged, SSE MIN/MAX 1.80 to 2.27 ns. The x64 fidelity programs give the same results except x87test's
+mxcsr.ftz.flags. Forza Horizon 6 played normally with it. Off unless HB_FEX_LAZY_AFP=1 is set.
+
+Built for arm64ec on FEX 2610 plus 0001 to 0034.
+---
 diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
 index 8986ec4..cde5cef 100644
 --- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
