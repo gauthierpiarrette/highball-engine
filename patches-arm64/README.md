@@ -42,6 +42,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0041` ntdll-arm64ec-the-x64-state-on-an-unhandled-exception | A crash log named the instruction but not the x64 registers. | Microsoft Flight Simulator 2024 | diagnostics | |
 | `0042` ntdll-arm64ec-rtliseccode-above-the-user-address-space | A thread could fault in a loop until its stack ran out. | Microsoft Flight Simulator 2024 | general | |
 | `0043` ntdll-arm64ec-a-program-sees-its-own-page-protection | Programs saw the emulator's page protection, so restoring it made their own pages fault. | Microsoft Flight Simulator 2024, copy protections | x86-64 fidelity | pairs with FEX 0022 |
+| `0058` ntdll-arm64ec-system-calls-write-into-the-emulators-write-trap | A system call that wrote into a page holding code that already ran failed with an access violation, where Windows writes. | Football Manager 27 | x86-64 fidelity | needs FEX's `BTCpu64NotifyMemoryDirty`; uses `0043`, test in `tests/x64-fidelity/syscallwrite` |
 
 ## Details
 
@@ -330,3 +331,56 @@ roam and normal exit, many sessions between 2026-10-29 and 2026-10-31. The stall
 protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the panel showed 8995 of 8997 frames at an even
 2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
 from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.
+
+### System call writes into the emulator's write trap (0058)
+
+FEX makes a read-write-execute page that holds translated code read-execute, so that a write into it faults into
+its tracking of self-modifying code. A system call that wrote into such a page for the program faulted on the Unix
+side and returned STATUS_ACCESS_VIOLATION, where the Windows kernel writes: a buffer next to code that ran could not
+take a read, a copy or a query. Football Manager 27's copy protection asks for the SMBIOS table that way and stopped
+the game at "Loading game database".
+
+`0058` marks the pages the emulator traps (ntdll's ARM64EC side asks `GuestProtection` from `0043` for each 4 KB
+page, committed pages only). A write from inside a system call into a marked page takes the steps of a write by
+the program, in FEX's order: the signal handler sends the thread to a user callback that calls
+`BTCpu64NotifyMemoryDirty`, opens the page and calls it again, and then the write runs again. FEX traps the page
+again when it translates code from it again. The callback runs during the call only when the thread holds no Unix
+lock, because FEX calls `NtProtectVirtualMemory` while it holds its own lock for code invalidation. Under a lock
+(`virtual_mutex` in `NtGetWriteWatch` or `NtQueryVirtualMemory`, `dir_mutex` in `NtQueryDirectoryFile`) the page
+opens on the Unix side, and the dispatcher runs the same callback when the call returns. A call without such a
+write runs no callback, but each Unix lock now also calls `pthread_getspecific` for the count (`VirtualQuery`
+in a loop: 0.7% slower than r5). A reply that wineserver writes straight into such a page (`NtQueryObject`, some
+`NtQueryInformationProcess` classes, registry queries) still ends the thread; that is not covered. macOS only.
+
+A first way, FEX's notice after the marked calls only (as `BTCpu64NotifyReadFile` does for `NtReadFile`), passed
+the other checks but let a second thread run old code: its own write into the open page did not reach FEX before
+the call returned (`thread.no-stale-code`, 2 to 73 stale runs of about 52,000 in 4 of 13 runs).
+
+tests/x64-fidelity `syscallwrite` (M5 Pro, macOS 27.2), 39 checks:
+
+| Engine | Result |
+|---|---|
+| Rosetta 2 (CrossOver 26.3) | 39 of 39 |
+| r5, without `0058` | 23 of the first 34, then `lock` hangs |
+| r5 with `0058` | 39 of 39 (10 of 10 runs) |
+
+`VirtualQuery` in a loop: about 1,173,000 calls a second on r5, 1,165,000 with `0058`.
+
+The other x64-fidelity tests give the same results with and without `0058`.
+
+Games on r5 with `0058` (M5 Pro, macOS 27.2, 2026-11-16):
+
+- Football Manager 27 (Game Pass): past "Loading game database", plays, and exits normally. Without `0058` it
+  stops there in 5 of 5 starts.
+- DREDGE: plays as before.
+- Forza Horizon 6 (Game Pass), with the arm64 route of Highball's recipe, at 2560x1440, the Medium preset and
+  V-Sync off, the game's benchmark, measured on the previous version of `0058` (which also called
+  `BTCpu64NotifyMemoryDirty` after every `VirtualQuery`):
+
+| | r5 | r5 with `0058` |
+|---|---|---|
+| Result | 43 fps | 43 fps |
+| CPU Simulation (average, 1% low, 0.1% low) | 113.5, 62.2, 45.5 | 114.5, 68.0, 43.3 |
+| CPU Render | 62.7, 47.6, 39.9 | 62.3, 46.8, 34.4 |
+| GPU | 44.4, 39.2, 37.3 | 44.6, 39.4, 35.6 |
+| GPU limited | 99.8% | 99.8% |

@@ -1,0 +1,572 @@
+ntdll: system calls write into the emulator's write trap, as the Windows kernel does.
+
+FEX makes a read-write-execute page that holds translated code read-execute, so that a write into it faults into
+its tracking of self-modifying code. A write by the program itself reaches FEX that way, but a system call that
+writes into such a page for the program faulted on the Unix side, in virtual_handle_fault, and returned
+STATUS_ACCESS_VIOLATION. Windows has no such trap, and the same call succeeds there. FEX's own
+BTCpu64NotifyReadFile names the case ("FEX could have write-protected the memory region when a JIT executed the
+code, and once the NtReadFile tries returning data, it faults. This requires coordination between Wine and FEX").
+
+Football Manager 27 (Game Pass) stopped at "Loading game database": its copy protection asked for the SMBIOS table
+with NtQuerySystemInformation(SystemFirmwareTableInformation) into a buffer on a page next to code it had run,
+the call returned STATUS_ACCESS_VIOLATION after a fault at the buffer's TableBufferLength, and the protection then
+read an address it had computed from the missing answer (an unhandled access violation in its own code).
+
+The write takes the same steps as a write by the program, in FEX's order: the translations of the page go, the
+page opens, and the translations go again (a translation made in between traps the page again).
+
+- ntdll's ARM64EC side marks the pages the emulator traps: after a successful NtProtectVirtualMemory on the
+  current process, each 4 KB page that the new protection leaves not writable, while GuestProtection (0043) says
+  the program made it writable, goes to the Unix side through a private NtSetInformationVirtualMemory class
+  (0x4842). The Unix side keeps the mark in a free page flag (VPROT_HB_EMU_TRAP), on committed pages only. Any
+  other protection change and a decommit clear it, and region queries ignore it, so a program sees the same
+  regions as before.
+- A write fault from inside a system call (is_inside_syscall) into a marked page returns STATUS_HB_EMULATOR_TRAP
+  to the signal handler. The handler saves the faulting state below the stack pointer and sends the thread to a
+  trampoline. The trampoline calls KeUserModeCallback (id 0x4846). KiUserCallbackDispatcher hands that id to
+  hb_emulator_trap_callback: BTCpu64NotifyMemoryDirty, open the page (class 0x4845), BTCpu64NotifyMemoryDirty.
+  Then brk #0x4847 gives the saved state back, and the write runs again. The page stays open until FEX
+  translates code from it again. If the callback cannot run, the trampoline opens the page without FEX.
+- FEX calls NtProtectVirtualMemory while it holds its lock for code invalidation, and the callback takes that
+  lock. So the callback runs during the call only when the thread holds no Unix lock: mutex_lock and mutex_unlock
+  count the locks of each thread, and server_enter_uninterrupted_section takes its lock through them. Under a
+  lock (for example virtual_mutex in NtQueryVirtualMemory, NtGetWriteWatch and NtFreeVirtualMemory, or dir_mutex
+  in NtQueryDirectoryFile) the page opens on the Unix side and is recorded for the thread, and a flag in the
+  syscall frame (RESTORE_FLAGS_HB_NOTIFY) makes the dispatcher run the same callback for those pages when the call
+  returns, with no lock held. A call without such a write runs no callback, but each mutex_lock and mutex_unlock
+  now also calls pthread_getspecific for the lock count (VirtualQuery in a loop is 0.7% slower, see below). Until
+  the call returns, another thread can run old code from such a page, as with BTCpu64NotifyReadFile.
+- Not covered: data that wineserver writes straight into a trapped page (a server reply such as NtQueryObject
+  with ObjectNameInformation, NtQueryInformationProcess with ProcessImageFileName, or a registry query) fails in
+  read_reply_data with EFAULT and still ends the thread. Asynchronous I/O that completes later is not covered
+  either.
+- macOS only (the trampoline uses Darwin's mcontext); other hosts keep the old result.
+
+tests/x64-fidelity/syscallwrite (M5 Pro, macOS 27.2), 39 checks: Rosetta 2 39 of 39. r5, without this patch: 23 of
+the first 34, then the lock check hangs. With this patch: 39 of 39 in 10 of 10 runs. Without the lock count, the
+lock check hung in 5 of 5 runs; with a notice only after NtQueryVirtualMemory, writewatch.no-flush ran old code.
+VirtualQuery in a loop: 1,173,000 calls a second on r5, 1,165,000 with this patch.
+
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index d98a886..405ac1d 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -889,6 +889,61 @@ NTSTATUS SYSCALL_API NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID
+     return status;
+ }
+ 
++/* Highball: the emulator makes a read-write-execute page that holds translated code read-execute to see writes into it;
++ * the Unix side marks such pages, so that a system call can still write into them as the Windows kernel does
++ * (dlls/ntdll/unix/virtual.c, HB_VM_EMULATOR_TRAP_INFORMATION) */
++#define HB_VM_EMULATOR_TRAP_INFORMATION 0x4842
++#define HB_VM_EMULATOR_OPEN_TRAP        0x4845
++static void hb_mark_emulator_trap( void *addr, SIZE_T size, ULONG prot )
++{
++    static const ULONG writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++    MEMORY_RANGE_ENTRY ranges[16];
++    char *page = (char *)((ULONG_PTR)addr & ~(ULONG_PTR)0xfff), *end = (char *)addr + size;
++    ULONG count = 0, trap = 1;
++
++    if (!pGuestProtection || (prot & writable)) return;
++    /* each page: only those the program itself made writable */
++    for (; page < end; page += 0x1000)
++    {
++        if (!(pGuestProtection( page, prot ) & writable)) continue;
++        if (count && (char *)ranges[count - 1].VirtualAddress + ranges[count - 1].NumberOfBytes == page)
++        {
++            ranges[count - 1].NumberOfBytes += 0x1000;
++            continue;
++        }
++        if (count == ARRAY_SIZE(ranges))
++        {
++            NtSetInformationVirtualMemory( GetCurrentProcess(), (VIRTUAL_MEMORY_INFORMATION_CLASS)HB_VM_EMULATOR_TRAP_INFORMATION,
++                                           count, ranges, &trap, sizeof(trap) );
++            count = 0;
++        }
++        ranges[count].VirtualAddress = page;
++        ranges[count].NumberOfBytes = 0x1000;
++        count++;
++    }
++    if (count)
++        NtSetInformationVirtualMemory( GetCurrentProcess(), (VIRTUAL_MEMORY_INFORMATION_CLASS)HB_VM_EMULATOR_TRAP_INFORMATION,
++                                       count, ranges, &trap, sizeof(trap) );
++}
++
++/* Highball: the user callback for a system call's write into the emulator's write trap (unix/signal_arm64.c): the
++ * page's translations go, the page opens, and they go again (a translation made in between traps the page again).
++ * After a write under a Unix lock, the page is open already and the callback runs when the call returns; a range
++ * of size 0 at NULL then means that the emulator drops all its translations. */
++NTSTATUS WINAPI __attribute__((used)) hb_emulator_trap_callback( void **args, ULONG len )
++{
++    MEMORY_RANGE_ENTRY range = { args[0], (SIZE_T)args[1] };
++    ULONG open = 1;
++    BOOL guard = enter_syscall_callback();  /* the emulator's own system calls do not call it back */
++
++    if (pBTCpu64NotifyMemoryDirty) pBTCpu64NotifyMemoryDirty( range.VirtualAddress, range.NumberOfBytes );
++    NtSetInformationVirtualMemory( GetCurrentProcess(), (VIRTUAL_MEMORY_INFORMATION_CLASS)HB_VM_EMULATOR_OPEN_TRAP,
++                                   1, &range, &open, sizeof(open) );
++    if (pBTCpu64NotifyMemoryDirty) pBTCpu64NotifyMemoryDirty( range.VirtualAddress, range.NumberOfBytes );
++    if (guard) leave_syscall_callback();
++    return STATUS_SUCCESS;
++}
++
+ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,
+                                              ULONG new_prot, ULONG *old_prot )
+ {
+@@ -896,7 +951,12 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+     NTSTATUS status;
+ 
+     if (!enter_syscall_callback())
+-        return syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
++    {
++        /* the emulator's own call: its write trap on translated code */
++        status = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
++        if (!status && is_current) hb_mark_emulator_trap( *addr_ptr, *size_ptr, new_prot );
++        return status;
++    }
+ 
+     if (!is_current) send_cross_process_notification( process, CrossProcessPreVirtualProtect,
+                                                       *addr_ptr, *size_ptr, 2, new_prot, 0 );
+@@ -913,6 +973,7 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+     else if (pNotifyMemoryProtect) pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, status );
+ 
+     leave_syscall_callback();
++    if (!status && is_current) hb_mark_emulator_trap( *addr_ptr, *size_ptr, new_prot );
+     return status;
+ }
+ 
+@@ -1615,10 +1676,16 @@ __ASM_GLOBAL_FUNC( "#KiUserCallbackDispatcher",
+                    ".seh_handler user_callback_handler, @except\n\t"
+                    "ldr x0, [sp]\n\t"             /* args */
+                    "ldp w1, w2, [sp, #0x08]\n\t"  /* len, id */
+-                   "ldr x3, [x18, 0x60]\n\t"      /* peb */
++                   "mov w3, #0x4846\n\t"          /* Highball: HB_CALLBACK_EMULATOR_TRAP, handled here */
++                   "cmp w2, w3\n\t"
++                   "b.ne 1f\n\t"
++                   "adrp x15, \"#hb_emulator_trap_callback\"\n\t"
++                   "add x15, x15, :lo12:\"#hb_emulator_trap_callback\"\n\t"
++                   "b 2f\n"
++                   "1:\tldr x3, [x18, 0x60]\n\t"    /* peb */
+                    "ldr x3, [x3, 0x58]\n\t"       /* peb->KernelCallbackTable */
+-                   "ldr x15, [x3, x2, lsl #3]\n\t"
+-                   "blr x15\n\t"
++                   "ldr x15, [x3, x2, lsl #3]\n"
++                   "2:\tblr x15\n\t"
+                    ".globl \"#KiUserCallbackDispatcherReturn\"\n"
+                    "\"#KiUserCallbackDispatcherReturn\":\n\t"
+                    "mov x2, x0\n\t"               /* status */
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index a9a9b70..4ce0057 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -268,6 +268,7 @@ C_ASSERT( offsetof(struct callback_stack_layout, sp) == 0x20 );
+ C_ASSERT( sizeof(struct callback_stack_layout) == 0x30 );
+ 
+ #define RESTORE_FLAGS_EMULATION  0x00010000
++#define RESTORE_FLAGS_HB_NOTIFY  0x00020000  /* Highball: tell the emulator about opened pages on return */
+ 
+ struct syscall_frame
+ {
+@@ -1264,6 +1265,8 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *context,
+  *
+  * Handler for SIGSEGV and related errors.
+  */
++static BOOL hb_trap_redirect( struct thread_data *data, ucontext_t *sigcontext, void *addr );
++
+ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+@@ -1301,7 +1304,15 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+     rec.NumberParameters = 2;
+ 
+-    if (!virtual_handle_fault( data, &rec, (void *)SP_sig(sigcontext) )) return;
++    switch (virtual_handle_fault( data, &rec, (void *)SP_sig(sigcontext) ))
++    {
++    case STATUS_SUCCESS:
++        return;
++    case STATUS_HB_EMULATOR_TRAP:
++        if (hb_trap_redirect( data, sigcontext, siginfo->si_addr )) return;
++        rec.ExceptionCode = STATUS_ACCESS_VIOLATION;
++        break;
++    }
+     if (handle_syscall_fault( data, sigcontext, &rec )) return;
+ 
+     save_context( &context, sigcontext );
+@@ -1309,6 +1320,68 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ }
+ 
+ 
++/**********************************************************************
++ *		hb_trap_redirect, hb_trap_trampoline
++ *
++ * Highball: a system call wrote into a page the emulator made read-execute to see writes into translated code
++ * (virtual.c). The handler sends the thread to hb_trap_trampoline on its kernel stack, below the faulting code: a user
++ * callback hands the page to the emulator and opens it; then brk #0x4847 comes back here and the saved state of the
++ * faulting write takes its place, and the write runs again.
++ */
++#ifdef __APPLE__
++static void hb_trap_trampoline( void *page, ULONG_PTR size )
++{
++    struct thread_data *data = get_thread_data();
++    void *args[2] = { page, (void *)size }, *ret_ptr;
++    ULONG ret_len;
++
++    data->hb_trap_callback = TRUE;
++    if (KeUserModeCallback( HB_CALLBACK_EMULATOR_TRAP, args, sizeof(args), &ret_ptr, &ret_len ))
++    {
++        /* no callback (no room on the kernel stack): open the page without the emulator, or the write faults again */
++        MEMORY_RANGE_ENTRY range = { page, size };
++        ULONG open = 1;
++
++        WARN( "the user callback for %p failed\n", page );
++        NtSetInformationVirtualMemory( GetCurrentProcess(), (VIRTUAL_MEMORY_INFORMATION_CLASS)HB_VM_EMULATOR_OPEN_TRAP,
++                                       1, &range, &open, sizeof(open) );
++    }
++    data->hb_trap_callback = FALSE;
++    __asm__ volatile( "brk #0x4847" );
++    for (;;) abort_thread( 1 );
++}
++
++static BOOL hb_trap_redirect( struct thread_data *data, ucontext_t *sigcontext, void *addr )
++{
++    struct __darwin_mcontext64 *saved;
++    ULONG_PTR sp = SP_sig(sigcontext) - 128 /* red zone */ - sizeof(*saved);
++
++    sp &= ~(ULONG_PTR)15;
++    saved = (struct __darwin_mcontext64 *)sp;
++    *saved = *sigcontext->uc_mcontext;
++    data->hb_trap_saved = saved;
++    SP_sig(sigcontext) = sp - 16;
++    PC_sig(sigcontext) = (ULONG_PTR)hb_trap_trampoline;
++    LR_sig(sigcontext) = 0;
++    FP_sig(sigcontext) = 0;
++    REGn_sig( 0, sigcontext ) = (ULONG_PTR)addr & ~(ULONG_PTR)(get_host_page_size() - 1);
++    REGn_sig( 1, sigcontext ) = get_host_page_size();
++    return TRUE;
++}
++
++static BOOL hb_trap_return( struct thread_data *data, ucontext_t *sigcontext, DWORD64 esr )
++{
++    if (ESR_ELx_EC(esr) != ESR_ELx_EC_BRK64 || ESR_ELx_ISS_BRK_COMMENT(esr) != 0x4847 || !data->hb_trap_saved) return FALSE;
++    *sigcontext->uc_mcontext = *(struct __darwin_mcontext64 *)data->hb_trap_saved;
++    data->hb_trap_saved = NULL;
++    return TRUE;
++}
++#else
++static BOOL hb_trap_redirect( struct thread_data *data, ucontext_t *sigcontext, void *addr ) { return FALSE; }
++static BOOL hb_trap_return( struct thread_data *data, ucontext_t *sigcontext, DWORD64 esr ) { return FALSE; }
++#endif
++
++
+ /**********************************************************************
+  *		ill_handler
+  *
+@@ -1393,6 +1466,8 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     esr = get_fault_esr( sigcontext );
+ #endif
+ 
++    if (hb_trap_return( data, sigcontext, esr )) return;  /* Highball: back to a write into the emulator's trap */
++
+     switch (ESR_ELx_EC(esr))
+     {
+     case ESR_ELx_EC_SOFTSTP_LOW:
+@@ -1791,6 +1866,51 @@ static BOOL hb_direct_continue_enabled(void)
+ }
+ #endif
+ 
++/***********************************************************************
++ *           hb_request_syscall_notify
++ *
++ * Highball: the current system call opened pages of the emulator's write trap while it held a Unix lock
++ * (virtual.c); tell the emulator about them when the call returns.
++ */
++void hb_request_syscall_notify( struct thread_data *data )
++{
++    get_syscall_frame( data )->restore_flags |= RESTORE_FLAGS_HB_NOTIFY;
++}
++
++/***********************************************************************
++ *           hb_syscall_notify
++ *
++ * Called by the dispatcher on the return of such a system call, with no Unix lock held: the user callback hands
++ * each page to the emulator, as for a write without a lock. Returns its argument (the syscall's x0).
++ */
++ULONG_PTR hb_syscall_notify( ULONG_PTR x0 )
++{
++    struct thread_data *data = get_thread_data();
++    struct syscall_frame *frame = get_syscall_frame( data );
++    void *args[2], *ret_ptr;
++    ULONG ret_len;
++    int i, count;
++
++    frame->restore_flags &= ~RESTORE_FLAGS_HB_NOTIFY;
++    count = data->hb_notify_count;
++    data->hb_notify_count = 0;
++    data->hb_trap_callback = TRUE;
++    if (count < 0)  /* too many pages: the emulator drops all its translations */
++    {
++        args[0] = NULL;
++        args[1] = 0;
++        KeUserModeCallback( HB_CALLBACK_EMULATOR_TRAP, args, sizeof(args), &ret_ptr, &ret_len );
++    }
++    for (i = 0; i < count; i++)
++    {
++        args[0] = data->hb_notify_pages[i];
++        args[1] = (void *)(ULONG_PTR)get_host_page_size();
++        KeUserModeCallback( HB_CALLBACK_EMULATOR_TRAP, args, sizeof(args), &ret_ptr, &ret_len );
++    }
++    data->hb_trap_callback = FALSE;
++    return x0;
++}
++
+ /* Returns its argument (the syscall's x0) when the dispatcher's fast path can finish the return itself. */
+ ULONG_PTR syscall_dispatcher_return_slowpath( ULONG_PTR x0 )
+ {
+@@ -2012,6 +2132,10 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
+                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
++                   "tbz x16, #17, 3f\n\t"       /* Highball: RESTORE_FLAGS_HB_NOTIFY */
++                   "bl " __ASM_NAME("hb_syscall_notify") "\n\t" /* returns x0 */
++                   "ldr w16, [sp, #0x10c]\n"
++                   "3:\t"
+                    "tbz x16, #16, 1f\n\t"       /* RESTORE_FLAGS_EMULATION */
+                    "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n\t"
+                    "ldr w16, [sp, #0x10c]\n"   /* Highball: the slow path may return (x0 kept); reload the flags */
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 9b6401e..9e448d4 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -126,6 +126,11 @@ struct thread_data
+     void        *start;             /* thread entry point */
+     void        *param;             /* thread entry point parameter */
+     struct list  entry;             /* entry in TEB list */
++    BOOL         hb_trap_callback;  /* Highball: in the user callback for a write into the emulator's trap */
++    void        *hb_trap_saved;     /* Highball: the faulting state the callback goes back to (signal_arm64.c) */
++    int          hb_lock_depth;     /* Highball: how many Unix locks the thread holds (mutex_lock) */
++    int          hb_notify_count;   /* Highball: pages opened under a lock in this system call, -1 for too many */
++    void        *hb_notify_pages[8]; /* Highball: and those pages (virtual.c, signal_arm64.c) */
+     char         debug_info[0x800]; /* debug_info structure */
+     char         signal_stack[];    /* signal stack */
+     /* char kernel_stack[] */
+@@ -480,6 +485,12 @@ static inline BOOL is_inside_signal_stack( struct thread_data *data, void *ptr )
+     return ((char *)ptr >= data->signal_stack && (char *)ptr < data->signal_stack + signal_stack_size);
+ }
+ 
++/* Highball: system call writes into the emulator's write trap (virtual.c, signal_arm64.c) */
++#define STATUS_HB_EMULATOR_TRAP ((NTSTATUS)0x20004842)  /* customer bit: virtual_handle_fault asks for the callback */
++#define HB_CALLBACK_EMULATOR_TRAP 0x4846                 /* KeUserModeCallback id that ntdll's ARM64EC side handles */
++#define HB_VM_EMULATOR_OPEN_TRAP 0x4845                  /* NtSetInformationVirtualMemory: open marked pages */
++extern void hb_request_syscall_notify( struct thread_data *data );
++
+ static inline BOOL is_inside_syscall( struct thread_data *data, ULONG_PTR sp )
+ {
+     if (!data->teb) return TRUE;
+@@ -493,13 +504,19 @@ static inline CLIENT_ID make_client_id( ULONG pid, ULONG tid )
+     return id;
+ }
+ 
++/* Highball: the lock count tells virtual_handle_fault whether a system call's write into the emulator's write trap
++ * may call the emulator back at once (no Unix lock held), or only when the call returns. */
+ static inline void mutex_lock( pthread_mutex_t *mutex )
+ {
++    struct thread_data *data;
+     if (!process_exiting) pthread_mutex_lock( mutex );
++    if ((data = get_thread_data())) data->hb_lock_depth++;
+ }
+ 
+ static inline void mutex_unlock( pthread_mutex_t *mutex )
+ {
++    struct thread_data *data;
++    if ((data = get_thread_data())) data->hb_lock_depth--;
+     if (!process_exiting) pthread_mutex_unlock( mutex );
+ }
+ 
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index bbcd4b2..bd9e602 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -280,6 +280,20 @@ static inline BOOL use_aslr(void)
+  * (NtSetInformationThread), so no page ever flips here. Everything else keeps the W^X dance below. */
+ #define VPROT_HB_MAPJIT      0x2000  /* an emulator code buffer that wants MAP_JIT */
+ #define VPROT_HB_MAPJIT_DONE 0x4000  /* and is mapped so */
++/* Highball: FEX makes a read-write-execute page that holds translated code read-execute (its write trap for
++ * self-modifying code), so a system call that writes into such a page for the program faulted here and returned
++ * STATUS_ACCESS_VIOLATION, where the Windows kernel writes. ntdll's ARM64EC side marks the pages the emulator traps
++ * (HB_VM_EMULATOR_TRAP_INFORMATION). A write from inside a system call into a marked page does what FEX does for a
++ * write by the program, in the same order: the translations of the page go first, then the trap. The signal handler
++ * sends the thread to a user callback (signal_arm64.c) that hands the page to FEX (BTCpu64NotifyMemoryDirty), opens
++ * it (HB_VM_EMULATOR_OPEN_TRAP) and hands it to FEX again; then the write runs again. The page stays open until FEX
++ * translates code from it again. The callback runs only when the thread holds no Unix lock (mutex_lock counts
++ * them): FEX calls NtProtectVirtualMemory while it holds its own lock for code invalidation, and the callback takes
++ * that lock, so two threads could wait for each other. Under a lock the page opens here, and the same callback runs
++ * when the system call returns (hb_request_syscall_notify). */
++#define HB_EMU_TRAP 1
++#define VPROT_HB_EMU_TRAP 0x80  /* page flag: the emulator's write trap on a page the program made writable */
++#define HB_VM_EMULATOR_TRAP_INFORMATION 0x4842   /* NtSetInformationVirtualMemory: mark or unmark pages */
+ static int hb_mapjit_request;   /* the allocation being mapped wants MAP_JIT (under virtual_mutex) */
+ static BOOL hb_mapjit_enabled(void)
+ {
+@@ -365,6 +379,9 @@ static int make_jit_range( char *base, size_t size )
+     return 0;
+ }
+ #endif
++#ifndef VPROT_HB_EMU_TRAP
++#define VPROT_HB_EMU_TRAP 0
++#endif
+ 
+ void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
+ {
+@@ -2679,7 +2696,7 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size
+     else host_end = ROUND_ADDR( base + size, host_page_mask );
+ 
+     if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
+-    set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
++    set_page_vprot_bits( base, size, 0, VPROT_COMMITTED | VPROT_HB_EMU_TRAP );  /* Highball: and the emulator's mark */
+     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
+     return STATUS_SUCCESS;
+ }
+@@ -4886,6 +4903,66 @@ static NTSTATUS grow_thread_stack( struct thread_data *data, char *page, struct
+ }
+ 
+ 
++#ifdef HB_EMU_TRAP
++/* Highball: open the marked pages of a host page (the emulator dropped their translations) */
++static void hb_open_emulator_trap( char *page )
++{
++    size_t i;
++
++    for (i = 0; i < host_page_size; i += page_size)
++    {
++        BYTE vprot = get_page_vprot( page + i );
++        if ((vprot & VPROT_HB_EMU_TRAP) && (vprot & VPROT_COMMITTED))
++            set_page_vprot( page + i, page_size, (vprot & ~VPROT_HB_EMU_TRAP) | VPROT_WRITE );
++    }
++    mprotect_range( page, host_page_size, 0, 0 );
++}
++
++static NTSTATUS hb_open_emulator_trap_range( ULONG_PTR count, MEMORY_RANGE_ENTRY *addresses )
++{
++    sigset_t sigset;
++    ULONG_PTR i;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    for (i = 0; i < count; i++)
++    {
++        char *page = ROUND_ADDR( addresses[i].VirtualAddress, host_page_mask );
++        char *end = (char *)addresses[i].VirtualAddress + addresses[i].NumberOfBytes;
++        for (; page < end; page += host_page_size) if (find_view( page, 0 )) hb_open_emulator_trap( page );
++    }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    return STATUS_SUCCESS;
++}
++
++/* Highball: mark (trap != 0) or unmark committed pages as the emulator's write trap */
++static NTSTATUS hb_set_emulator_trap( ULONG_PTR count, MEMORY_RANGE_ENTRY *addresses, ULONG trap )
++{
++    struct file_view *view;
++    sigset_t sigset;
++    ULONG_PTR i;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    for (i = 0; i < count; i++)
++    {
++        char *base = ROUND_ADDR( addresses[i].VirtualAddress, page_mask );
++        SIZE_T size = ROUND_SIZE( addresses[i].VirtualAddress, addresses[i].NumberOfBytes, page_mask ), off;
++
++        if (!size || !(view = find_view( base, size ))) continue;
++        if (!trap)
++        {
++            set_page_vprot_bits( base, size, 0, VPROT_HB_EMU_TRAP );
++            continue;
++        }
++        for (off = 0; off < size; off += page_size)  /* committed pages only */
++            if (get_page_vprot( base + off ) & VPROT_COMMITTED)
++                set_page_vprot_bits( base + off, page_size, VPROT_HB_EMU_TRAP, 0 );
++    }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    return STATUS_SUCCESS;
++}
++#endif
++
++
+ /***********************************************************************
+  *           virtual_handle_fault
+  */
+@@ -4937,6 +5014,33 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+     }
+ #endif
+ 
++#ifdef HB_EMU_TRAP
++    /* Highball: a system call writes into a page the emulator made read-execute to see writes into translated code.
++     * The Windows kernel writes there: the emulator drops the page's translations, then the page opens. */
++    if (err == EXCEPTION_WRITE_FAULT && (vprot & VPROT_HB_EMU_TRAP) && !(vprot & VPROT_GUARD) &&
++        is_inside_syscall( data, (ULONG_PTR)stack ) && !data->hb_trap_callback)
++    {
++        TRACE( "write from a system call into the emulator's trap at %p\n", addr );
++        if (data->hb_lock_depth > 1)  /* the system call holds a Unix lock besides virtual_mutex taken above */
++        {
++            int i;
++
++            /* open the page now; the emulator hears of it when the system call returns */
++            hb_open_emulator_trap( page );
++            for (i = 0; i < data->hb_notify_count; i++) if (data->hb_notify_pages[i] == page) break;
++            if (data->hb_notify_count >= 0 && i == data->hb_notify_count)
++            {
++                if (i < ARRAY_SIZE(data->hb_notify_pages)) data->hb_notify_pages[data->hb_notify_count++] = page;
++                else data->hb_notify_count = -1;  /* too many: the emulator drops all its translations */
++            }
++            hb_request_syscall_notify( data );
++            mutex_unlock( &virtual_mutex );
++            return STATUS_SUCCESS;
++        }
++        mutex_unlock( &virtual_mutex );
++        return STATUS_HB_EMULATOR_TRAP;  /* the signal handler sends the thread to the user callback */
++    }
++#endif
+ #ifdef __APPLE__
+     /* Rosetta on Apple Silicon misreports certain write faults as read faults. */
+     if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
+@@ -6021,7 +6125,7 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
+         BYTE vprot;
+ 
+         info->AllocationBase = alloc_base;
+-        info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~VPROT_WRITEWATCH );
++        info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, (BYTE)~(VPROT_WRITEWATCH | VPROT_HB_EMU_TRAP) );
+         info->State = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
+         info->Protect = (vprot & VPROT_COMMITTED) ? get_win32_prot( vprot, view->protect ) : 0;
+         info->AllocationProtect = get_win32_prot( view->protect, view->protect );
+@@ -6352,7 +6456,7 @@ static NTSTATUS get_working_set_ex( HANDLE process, LPCVOID addr,
+         while (start != (char *)view->base + view->size && r != ref + count
+                && r->addr < (char *)view->base + view->size)
+         {
+-            start += get_committed_size( view, start, end - start, &vprot, ~VPROT_WRITEWATCH );
++            start += get_committed_size( view, start, end - start, &vprot, (BYTE)~(VPROT_WRITEWATCH | VPROT_HB_EMU_TRAP) );
+             i = 0;
+             while (r + i != ref + count && r[i].addr < start) ++i;
+             if (vprot & VPROT_COMMITTED) fill_working_set_info( &data, view, vprot, r, i, info );
+@@ -7260,6 +7364,23 @@ NTSTATUS WINAPI NtSetInformationVirtualMemory( HANDLE process,
+     TRACE("(%p, info_class=%d, %lu, %p, %p, %u)\n",
+           process, info_class, count, addresses, ptr, size);
+ 
++#ifdef HB_EMU_TRAP
++    if ((ULONG)info_class == HB_VM_EMULATOR_TRAP_INFORMATION)  /* Highball: private class for ntdll's ARM64EC side */
++    {
++        if (process != GetCurrentProcess()) return STATUS_NOT_SUPPORTED;
++        if (!ptr) return STATUS_INVALID_PARAMETER_5;
++        if (size != sizeof(ULONG)) return STATUS_INVALID_PARAMETER_6;
++        if (!count) return STATUS_INVALID_PARAMETER_3;
++        return hb_set_emulator_trap( count, addresses, *(ULONG *)ptr );
++    }
++    if ((ULONG)info_class == HB_VM_EMULATOR_OPEN_TRAP)
++    {
++        if (process != GetCurrentProcess()) return STATUS_NOT_SUPPORTED;
++        if (!count || !addresses) return STATUS_INVALID_PARAMETER_3;
++        return hb_open_emulator_trap_range( count, addresses );
++    }
++#endif
++
+     switch (info_class)
+     {
+     case VmPrefetchInformation:
