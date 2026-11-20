@@ -27,6 +27,7 @@ $CC -o "$OUT/cowtest.exe" "$HERE/cowtest.c"
 $CC -shared -o "$OUT/imagequery-helper.dll" "$HERE/imagequery_dll.c" "$HERE/imagequery_asm.S"
 $CC -o "$OUT/imagequery.exe" "$HERE/imagequery.c"
 $CC -o "$OUT/imagemap.exe" "$HERE/imagemap.c"
+$CC -o "$OUT/msync-thread-exit.exe" "$HERE/msync-thread-exit.c"
 # x87test also as a 32-bit program: the x87 matters most to 32-bit games, which run through WoW64
 "$BIN/i686-w64-mingw32-clang" -O2 -Wall -Wno-unused-function -Wno-unused-variable -o "$OUT/x87test32.exe" "$HERE/x87test.c"
 "$BIN/i686-w64-mingw32-clang" -O2 -Wall -Wno-unused-function -Wno-unused-variable -o "$OUT/drtest32.exe" "$HERE/drtest.c"
