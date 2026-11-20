@@ -20,8 +20,9 @@ Microsoft Flight Simulator 2024's Xbox services were not tried (we do not have t
 
 Source and licence: the change is MetalHorizon's patch 0002 (github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher),
 ported by hand because Wine 11.18 moved WinHttpWebSocketCompleteUpgrade to dlls/winhttp/socket.c; the write_data
-check is ours. That repository is GPL-3.0 and its patch carries no licence or author line, so its author has been asked
-to allow it under LGPL-2.1 or later, as Wine; this patch should not be merged before he answers.
+check is ours. The repository is GPL-3.0 and the original patch carries no licence or author line. The author
+authorized LGPL-2.1 in response to a request for LGPL-2.1-or-later. The reply names version 2.1 explicitly.
+https://github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher/issues/20#issuecomment-7043976774
 
 Upstream: not sent.
 

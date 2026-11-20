@@ -335,8 +335,8 @@ from the one Microsoft Flight Simulator 2024 pins until a flight has run on them
 ### WebSocket connection (0061)
 
 From the MetalHorizon launcher's Wine patch 0002 (alexandreunitypro, github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher),
-ported to 11.18. That repository is GPL-3.0 and the patch has no licence line; its author has been asked to allow it
-under LGPL-2.1 or later, and it should not be merged before he answers. Forza Horizon 6's PlayFab and Xbox real-time
+ported to 11.18. Its author gave [permission under LGPL-2.1](https://github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher/issues/20#issuecomment-7043976774)
+in response to a request for LGPL-2.1-or-later. Forza Horizon 6's PlayFab and Xbox real-time
 activity WebSockets spun on WSAEWOULDBLOCK, about 15,000 receives a second per thread: the connection stayed on the
 request after the upgrade, went back to the keep-alive pool and was reused by the next request while the WebSocket
 read from it. The WebSocket now owns its connection, and WinHttpWriteData on the upgraded request returns
