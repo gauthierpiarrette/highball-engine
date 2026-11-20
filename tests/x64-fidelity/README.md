@@ -29,6 +29,7 @@ a wrong check, not a finding.
 | `syscallwrite` | system calls (ReadProcessMemory, ReadFile, NtQuerySystemInformation for the SMBIOS firmware table) that write into a read-write-execute page whose code already ran, before the program writes there itself; the code still runs afterwards and a rewrite without a flush takes effect; GetWriteWatch and NtQueryDirectoryFile, which write while the system holds a lock; a VirtualQuery and a copy into such a page while a second thread rewrites code (no hang, no old code) |
 | `msync-thread-exit` | 2,000 alertable waits and APCs on successive threads, checking a live file and event after each thread exits. For an msync comparison, run on the same engine with and without `WINEMSYNC=1` |
 | `msync-pingpong` | Event ping-pong and eight threads on a semaphore and a mutex (timings as INFO), WaitAny/WaitAll, 1,000 APCs to an alertable wait, and a mutex abandoned by an exiting thread. For an msync comparison, run on the same engine with and without `WINEMSYNC=1` |
+| `scalarminmax` | compares all 128 destination bits after legacy MINSS, MAXSS, MINSD and MAXSD. With FEX, run with and without `HB_FEX_LAZY_AFP=1` |
 
 Output: one line per check, `PASS <id>`, `FAIL <id>: <detail>` or `INFO <id>: <value>`, then
 `SUMMARY <test> pass=N fail=M`; the exit code is the number of failures.
