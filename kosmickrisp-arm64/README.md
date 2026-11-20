@@ -30,7 +30,10 @@ with two sets of patches, applied in this order:
     both off (the default) the key is unchanged and no existing cache is rebuilt. A native Vulkan
     compute test with robustBufferAccess2 (scattered storage and uniform reads, M5 Max): 12.25 ms, 10.44 with
     `HB_KK_NO_UBO_ROBUST=1`, 8.73 with both. Forza Horizon 6 with both: higher frame rate, no visible artifacts. A read past
-    a bound storage buffer returns the memory after it, and a write past it lands there. Two consequences of the key: a
+    a bound storage buffer can access memory beyond its range. With the storage switch on, a null storage buffer
+    descriptor also loses its zero-read and discarded-write behavior. The descriptor has size zero and uses GPU
+    address zero unless `HB_KK_NO_UBO_ROBUST=1` supplies the shared zero buffer from `0007`, which a storage write
+    can modify. These are consequences of the descriptor layout and shader lowering. Two consequences of the key: a
     recipe that already sets `HB_KK_NO_UBO_ROBUST` gets a new key once and rebuilds its cache; and a cache written under
     `0007` alone with that switch on stays under the default key, so if such a recipe later drops the switch, shaders
     translated without robustness are reused until that cache is cleared.
