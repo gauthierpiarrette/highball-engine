@@ -42,6 +42,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0041` ntdll-arm64ec-the-x64-state-on-an-unhandled-exception | A crash log named the instruction but not the x64 registers. | Microsoft Flight Simulator 2024 | diagnostics | |
 | `0042` ntdll-arm64ec-rtliseccode-above-the-user-address-space | A thread could fault in a loop until its stack ran out. | Microsoft Flight Simulator 2024 | general | |
 | `0043` ntdll-arm64ec-a-program-sees-its-own-page-protection | Programs saw the emulator's page protection, so restoring it made their own pages fault. | Microsoft Flight Simulator 2024, copy protections | x86-64 fidelity | pairs with FEX 0022 |
+| `0065` ntdll-server-msync-on-the-arm64-line | The arm64 line had no msync, so a bottle's msync setting did nothing and every wait went to wineserver; Forza Horizon 6 showed Low Streaming Bandwidth above 200 km/h. | every arm64 bottle in practice (msync is Highball's default sync; WINEMSYNC=1) | macOS | CrossOver 26.3.0's msync (Marc-Aurel Zent, LGPL-2.1 or later, the tarball in `inputs.json`), ported to inproc sync; server protocol 963 |
 
 ## Details
 
@@ -330,3 +331,24 @@ roam and normal exit, many sessions between 2026-10-29 and 2026-10-31. The stall
 protection is gone, and at 1080p, Very Low, FSR Quality and a cap of 30 the panel showed 8995 of 8997 frames at an even
 2 vsyncs. These patches apply to every game on an engine built with them, so the line that ships them is separate
 from the one Microsoft Flight Simulator 2024 pins until a flight has run on them.
+
+### msync (0065)
+
+`0065` brings msync to this line. `dlls/ntdll/unix/msync.[ch]` and `server/msync.[ch]` are byte-identical to CrossOver
+26.3.0's published sources (`crossover-sources-26.3.0.tar.gz`, pinned in `inputs.json`); the glue is ported to 11.18's
+inproc sync, a thread's alert slot is no longer passed to close() when it exits, and
+`get_inproc_sync_fd` carries the msync slot index (protocol 963). A test program on an M5 Max: event ping-pong 18.0 to 7.2
+us, 8 threads on a semaphore and a mutex 1.24 to 0.089 s, WaitAll, APCs and abandoned mutexes correct. Forza Horizon 6:
+"msync: up and running", 400 km/h through Tokyo with no Low Streaming Bandwidth warning. It applies to every bottle whose
+sync is msync, which is Highball's default, so in practice every arm64 bottle gets it, Microsoft Flight Simulator
+2024's included; nobody has tried that game with it yet, nor a 16 GB Mac. Upstream Wine is already at protocol 963 with
+a different layout, so the next rebase has to renumber.
+
+Other programs on the same engine with WINEMSYNC=1 (M5 Max, macOS 27.2, 2026-11-17): Steam's client, its CEF web helper
+(GPU web views on and off) and the Steam overlay ran all day; EA SPORTS FC 27 (D3D12 through vkd3d-proton) ran three
+sessions through its menus and settings; the test program above. The only hang seen was the overlay freeze that 0064
+fixes (Steam's service ending on a missing gdi32 export), not a wait. Highball's
+note that Steam's web helper hung under msync on Wine 10 did not reproduce here.
+
+Source and licence: msync is CodeWeavers' code (Marc-Aurel Zent) from CrossOver's Wine tree, published under Wine's
+LGPL-2.1 or later in CrossOver 26.3.0's source tarball; the files keep their copyright headers.
