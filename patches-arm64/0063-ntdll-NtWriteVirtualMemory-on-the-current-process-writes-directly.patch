@@ -1,0 +1,123 @@
+ntdll: NtWriteVirtualMemory on the current process writes directly.
+
+Wine writes another process's memory through wineserver, which on macOS writes through the Mach task port. macOS
+refuses the server that port, so WriteProcessMemory failed with ERROR_ACCESS_DENIED even when a process wrote its own
+code. In-process hookers do exactly that: the Steam overlay (GameOverlayRenderer64.dll) logged "WriteProcessMemory()
+call failed trying to overwrite first 5 bytes of function body during hook" for every function and never showed.
+NtWriteVirtualMemory now writes the current process itself with virtual_uninterrupted_write_memory (write access
+checked and write watches updated under the virtual lock, then one memcpy; no probing write into the target), as
+NtReadVirtualMemory already reads it. An x64 test that rewrites the first five bytes of XInputGetState, GetCursorPos,
+CreateDXGIFactory1 and Sleep through WriteProcessMemory got ERROR_ACCESS_DENIED before and succeeds after (M5 Max,
+macOS 27.2, 2026-11-17). The overlay also needs 0064, and its swap chain hooks need DXVK's methods to be detourable
+on ARM64EC, which is a separate change.
+
+The memcpy can fault. With 0019, image pages a program made WRITECOPY stay read-execute on the host until the first
+write, so the copy faults inside the uninterrupted section; the fault handler resolves it, which works only because
+virtual_mutex is recursive and SIGSEGV is not blocked in that section. virtual_uninterrupted_write_memory's premise
+that nothing faults inside it no longer holds for these pages.
+
+Pages FEX keeps write-trapped while the program sees them writable (0043) are read-execute in Wine's view, so the
+direct write refuses them with STATUS_PARTIAL_COPY, where Windows writes. kernelbase's WriteProcessMemory only makes
+pages writable that read back as not writable, and with 0043 they read back as the program's read-write-execute, so
+ntdll's ARM64EC NtWriteVirtualMemory now handles that case: when the write fails on the current process, each page
+that is not writable on the host but writable for the program (the emulator's GuestProtection) gets the program's
+protection back through NtProtectVirtualMemory, which tells the emulator to drop its translations of the page, and
+the write is retried once. The emulator protects the page again when it next translates it.
+
+This turns every program that patches itself through WriteProcessMemory, overlays, DRM, anti-cheat, mod loaders and
+Forza Horizon 6's copy protection, from failing to succeeding. tests/x64-fidelity/wpmtest.c writes data, the program's
+own image code, and generated code that has already run (read-write-execute and read-execute, through
+WriteProcessMemory and NtWriteVirtualMemory), and calls the code after each write. M5 Max, macOS 27.2, 2026-11-19:
+before 0063, the writes fail with ERROR_ACCESS_DENIED; with the unix part alone 10/2 (both failures are the
+write-trapped read-write-execute page, ERROR_PARTIAL_COPY and STATUS_PARTIAL_COPY); with the ARM64EC part 12/0.
+memtest 53/0, smcdata and smcretire 0 stale calls, unchanged.
+Microsoft Flight Simulator 2024 was not tried: we do not have it.
+
+Upstream: not sent.
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index bbcd4b2..b4f5359 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -7128,7 +7128,22 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
+ {
+     unsigned int status;
+ 
+-    if (virtual_check_buffer_for_read( buffer, size ))
++    if (process == GetCurrentProcess())
++    {
++        /* The server writes through the Mach task port on macOS, which it is refused for
++         * our own process; write our own memory here, as NtReadVirtualMemory reads it. */
++        if (!virtual_check_buffer_for_read( buffer, size ))
++        {
++            status = STATUS_PARTIAL_COPY;
++            size = 0;
++        }
++        else if ((status = virtual_uninterrupted_write_memory( addr, buffer, size )))
++        {
++            status = STATUS_PARTIAL_COPY;
++            size = 0;
++        }
++    }
++    else if (virtual_check_buffer_for_read( buffer, size ))
+     {
+         SERVER_START_REQ( write_process_memory )
+         {
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index d98a886..b0629e1 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -651,7 +651,7 @@ DEFINE_SYSCALL(NtWorkerFactoryWorkerReady, (HANDLE handle))
+ DEFINE_SYSCALL(NtWriteFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, const void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key))
+ DEFINE_SYSCALL(NtWriteFileGather, (HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key))
+ DEFINE_SYSCALL(NtWriteRequestData, (HANDLE handle, LPC_MESSAGE *request, ULONG id, void *buffer, ULONG len, ULONG *retlen))
+-DEFINE_SYSCALL(NtWriteVirtualMemory, (HANDLE process, void *addr, const void *buffer, SIZE_T size, SIZE_T *bytes_written))
++DEFINE_WRAPPED_SYSCALL(NtWriteVirtualMemory, (HANDLE process, void *addr, const void *buffer, SIZE_T size, SIZE_T *bytes_written))
+ DEFINE_SYSCALL(NtYieldExecution, (void))
+ 
+ NTSTATUS SYSCALL_API NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
+@@ -916,6 +916,44 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+     return status;
+ }
+ 
++/* Highball: a page the emulator made read-execute to see writes into translated code is still writable for the
++ * program, so a write into it from WriteProcessMemory succeeds on Windows. Where the direct write fails on such
++ * a page, give it back the protection the program set, through NtProtectVirtualMemory so the emulator drops its
++ * translations of that page, and write again. The emulator protects the page again when it translates it. */
++NTSTATUS SYSCALL_API NtWriteVirtualMemory( HANDLE process, void *addr, const void *buffer, SIZE_T size,
++                                           SIZE_T *bytes_written )
++{
++    NTSTATUS status = syscall_NtWriteVirtualMemory( process, addr, buffer, size, bytes_written );
++    ULONG_PTR page, end;
++    BOOL changed = FALSE;
++
++    if (status != STATUS_PARTIAL_COPY || !size || !pGuestProtection || !RtlIsCurrentProcess( process ))
++        return status;
++
++    end = (ULONG_PTR)addr + size;
++    if (end < (ULONG_PTR)addr) return status;
++    for (page = (ULONG_PTR)addr & ~(page_size - 1); page < end; page += page_size)
++    {
++        MEMORY_BASIC_INFORMATION info;
++        ULONG guest, old;
++        void *base = (void *)page;
++        SIZE_T len = page_size;
++
++        if (syscall_NtQueryVirtualMemory( process, base, MemoryBasicInformation, &info, sizeof(info), NULL ) ||
++            info.State != MEM_COMMIT)
++            return status;
++        if (info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
++            continue;
++        guest = pGuestProtection( base, info.Protect );
++        if (!(guest & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
++            return status;
++        if (NtProtectVirtualMemory( process, &base, &len, guest, &old )) return status;
++        changed = TRUE;
++    }
++    if (!changed) return status;
++    return syscall_NtWriteVirtualMemory( process, addr, buffer, size, bytes_written );
++}
++
+ /* Highball: a page the emulator made read-execute to see writes into translated code reads back with the protection
+  * the program set itself, as on Windows, where no such step exists */
+ NTSTATUS SYSCALL_API NtQueryVirtualMemory( HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class,
