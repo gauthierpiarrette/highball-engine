@@ -1,4 +1,4 @@
-d3d12core: enable VK_EXT_swapchain_colorspace, so HDR swapchains get HDR surface formats.
+d3d12core: enable VK_EXT_swapchain_colorspace with DXVK_HDR=1.
 
 vkd3d-proton never asked the instance for VK_EXT_swapchain_colorspace. On drivers that list HDR color spaces only
 when it is enabled (KosmicKrisp, Mesa's common WSI), the surface offered sRGB alone, SetColorSpace1 of
@@ -6,33 +6,59 @@ DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 (HDR10) or G10_NONE_P709 (scRGB) fail
 went on rendering HDR wrote PQ values into an sRGB swapchain: a washed-out grey picture. The extension is optional, so
 nothing changes where it is missing; an unsupported color space is now logged.
 
-It reaches every game with an FP16 swapchain, not only HDR ones: DXVK's dxgi puts every R16G16B16A16_FLOAT swapchain
-in scRGB whenever the presenter accepts that color space, which it now does on KosmicKrisp. What the display does with
-scRGB is up to the driver (KosmicKrisp 0011 gives it default HDR metadata only when asked). HDR10 still needs
-DXVK_HDR=1: DXVK only accepts the HDR10 color space with enableHDR set. It changes the MoltenVK route as well, which
-was not tried with Microsoft Flight Simulator 2024 (we do not have it).
+The extension is requested only with DXVK_HDR=1, which also lets DXVK accept the HDR10 color space. On KosmicKrisp,
+DXVK's DXGI can then put any R16G16B16A16_FLOAT swapchain in scRGB with EDR. With the switch unset, the driver
+continues offering only sRGB through this path.
 
-Checked on an M5 Max, macOS 27.2, KosmicKrisp (2026-11-17): Forza Horizon 6 sets color space 12 (HDR10) and EA SPORTS
+Before adding the DXVK_HDR gate, checked on an M5 Max, macOS 27.2, KosmicKrisp (2026-11-17): Forza Horizon 6 sets color space 12 (HDR10) and EA SPORTS
 FC 27 color space 1 (scRGB), both accepted, both shown as HDR. Builds with the renderers' llvm-mingw for x86-64 on top
 of 0001 to 0012.
 
 Upstream: not sent.
 
 diff --git a/libs/d3d12core/main.c b/libs/d3d12core/main.c
-index a8498bca..4ebcdfe7 100644
+index a8498bca73738e2a0509fc54fec91f510c3041b1..fb0f45ca239b24245576a2c5257f52dd702771f9 100644
 --- a/libs/d3d12core/main.c
 +++ b/libs/d3d12core/main.c
-@@ -581,6 +581,8 @@ static HRESULT vkd3d_create_instance_global(struct vkd3d_instance **out_instance
+@@ -566,6 +566,7 @@ done:
+ static HRESULT vkd3d_create_instance_global(struct vkd3d_instance **out_instance)
+ {
+     struct vkd3d_instance_create_info instance_create_info;
++    char hdr[3];
+     HRESULT hr = S_OK;
+ 
+     static const char * const instance_extensions[] =
+@@ -576,7 +577,7 @@ static HRESULT vkd3d_create_instance_global(struct vkd3d_instance **out_instance
+ #endif
+     };
+ 
+-    static const char * const optional_instance_extensions[] =
++    const char *optional_instance_extensions[] =
+     {
          VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
          VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
-         VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
-+        /* HDR10 and scRGB surface formats for SetColorSpace1 */
-+        VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,
- #ifndef _WIN32
-         /* TODO: We need to attempt to dlopen() native DXVK DXGI and handle this more gracefully. */
-         "VK_KHR_xcb_surface",
+@@ -587,6 +588,7 @@ static HRESULT vkd3d_create_instance_global(struct vkd3d_instance **out_instance
+         "VK_KHR_xlib_surface",
+         "VK_KHR_wayland_surface",
+ #endif
++        NULL, /* Optional HDR color spaces. */
+     };
+ 
+ #ifdef _WIN32
+@@ -605,7 +607,10 @@ static HRESULT vkd3d_create_instance_global(struct vkd3d_instance **out_instance
+     instance_create_info.instance_extensions = instance_extensions;
+     instance_create_info.instance_extension_count = ARRAY_SIZE(instance_extensions);
+     instance_create_info.optional_instance_extensions = optional_instance_extensions;
+-    instance_create_info.optional_instance_extension_count = ARRAY_SIZE(optional_instance_extensions);
++    instance_create_info.optional_instance_extension_count = ARRAY_SIZE(optional_instance_extensions) - 1;
++    if (vkd3d_get_env_var("DXVK_HDR", hdr, sizeof(hdr)) && !strcmp(hdr, "1"))
++        optional_instance_extensions[instance_create_info.optional_instance_extension_count++] =
++                VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+ 
+ #ifdef _WIN32
+     openvr_extensions = openvr_instance_extensions();
 diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
-index 8dd2cc10..9bb0c786 100644
+index 8dd2cc10fb2aca3390780dca8a7f50227b3792f0..9bb0c786b02e6cc3ae23dd421b7536c94957ecb5 100644
 --- a/libs/vkd3d/swapchain.c
 +++ b/libs/vkd3d/swapchain.c
 @@ -1278,7 +1278,10 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetColorSpace(IDXGIVkSwapCha
