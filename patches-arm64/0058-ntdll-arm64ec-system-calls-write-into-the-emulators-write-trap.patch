@@ -533,7 +533,7 @@ index bbcd4b2..bd9e602 100644
  
          info->AllocationBase = alloc_base;
 -        info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~VPROT_WRITEWATCH );
-+        info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~(VPROT_WRITEWATCH | VPROT_HB_EMU_TRAP) );
++        info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, (BYTE)~(VPROT_WRITEWATCH | VPROT_HB_EMU_TRAP) );
          info->State = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
          info->Protect = (vprot & VPROT_COMMITTED) ? get_win32_prot( vprot, view->protect ) : 0;
          info->AllocationProtect = get_win32_prot( view->protect, view->protect );
@@ -542,7 +542,7 @@ index bbcd4b2..bd9e602 100644
                 && r->addr < (char *)view->base + view->size)
          {
 -            start += get_committed_size( view, start, end - start, &vprot, ~VPROT_WRITEWATCH );
-+            start += get_committed_size( view, start, end - start, &vprot, ~(VPROT_WRITEWATCH | VPROT_HB_EMU_TRAP) );
++            start += get_committed_size( view, start, end - start, &vprot, (BYTE)~(VPROT_WRITEWATCH | VPROT_HB_EMU_TRAP) );
              i = 0;
              while (r + i != ref + count && r[i].addr < start) ++i;
              if (vprot & VPROT_COMMITTED) fill_working_set_info( &data, view, vprot, r, i, info );
