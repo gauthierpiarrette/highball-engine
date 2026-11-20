@@ -30,14 +30,15 @@ with two sets of patches, applied in this order:
     scale, pre-exposure and flags of that structure. A blit the scaler cannot take (another region, a missing image, a
     content scale outside what MetalFX supports, motion vectors at the output size without the macOS 27 SDK and
     runtime) is performed as an ordinary blit, so the output is always written. One scaler per context (a nonzero
-    id the caller picks), up to 8, least recently used replaced; it is sized from the color and output images, with
-    input content properties on, so a change of render size within the color image keeps the scaler and its
-    history, and a new scaler starts with a reset. Every command buffer that encodes a scaler holds a reference to it
-    until it is reset or freed, which Vulkan allows only after it completed, so a replaced scaler lives as long as
-    the GPU work that uses it. The encoder after the scale waits for all earlier work of the queue (KosmicKrisp's
-    encoders already end in a barrier before all later stages). A command buffer replayed by the queue drops the
-    structure (Mesa's command queue copies unknown pNext structures by reference), so a replay is an ordinary blit.
-    Written for Highball from Apple's MetalFX headers; it shares no code with MetalSharp. Used by vkd3d-proton `0014`
+    id the caller picks), up to 8, sized from the color and output images with dynamic input content enabled.
+    Content outside the supported range takes the ordinary blit and logs once per device. The scaler stays cached
+    through that fallback and starts fresh when temporal scaling resumes. A queue submission expires cache entries
+    idle for 30 seconds, and a full cache evicts the least recently used entry. Command buffers retain the scalers
+    they encode until reset or free. A producer barrier immediately after MetalFX orders later work on the same Metal
+    queue, including work in other command buffers. A command buffer replayed by the queue drops the structure
+    (Mesa's command queue copies unknown pNext structures by reference), so a replay is an ordinary blit.
+    Credit to Avery Felts and MetalSharp for the idea of adding MetalFX temporal upscaling to the driver.
+    The implementation uses Apple's MetalFX headers. Used by vkd3d-proton `0014`
     for FSR 3.1. Forza Horizon 6 at FSR Quality on an M5 Max, macOS 27.2, on the base of this series with `0011`,
     `0012` and vkd3d-proton `0013` and `0014` built as in CI (2026-11-19): "kk: MetalFX temporal 1728x1117, content
     1152x744 -> 1728x1117" and, at Retina, 2304x1492 to 3456x2234; full frame, the game's sharpening, HDR, no
