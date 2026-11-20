@@ -7,9 +7,11 @@ address to one of 256 queues, each guarded by a spinlock that only ever spins, a
 wake either sees the waiter or the waiter sees the new value) and returns from a wake when there are none; the spinlock
 tests before it sets and yields the core after 256 spins, so a preempted holder no longer keeps every other thread
 spinning for its time slice. tests/x64-fidelity/wakestress.c (WaitOnAddress/WakeByAddressSingle producers and
-consumers, 8 consumers, two runs each, M5 Max, macOS 27.2, 2026-11-19) lost no wakeups before or after and went from
+consumers, 8 consumers, two runs each, M5 Max, macOS 27.2, 2026-11-19) consumed every item before and after and went from
 3.7-4.1 to 7.4-9.9 million items a second with 4 producers, from 2.2-2.9 to 11.4-11.6 million with 16 and from 2.4-2.6
-to 11.4-11.5 million with 24; a wake with nobody waiting from 33 to 27 ns. In the game the overlay's CPU time dropped by about 2 ms (GPU 11.0 ms, CPU 8.7 ms afterwards).
+to 11.4-11.5 million with 24; a wake with nobody waiting from 33 to 27 ns.
+One in-game run showed 8.7 ms CPU and 11.0 ms GPU in the overlay with the patch. There is no recorded before value
+or repeat run to establish the roughly 2 ms CPU estimate.
 
 Upstream: not sent.
 

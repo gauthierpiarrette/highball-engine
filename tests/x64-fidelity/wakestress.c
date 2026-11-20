@@ -1,12 +1,12 @@
 /* WaitOnAddress / WakeByAddressSingle under load, as a job system uses them: producers add work to a counter and
- * wake, consumers take work or wait on the counter. Every item has to be consumed (a lost wakeup leaves items behind
- * until the 50 ms wait timeout, and a run that does not finish in 10 s fails). Records the cost of a wake with nobody
+ * wake, consumers take work or wait on the counter. Every item has to be consumed, and a wait timing out with work
+ * pending is counted even if the work is later consumed. Records the cost of a wake with nobody
  * waiting and the items per second for 4, 16 and 24 producers with 8 consumers.
  * Arguments: [producers consumers items-per-producer] runs that one configuration only. */
 #include "fid.h"
 #include <stdlib.h>
 
-static volatile LONG work, done, stop;
+static volatile LONG work, done, stop, pending_timeouts, wait_errors;
 static LONG items;
 
 static DWORD WINAPI consumer(void *arg)
@@ -21,7 +21,11 @@ static DWORD WINAPI consumer(void *arg)
             continue;
         }
         if (stop) return 0;
-        WaitOnAddress((void *)&work, &zero, sizeof(LONG), 50);
+        if (!WaitOnAddress((void *)&work, &zero, sizeof(LONG), 50))
+        {
+            if (GetLastError() != ERROR_TIMEOUT) InterlockedIncrement(&wait_errors);
+            else if (InterlockedCompareExchange(&work, 0, 0) > 0) InterlockedIncrement(&pending_timeouts);
+        }
     }
 }
 
@@ -48,7 +52,7 @@ static void run(int producers, int consumers, LONG per_producer)
     char id[64];
     int i;
 
-    work = done = stop = 0;
+    work = done = stop = pending_timeouts = wait_errors = 0;
     items = per_producer;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
@@ -66,6 +70,10 @@ static void run(int producers, int consumers, LONG per_producer)
     seconds = (t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
     snprintf(id, sizeof(id), "items.%dp%dc", producers, consumers);
     fid_check(done == expected, id, "%ld of %ld items consumed", done, expected);
+    snprintf(id, sizeof(id), "wait.%dp%dc", producers, consumers);
+    /* Work can also arrive just as a timeout returns, so report the observation as such. */
+    fid_check(!pending_timeouts && !wait_errors, id, "%ld timeouts with work pending, %ld unexpected wait errors",
+              pending_timeouts, wait_errors);
     snprintf(id, sizeof(id), "rate.%dp%dc", producers, consumers);
     fid_info(id, "%.2f million items/s (%ld items in %.3f s)", done / seconds / 1e6, done, seconds);
 }
