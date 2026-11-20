@@ -435,4 +435,6 @@ The Intel line's `0030` for this line, unchanged. On the arm64 engine r5 (M5 Max
 "unimplemented function GDI32.dll.D3DKMTSetProcessSchedulingPriorityClass, aborting" from Steam's 32-bit service came
 right before an `assert_steam.exe` dump ("CSteamEngine::BMainLoop appears to have stalled > 15 seconds") each time the
 overlay opened in Forza Horizon 6; the overlay stayed empty and the game froze. With the patch a 32-bit test finds the
-export and gets STATUS_SUCCESS, and the overlay draws and closes normally.
+export and gets STATUS_SUCCESS. The overlay drew and closed normally in a local build that also included Wine
+`0063` and an ARM64EC DXVK change that made the swapchain methods detourable. The overlay is expected to work with
+CI's x86-64 renderers and `0063`; that combination still needs a run.
