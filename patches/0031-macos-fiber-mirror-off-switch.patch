@@ -1,0 +1,169 @@
+macOS: HB_FIBER_MIRROR=0 keeps the pthread QoS value in %gs:0x20 for PE code too.
+
+0008 and 0009 give %gs:0x20 to Tib.FiberData whenever PE code runs, so the
+GetCurrentFiber() intrinsic finds the real fiber, and give the slot back to
+the macOS QoS value at every entry into unix code. D3DMetal's PE DLLs call
+host code directly, without passing a dispatcher, so host code running on a
+game thread can still find a fiber pointer where pthread and libdispatch
+expect the thread's QoS class.
+
+MEASURED (highball#371, AlexPako, M5 Pro, macOS 27.2.1, Steam copy of
+Diablo II: Resurrected, D3DMetal, 2026-11-13 and 2026-11-14):
+
+  * engine r31 (Wine with 0008 and 0009): the game exits a few seconds after
+    start, before any window, with SIGILL; AVX, sync, the timestamp shim and
+    the overlay made no difference.
+  * r31 with the Wine of r4 (before 0008 and 0009): reaches the menu and plays.
+  * r31 with the Wine of r33 built with the mirror neutralised (highball-engine
+    run 43582177770, branch exp-no-fiber-mirror): reaches the menu and plays,
+    58.6 fps average with a 60 fps cap, four minutes, normal exit.
+
+So the mirror is what stops the game. That the stop is libdispatch rejecting
+a fiber pointer as a priority (a client crash is ud2, hence SIGILL) is the
+reading that fits, not confirmed with a crash report.
+
+The mirror can't simply go: Marvel's Guardians of the Galaxy (0008) and
+Metaphor: ReFantazio (0009) are verified with it. So it stays the default and
+a process can turn it off:
+
+  * ntdll reads HB_FIBER_MIRROR once, on the first thread. Each thread keeps a
+    pointer (amd64_thread_data, TEB+0x350) to what PE code gets in the slot:
+    Tib.FiberData by default, host_qos when the variable is "0". The three
+    returns to PE code from 0009 load through it, two moves and one load as
+    before, no branch and no flags touched.
+  * kernelbase reads the same variable and then skips its slot store in
+    ConvertThreadToFiberEx, ConvertFiberToThread and SwitchToFiber.
+
+With the variable set, GetCurrentFiber() is wrong again in that process, as
+on the engines before 0008, so it is for games that don't read the
+intrinsic. Highball sets it per game from the database.
+
+UPSTREAM: nothing to send (Wine 10.5 swaps the whole gs base, see 0009).
+
+---
+diff --git a/dlls/kernelbase/thread.c b/dlls/kernelbase/thread.c
+index 6874bb4..25ae210 100644
+--- a/dlls/kernelbase/thread.c
++++ b/dlls/kernelbase/thread.c
+@@ -1145,6 +1145,24 @@ LPVOID WINAPI DECLSPEC_HOTPATCH CreateFiberEx( SIZE_T stack_commit, SIZE_T stack
+ }
+ 
+ 
++#ifdef __x86_64__
++/* HB_FIBER_MIRROR=0 keeps the pthread QoS value in %gs:0x20 for PE code as well, for a game whose
++ * fiber threads call host code directly through D3DMetal (Diablo II: Resurrected, highball#371).
++ * ntdll's dispatchers read the same variable. */
++static BOOL fiber_mirror_enabled(void)
++{
++    static LONG enabled = -1;
++    if (enabled < 0)
++    {
++        WCHAR value[4];
++        DWORD len = GetEnvironmentVariableW( L"HB_FIBER_MIRROR", value, ARRAY_SIZE(value) );
++        enabled = !(len == 1 && value[0] == '0');
++    }
++    return enabled;
++}
++#endif
++
++
+ /* On macOS the %gs base is the host thread block, not the TEB, so signal_init_process()
+  * mirrors individual TEB fields into it. Tib.FiberData was never mirrored, but
+  * GetCurrentFiber() is an intrinsic that reads %gs:0x20 directly and cannot be intercepted,
+@@ -1160,7 +1178,8 @@ static inline void set_teb_fiber_data( void *fiber )
+ {
+     NtCurrentTeb()->Tib.FiberData = fiber;
+ #ifdef __x86_64__
+-    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (fiber), "n" (FIELD_OFFSET(TEB, Tib.FiberData)));
++    if (fiber_mirror_enabled())
++        __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (fiber), "n" (FIELD_OFFSET(TEB, Tib.FiberData)));
+ #endif
+ }
+ 
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index acd83f0..360d49a 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -510,6 +510,7 @@ struct amd64_thread_data
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
+     DWORD_PTR             host_qos;      /* 0340 macOS: the pthread QoS slot value, %gs:0x20, while PE code owns that slot */
+     DWORD_PTR             host_slot13;   /* 0348 macOS: the pthread TSD slot 13 (libc gmtime key), %gs:0x68, while PE code owns it as LastErrorValue */
++    DWORD_PTR            *pe_fiber_slot; /* 0350 macOS: what PE code finds in %gs:0x20, &teb->Tib.FiberData, or &host_qos when HB_FIBER_MIRROR=0 */
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+@@ -517,6 +518,7 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pth
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, frame_size ) == 0x328 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, host_qos ) == 0x340 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, host_slot13 ) == 0x348 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pe_fiber_slot ) == 0x350 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
+@@ -1834,7 +1836,8 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
+                    "movq %rax,0x348(%r13)\n\t"
+                    "movl 0x68(%r13),%eax\n\t"      /* teb->LastErrorValue, zero-extended */
+                    "movq %rax,%gs:0x68\n\t"
+-                   "movq 0x20(%r13),%rax\n\t"      /* teb->Tib.FiberData: PE code owns %gs:0x20 from here */
++                   "movq 0x350(%r13),%rax\n\t"     /* amd64_thread_data()->pe_fiber_slot */
++                   "movq (%rax),%rax\n\t"          /* teb->Tib.FiberData, or host_qos without the mirror: PE code owns %gs:0x20 from here */
+                    "movq %rax,%gs:0x20\n\t"
+ #endif
+                    "xor %rbx,%rbx\n\t"
+@@ -3101,6 +3104,22 @@ void signal_init_process(void)
+ }
+ 
+ 
++#ifdef __APPLE__
++/* Whether PE code finds Tib.FiberData in %gs:0x20 (the default) or keeps the pthread QoS value
++ * there (HB_FIBER_MIRROR=0). Read on the first thread, before any other thread exists. */
++static BOOL fiber_mirror_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *v = getenv( "HB_FIBER_MIRROR" );
++        enabled = !(v && v[0] == '0' && !v[1]);
++    }
++    return enabled;
++}
++#endif
++
++
+ /***********************************************************************
+  *           init_syscall_frame
+  */
+@@ -3136,6 +3155,13 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend,
+      * on entry (the dispatchers, user_mode_callback_return), PE code gets Tib.FiberData on
+      * return (__wine_syscall_dispatcher_return, call_user_mode_callback). Keep the host value. */
+     __asm__ volatile ("movq %%gs:%c1,%0" : "=r" (thread_data->host_qos) : "n" (FIELD_OFFSET(TEB, Tib.FiberData)));
++    /* HB_FIBER_MIRROR=0 leaves the host value in the slot for PE code too. GetCurrentFiber() is then
++     * wrong again, but host code called straight from PE code finds a valid QoS class. D3DMetal calls
++     * Metal from the game's own threads without passing a dispatcher, so a job thread running a
++     * fiber reached libdispatch with the fiber pointer as its priority, and libdispatch stopped the
++     * process on an illegal instruction (Diablo II: Resurrected, highball#371). kernelbase reads the
++     * same variable and then leaves the slot alone in the fiber calls. */
++    thread_data->pe_fiber_slot = fiber_mirror_enabled() ? (DWORD_PTR *)&teb->Tib.FiberData : &thread_data->host_qos;
+     /* %gs:0x68 is where MSVC-built code reads LastErrorValue directly (Unity's Mono runtime reads it
+      * at 130 sites: File.Delete of a missing file threw "Unknown error (0x80f13910)", The Last
+      * Flame, 2026-09-20). On macOS that is pthread TSD slot 13, libc's gmtime key, so it is
+@@ -3415,7 +3441,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "movq %rdx,0x348(%r15)\n\t"
+                    "movl 0x68(%r15),%edx\n\t"      /* teb->LastErrorValue: PE code owns %gs:0x68 again */
+                    "movq %rdx,%gs:0x68\n\t"
+-                   "movq 0x20(%r15),%r15\n\t"      /* teb->Tib.FiberData */
++                   "movq 0x350(%r15),%r15\n\t"     /* amd64_thread_data()->pe_fiber_slot */
++                   "movq (%r15),%r15\n\t"          /* teb->Tib.FiberData, or host_qos without the mirror */
+                    "movq %r15,%gs:0x20\n\t"        /* PE code reads GetCurrentFiber() here; %r15 is restored below */
+ #endif
+ #ifdef __linux__
+@@ -3707,7 +3734,8 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "movq %rdx,0x348(%r13)\n\t"
+                    "movl 0x68(%r13),%edx\n\t"      /* teb->LastErrorValue: PE code owns %gs:0x68 again */
+                    "movq %rdx,%gs:0x68\n\t"
+-                   "movq 0x20(%r13),%rdx\n\t"      /* teb->Tib.FiberData: PE code owns %gs:0x20 again (%rdx is volatile for the PE caller) */
++                   "movq 0x350(%r13),%rdx\n\t"     /* amd64_thread_data()->pe_fiber_slot (%rdx is volatile for the PE caller) */
++                   "movq (%rdx),%rdx\n\t"          /* teb->Tib.FiberData, or host_qos without the mirror: PE code owns %gs:0x20 again */
+                    "movq %rdx,%gs:0x20\n\t"
+ #endif
+                    "movq 0x58(%rcx),%r13\n\t"
