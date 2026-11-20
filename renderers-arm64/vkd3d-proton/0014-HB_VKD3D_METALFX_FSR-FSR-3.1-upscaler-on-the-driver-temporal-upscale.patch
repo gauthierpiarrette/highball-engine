@@ -5,7 +5,8 @@ scaler), the game's own FSR 3.1 upscaler is recorded as one upscale instead of i
 without game-specific data: at pipeline creation the game's amd_fidelityfx_upscaler_dx12.dll (next to its executable,
 read only, never loaded or replaced) is scanned for its DXBC containers, each one's HASH part and PSV0 bindings tell its
 pass (prepare_inputs b0 t0-t2 u0-u4, accumulate b0 s1 t8 u0 u2, any other FSR 3.1 pass "other"; FSR 2 and FSR 4
-containers are left out), and a compute pipeline whose DXIL hash is in that table is marked.
+containers are left out), and a compute pipeline whose DXIL hash is in that table is marked. The table
+is enabled only if the scan completes and finds both the prepare_inputs and accumulate binding shapes.
 
 At dispatch, prepare_inputs gives color (t2), depth (t1), motion vectors (t0), the constants (b0) and the context: its
 u0, an image the FSR context owns, so every FSR context gets its own scaler and history. The passes after it are
@@ -36,14 +37,15 @@ RCAS sharpens)", and "kk: MetalFX temporal 1728x1117, content 1152x744 -> 1728x1
 Retina); full frame, the game's sharpening and HDR, no visible artifacts. No frame time against stock FSR, and no second
 FSR 3.1 game tried yet.
 
-Written for Highball from the FidelityFX SDK's public pass and binding layout and Vulkan; it shares no code with
-MetalSharp (an earlier version of this patch followed MetalSharp's d3d12_command_list_metalfx_scale, AGPL-3.0, and was
-replaced).
+The earlier upscale function followed MetalSharp's d3d12_command_list_metalfx_scale (AGPL-3.0). It was reworked
+around vkCmdBlitImage2 and Highball's own interface, retaining vkd3d's standard barrier setup. Pass recognition
+uses the FidelityFX SDK's public pass and binding layout.
 
 Upstream: not sent.
 
 diff --git a/include/private/vkd3d_hb_upscale.h b/include/private/vkd3d_hb_upscale.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..186be6c1768e9279f5aa7c1ac32797232205986d
 --- /dev/null
 +++ b/include/private/vkd3d_hb_upscale.h
 @@ -0,0 +1,55 @@
@@ -103,6 +105,7 @@ new file mode 100644
 +
 +#endif /* __VKD3D_HB_UPSCALE_H */
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 84976e6af3949c0b5949029e011550379d27211d..57ff3b8b8c237c8a758520acccd089d4b2d43eb3 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -7215,6 +7215,8 @@ static void d3d12_command_list_reset_state(struct d3d12_command_list *list,
@@ -493,9 +496,10 @@ diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
              root_parameter_index, address);
  }
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index dfb412f86b0859874aadf98f60a40c3f6fad582e..0c7a1b8babd8ce9f1fbba489b3f9e880cd76ccbc 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
-@@ -4005,6 +4005,8 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
+@@ -3982,6 +3982,8 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
              user_extension_supported);
  
      vkd3d_physical_device_info_init(&device->device_info, device);
@@ -505,6 +509,7 @@ diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
  
      if (FAILED(hr = vkd3d_init_device_caps(device, create_info, &device->device_info)))
 diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index b52a038f1f337021ef2638372fb64bdf01612f4b..3f6b64c4910c4e1ba8b1e9a03a8ed4d96c3813a1 100644
 --- a/libs/vkd3d/resource.c
 +++ b/libs/vkd3d/resource.c
 @@ -5599,6 +5599,7 @@ bool vkd3d_create_texture_view(struct d3d12_device *device, const struct vkd3d_t
@@ -516,9 +521,10 @@ diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
      object->info.texture.aspect_mask = desc->aspect_mask;
      object->info.texture.miplevel_idx = desc->miplevel_idx;
 diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index c5ae9100537df5cfd51cb21bc8177bd7f73b7f31..71587603cda34e17d3d903618fc57f7d172b282f 100644
 --- a/libs/vkd3d/state.c
 +++ b/libs/vkd3d/state.c
-@@ -3264,6 +3264,196 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+@@ -3264,6 +3264,215 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
      return S_OK;
  }
  
@@ -625,6 +631,7 @@ diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
 +static void hb_fsr_load_table(void)
 +{
 +    static const char fsr4[] = "fsr4";
++    bool have_prepare = false, have_accumulate = false;
 +    size_t capacity = 0, i, file_size;
 +    const uint8_t *hash, *psv0;
 +    uint32_t hash_size, psv0_size, size, pass;
@@ -674,14 +681,32 @@ diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
 +                (pass = hb_fsr_pass_from_psv0(psv0, psv0_size)) != HB_FSR_PASS_NONE)
 +        {
 +            if (!vkd3d_array_reserve((void **)&hb_fsr_shaders, &capacity, hb_fsr_shader_count + 1, sizeof(*hb_fsr_shaders)))
-+                break;
++            {
++                ERR("HB FSR: could not build the pass table.\n");
++                goto disable;
++            }
++            have_prepare |= pass == HB_FSR_PASS_PREPARE_INPUTS;
++            have_accumulate |= pass == HB_FSR_PASS_ACCUMULATE;
 +            memcpy(hb_fsr_shaders[hb_fsr_shader_count].digest, hash + 4, 16);
 +            hb_fsr_shaders[hb_fsr_shader_count++].pass = pass;
 +        }
 +        i += size - 1;
 +    }
++    if (!have_prepare || !have_accumulate)
++    {
++        WARN("HB FSR: provider has no complete prepare_inputs/accumulate pair; leaving FSR dispatches intact.\n");
++        goto disable;
++    }
++
 +    vkd3d_free(data);
 +    ERR("HB FSR: %zu FSR 3.1 shaders in the provider.\n", hb_fsr_shader_count);
++    return;
++
++disable:
++    vkd3d_free(data);
++    vkd3d_free(hb_fsr_shaders);
++    hb_fsr_shaders = NULL;
++    hb_fsr_shader_count = 0;
 +}
 +
 +static bool hb_fsr_enabled(void)
@@ -715,7 +740,7 @@ diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
  static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *state,
          struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc,
          const struct d3d12_cached_pipeline_state *cached_pso)
-@@ -3290,6 +3480,8 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
+@@ -3290,6 +3499,8 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
          return hr;
      }
  
@@ -725,6 +750,7 @@ diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
      {
          VK_CALL(vkDestroyPipeline(device->vk_device, state->compute.vk_pipeline, NULL));
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 121dd86a43339509673ac947e41e7a63f76de3d6..0868ad2e3c9b460d41b04010dce7df65eebe3bb8 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
 @@ -32,6 +32,7 @@
