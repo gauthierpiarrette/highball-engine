@@ -1,0 +1,740 @@
+diff --git a/src/kosmickrisp/bridge/meson.build b/src/kosmickrisp/bridge/meson.build
+index 03ba43b4248ffd66734b1166cd91c2c120e5aa93..f55b11a0fac43db589c23891a3f8012fe2fcc142 100644
+--- a/src/kosmickrisp/bridge/meson.build
++++ b/src/kosmickrisp/bridge/meson.build
+@@ -24,6 +24,7 @@ if host_machine.system() == 'darwin'
+     'mtl_sampler.m',
+     'mtl_sync.m',
+     'mtl_texture.m',
++    'mtl_upscaler.m',
+     'ns_process_info.m',
+   )
+ else
+@@ -42,6 +43,7 @@ else
+     'stubs/mtl_sampler.c',
+     'stubs/mtl_sync.c',
+     'stubs/mtl_texture.c',
++    'stubs/mtl_upscaler.c',
+     'stubs/ns_process_info.c',
+   )
+ endif
+@@ -54,7 +56,7 @@ mtl_bridge_dependencies = [
+ if host_machine.system() == 'darwin'
+   mtl_bridge_dependencies += dependency(
+     'appleframeworks',
+-    modules : ['Foundation']
++    modules : ['Foundation', 'MetalFX']
+   )
+ endif
+ 
+diff --git a/src/kosmickrisp/bridge/mtl_upscaler.h b/src/kosmickrisp/bridge/mtl_upscaler.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..576dc049481d9fd1159375001a0be0e3459aebd8
+--- /dev/null
++++ b/src/kosmickrisp/bridge/mtl_upscaler.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2026 Highball
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef MTL_UPSCALER_H
++#define MTL_UPSCALER_H 1
++
++#include "mtl_types.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++typedef void mtl_upscaler;
++
++struct mtl_upscale {
++   mtl_texture *color;
++   mtl_texture *depth;
++   mtl_texture *motion;
++   mtl_texture *reactive;
++   mtl_texture *exposure;
++   mtl_texture *output;
++   uint32_t content_width;
++   uint32_t content_height;
++   float jitter_x;
++   float jitter_y;
++   float motion_scale_x;
++   float motion_scale_y;
++   float pre_exposure;
++   bool reset;
++   bool depth_reversed;
++   bool auto_exposure;
++   bool motion_at_output;
++};
++
++bool mtl_upscaler_supported(mtl_device *device);
++mtl_upscaler *mtl_new_upscaler(mtl_device *device, mtl_compiler *compiler,
++                               const struct mtl_upscale *upscale);
++bool mtl_upscaler_matches(mtl_upscaler *upscaler,
++                          const struct mtl_upscale *upscale);
++bool mtl_upscaler_content_fits(mtl_device *device, mtl_upscaler *upscaler,
++                               const struct mtl_upscale *upscale);
++void mtl_upscaler_encode(mtl_upscaler *upscaler,
++                         mtl_command_buffer *command_buffer,
++                         const struct mtl_upscale *upscale);
++
++#endif
+diff --git a/src/kosmickrisp/bridge/mtl_upscaler.m b/src/kosmickrisp/bridge/mtl_upscaler.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd147f8921e0d4381493487c66ae61812c128550
+--- /dev/null
++++ b/src/kosmickrisp/bridge/mtl_upscaler.m
+@@ -0,0 +1,151 @@
++/*
++ * Copyright 2026 Highball
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl_upscaler.h"
++
++#include <Metal/MTL4CommandBuffer.h>
++#include <Metal/MTL4Compiler.h>
++#include <MetalFX/MetalFX.h>
++
++#if defined(__MAC_27_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_27_0
++#define MTL_UPSCALER_HAS_OUTPUT_MOTION 1
++#else
++#define MTL_UPSCALER_HAS_OUTPUT_MOTION 0
++#endif
++
++bool
++mtl_upscaler_supported(mtl_device *device)
++{
++   @autoreleasepool {
++      return [MTLFXTemporalScalerDescriptor supportsDevice:(id<MTLDevice>)device];
++   }
++}
++
++mtl_upscaler *
++mtl_new_upscaler(mtl_device *device, mtl_compiler *compiler,
++                 const struct mtl_upscale *upscale)
++{
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      id<MTLTexture> color = (id<MTLTexture>)upscale->color;
++      id<MTLTexture> depth = (id<MTLTexture>)upscale->depth;
++      id<MTLTexture> motion = (id<MTLTexture>)upscale->motion;
++      id<MTLTexture> reactive = (id<MTLTexture>)upscale->reactive;
++      id<MTLTexture> output = (id<MTLTexture>)upscale->output;
++
++      MTLFXTemporalScalerDescriptor *desc =
++         [[[MTLFXTemporalScalerDescriptor alloc] init] autorelease];
++      desc.colorTextureFormat = color.pixelFormat;
++      desc.depthTextureFormat = depth.pixelFormat;
++      desc.motionTextureFormat = motion.pixelFormat;
++      desc.outputTextureFormat = output.pixelFormat;
++      desc.inputWidth = color.width;
++      desc.inputHeight = color.height;
++      desc.outputWidth = output.width;
++      desc.outputHeight = output.height;
++      desc.autoExposureEnabled = upscale->auto_exposure;
++      desc.inputContentPropertiesEnabled = YES;
++      desc.inputContentMinScale =
++         [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:dev];
++      desc.inputContentMaxScale =
++         [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:dev];
++      if (reactive) {
++         desc.reactiveMaskTextureEnabled = YES;
++         desc.reactiveMaskTextureFormat = reactive.pixelFormat;
++      }
++      if (upscale->motion_at_output) {
++#if MTL_UPSCALER_HAS_OUTPUT_MOTION
++         if (@available(macOS 27.0, *))
++            desc.outputResolutionMotionVectorsEnabled = YES;
++         else
++            return NULL;
++#else
++         return NULL;
++#endif
++      }
++
++      return [desc newTemporalScalerWithDevice:dev
++                                      compiler:(id<MTL4Compiler>)compiler];
++   }
++}
++
++bool
++mtl_upscaler_matches(mtl_upscaler *upscaler, const struct mtl_upscale *upscale)
++{
++   @autoreleasepool {
++      id<MTL4FXTemporalScaler> scaler = (id<MTL4FXTemporalScaler>)upscaler;
++      id<MTLTexture> color = (id<MTLTexture>)upscale->color;
++      id<MTLTexture> depth = (id<MTLTexture>)upscale->depth;
++      id<MTLTexture> motion = (id<MTLTexture>)upscale->motion;
++      id<MTLTexture> reactive = (id<MTLTexture>)upscale->reactive;
++      id<MTLTexture> output = (id<MTLTexture>)upscale->output;
++
++      if (scaler.inputWidth != color.width ||
++          scaler.inputHeight != color.height ||
++          scaler.outputWidth != output.width ||
++          scaler.outputHeight != output.height)
++         return false;
++      if (scaler.colorTextureFormat != color.pixelFormat ||
++          scaler.depthTextureFormat != depth.pixelFormat ||
++          scaler.motionTextureFormat != motion.pixelFormat ||
++          scaler.outputTextureFormat != output.pixelFormat)
++         return false;
++      return scaler.reactiveMaskTextureFormat ==
++             (reactive ? reactive.pixelFormat : MTLPixelFormatInvalid);
++   }
++}
++
++bool
++mtl_upscaler_content_fits(mtl_device *device, mtl_upscaler *upscaler,
++                          const struct mtl_upscale *upscale)
++{
++   @autoreleasepool {
++      id<MTL4FXTemporalScaler> scaler = (id<MTL4FXTemporalScaler>)upscaler;
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      id<MTLTexture> color = (id<MTLTexture>)upscale->color;
++      id<MTLTexture> output = (id<MTLTexture>)upscale->output;
++      if (!upscale->content_width || !upscale->content_height ||
++          upscale->content_width > color.width ||
++          upscale->content_height > color.height)
++         return false;
++
++      float min_scale = scaler ? scaler.inputContentMinScale :
++         [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:dev];
++      float max_scale = scaler ? scaler.inputContentMaxScale :
++         [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:dev];
++      double scale_x = (double)output.width / upscale->content_width;
++      double scale_y = (double)output.height / upscale->content_height;
++      return scale_x >= min_scale && scale_x <= max_scale &&
++             scale_y >= min_scale && scale_y <= max_scale;
++   }
++}
++
++void
++mtl_upscaler_encode(mtl_upscaler *upscaler, mtl_command_buffer *command_buffer,
++                    const struct mtl_upscale *upscale)
++{
++   @autoreleasepool {
++      id<MTL4FXTemporalScaler> scaler = (id<MTL4FXTemporalScaler>)upscaler;
++
++      scaler.colorTexture = (id<MTLTexture>)upscale->color;
++      scaler.depthTexture = (id<MTLTexture>)upscale->depth;
++      scaler.motionTexture = (id<MTLTexture>)upscale->motion;
++      scaler.outputTexture = (id<MTLTexture>)upscale->output;
++      scaler.exposureTexture = (id<MTLTexture>)upscale->exposure;
++      if (upscale->reactive)
++         scaler.reactiveMaskTexture = (id<MTLTexture>)upscale->reactive;
++      scaler.inputContentWidth = upscale->content_width;
++      scaler.inputContentHeight = upscale->content_height;
++      scaler.jitterOffsetX = upscale->jitter_x;
++      scaler.jitterOffsetY = upscale->jitter_y;
++      scaler.motionVectorScaleX = upscale->motion_scale_x;
++      scaler.motionVectorScaleY = upscale->motion_scale_y;
++      scaler.preExposure = upscale->pre_exposure > 0.0f ? upscale->pre_exposure : 1.0f;
++      scaler.reset = upscale->reset;
++      scaler.depthReversed = upscale->depth_reversed;
++
++      [scaler encodeToCommandBuffer:(id<MTL4CommandBuffer>)command_buffer];
++   }
++}
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_upscaler.c b/src/kosmickrisp/bridge/stubs/mtl_upscaler.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f076284243e54f122722d83e188e92cf254c550
+--- /dev/null
++++ b/src/kosmickrisp/bridge/stubs/mtl_upscaler.c
+@@ -0,0 +1,38 @@
++/*
++ * Copyright 2026 Highball
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl_upscaler.h"
++
++bool
++mtl_upscaler_supported(mtl_device *device)
++{
++   return false;
++}
++
++mtl_upscaler *
++mtl_new_upscaler(mtl_device *device, mtl_compiler *compiler,
++                 const struct mtl_upscale *upscale)
++{
++   return NULL;
++}
++
++bool
++mtl_upscaler_matches(mtl_upscaler *upscaler, const struct mtl_upscale *upscale)
++{
++   return false;
++}
++
++bool
++mtl_upscaler_content_fits(mtl_device *device, mtl_upscaler *upscaler,
++                          const struct mtl_upscale *upscale)
++{
++   return false;
++}
++
++void
++mtl_upscaler_encode(mtl_upscaler *upscaler, mtl_command_buffer *command_buffer,
++                    const struct mtl_upscale *upscale)
++{
++}
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index 66c42ac075a6c146ed0876754235108eac7d9d4b..6fea5bd79fe5704c332ad5cdccbe52ef1ea7815c 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -75,6 +75,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+    util_dynarray_clear(&cmd->ts_stage_map);
+    kk_cmd_release_timestamps(cmd);
+    util_dynarray_clear(&cmd->minmax_uab_sets);
++   kk_hb_upscale_release_cmd(cmd);
+    kk_cmd_release_cmd_bufs(cmd);
+ }
+ 
+@@ -130,6 +131,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+    util_dynarray_fini(&cmd->ts_chunks);
+    util_dynarray_fini(&cmd->minmax_uab_sets);
+    util_dynarray_fini(&cmd->metal.cmd_bufs);
++   util_dynarray_fini(&cmd->hb_upscalers);
+ 
+    vk_free(&pool->vk.alloc, cmd);
+ }
+@@ -165,6 +167,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    cmd->post_render_writes = UTIL_DYNARRAY_INIT;
+    cmd->minmax_uab_sets = UTIL_DYNARRAY_INIT;
+    cmd->metal.cmd_bufs = UTIL_DYNARRAY_INIT;
++   cmd->hb_upscalers = UTIL_DYNARRAY_INIT;
+ 
+    {
+       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 568883bb647a4c4fac82cc1a283280fe0dc47516..f8f9105f41b6bda7a0c46862f24c7adce50738eb 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -350,6 +350,8 @@ struct kk_cmd_buffer {
+ 
+    /* What the command buffer encoded, for command queue errors (kk_queue) */
+    struct kk_cb_record record;
++
++   struct util_dynarray hb_upscalers;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_meta.c b/src/kosmickrisp/vulkan/kk_cmd_meta.c
+index 4b766d7dd5eeea4864fd7b3c49553d379fefa14e..51ff1be5efdd9e23a0db3625bc499acf59cc0079 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_meta.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_meta.c
+@@ -240,12 +240,25 @@ kk_CmdBlitImage2(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   VkBlitImageInfo2 blit = *pBlitImageInfo;
+ 
+-   struct kk_meta_save save;
+    kk_cb_record_op(&cmd->record, KK_CB_OP_BLIT_IMAGE);
++   if (cmd->replay) {
++      blit.pNext = NULL;
++   } else {
++      for (const VkBaseInStructure *ext = pBlitImageInfo->pNext; ext;
++           ext = ext->pNext) {
++         if (ext->sType == VK_STRUCTURE_TYPE_HB_TEMPORAL_UPSCALE_INFO &&
++             kk_hb_upscale(cmd, pBlitImageInfo,
++                           (const VkHbTemporalUpscaleInfo *)ext))
++            return;
++      }
++   }
++
++   struct kk_meta_save save;
+    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                  "meta:vkCmdBlitImage2");
+-   vk_meta_blit_image2(&cmd->vk, &dev->meta, pBlitImageInfo);
++   vk_meta_blit_image2(&cmd->vk, &dev->meta, &blit);
+    kk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 9c016fd264cd9ffbfb821ff3d865cbf9deecff7b..60fdb2df18f51434dc4918b90367e1de73616293 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -392,6 +392,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
+    dev->vk.get_timestamp = kk_get_timestamp;
+    simple_mtx_init(&dev->lazy_pipeline_lock, mtx_plain);
++   kk_hb_upscale_init(dev);
+ 
+    /* Create a new Metal pipeline compiler for the device */
+    dev->mtl_compiler_handle = kk_acquire_compiler(dev);
+@@ -476,6 +477,7 @@ fail_vab_memory:
+ fail_compiler:
+    kk_release_compiler(dev);
+ fail_init:
++   kk_hb_upscale_finish(dev);
+    simple_mtx_destroy(&dev->lazy_pipeline_lock);
+    vk_device_finish(&dev->vk);
+ fail_alloc:
+@@ -524,6 +526,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
+ 
++   kk_hb_upscale_finish(dev);
+    kk_release_compiler(dev);
+    simple_mtx_destroy(&dev->lazy_pipeline_lock);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 746808fbb58cd37134777c1e32f34f81ec0f736e..79e953081caead6ccda7a571dca05fdc74467111 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -10,6 +10,8 @@
+ 
+ #include "kk_private.h"
+ 
++#include "kk_hb_upscale.h"
++
+ #include "kk_query_table.h"
+ #include "kk_queue.h"
+ 
+@@ -115,6 +117,14 @@ struct kk_device {
+     * use (kk_cmd_shader_pipeline) */
+    simple_mtx_t lazy_pipeline_lock;
+ 
++   struct {
++      simple_mtx_t lock;
++      bool supported;
++      bool has_scalers;
++      bool logged_content_range;
++      struct kk_hb_upscaler slots[KK_HB_UPSCALERS];
++   } hb_upscale;
++
+    /* os_time_get_nano() at creation (command queue error diagnostics) */
+    int64_t created_ns;
+    /* In the process' list of devices alive (kk_device_foreach) */
+diff --git a/src/kosmickrisp/vulkan/kk_hb_upscale.c b/src/kosmickrisp/vulkan/kk_hb_upscale.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c07af8ec4c492c9bbaf1c5dab47f72618b6c464c
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_hb_upscale.c
+@@ -0,0 +1,208 @@
++/*
++ * Copyright 2026 Highball
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kk_hb_upscale.h"
++
++#include "kk_cmd_buffer.h"
++#include "kk_device.h"
++#include "kk_image.h"
++
++#include "kosmickrisp/bridge/mtl_bridge.h"
++#include "kosmickrisp/bridge/mtl_upscaler.h"
++
++#include "util/log.h"
++#include "util/os_time.h"
++#include "util/u_atomic.h"
++
++#define KK_HB_UPSCALER_IDLE_NS (30 * ONE_SECOND_IN_NS)
++
++static mtl_texture *
++kk_hb_upscale_texture(VkImage handle)
++{
++   VK_FROM_HANDLE(kk_image, image, handle);
++   return image ? image->planes[0].mtl_handle : NULL;
++}
++
++void
++kk_hb_upscale_init(struct kk_device *dev)
++{
++   simple_mtx_init(&dev->hb_upscale.lock, mtx_plain);
++   dev->hb_upscale.supported = mtl_upscaler_supported(dev->mtl_handle);
++}
++
++void
++kk_hb_upscale_finish(struct kk_device *dev)
++{
++   for (uint32_t i = 0; i < KK_HB_UPSCALERS; i++) {
++      if (dev->hb_upscale.slots[i].scaler)
++         mtl_release(dev->hb_upscale.slots[i].scaler);
++   }
++   simple_mtx_destroy(&dev->hb_upscale.lock);
++}
++
++void
++kk_hb_upscale_release_cmd(struct kk_cmd_buffer *cmd)
++{
++   util_dynarray_foreach(&cmd->hb_upscalers, mtl_upscaler *, scaler)
++      mtl_release(*scaler);
++   util_dynarray_clear(&cmd->hb_upscalers);
++}
++
++void
++kk_hb_upscale_trim(struct kk_device *dev)
++{
++   if (!p_atomic_read_relaxed(&dev->hb_upscale.has_scalers))
++      return;
++
++   simple_mtx_lock(&dev->hb_upscale.lock);
++   int64_t now = os_time_get_nano();
++   bool has_scalers = false;
++
++   for (uint32_t i = 0; i < KK_HB_UPSCALERS; i++) {
++      struct kk_hb_upscaler *slot = &dev->hb_upscale.slots[i];
++      if (slot->scaler && now - slot->last_use_ns >= KK_HB_UPSCALER_IDLE_NS) {
++         mtl_release(slot->scaler);
++         *slot = (struct kk_hb_upscaler){0};
++      }
++      has_scalers |= slot->scaler != NULL;
++   }
++   p_atomic_set(&dev->hb_upscale.has_scalers, has_scalers);
++   simple_mtx_unlock(&dev->hb_upscale.lock);
++}
++
++static struct kk_hb_upscaler *
++kk_hb_upscaler_get(struct kk_device *dev, uint64_t context, uint32_t flags,
++                   const struct mtl_upscale *upscale)
++{
++   struct kk_hb_upscaler *slot = NULL, *oldest = &dev->hb_upscale.slots[0];
++
++   /* The caller holds the cache lock through encoding because the scaler's
++    * per-dispatch properties are mutable. */
++   for (uint32_t i = 0; i < KK_HB_UPSCALERS; i++) {
++      struct kk_hb_upscaler *s = &dev->hb_upscale.slots[i];
++      if (s->scaler && s->context == context)
++         slot = s;
++      if (s->last_use_ns < oldest->last_use_ns)
++         oldest = s;
++   }
++
++   bool matches = slot && slot->flags == flags &&
++                  mtl_upscaler_matches(slot->scaler, upscale);
++   if (!mtl_upscaler_content_fits(dev->mtl_handle, matches ? slot->scaler : NULL,
++                                  upscale))
++      goto outside_range;
++
++   if (!matches) {
++      mtl_upscaler *scaler = mtl_new_upscaler(dev->mtl_handle,
++                                              dev->mtl_compiler_handle, upscale);
++      if (!scaler)
++         return NULL;
++
++      if (!slot)
++         slot = oldest;
++      if (slot->scaler)
++         mtl_release(slot->scaler);
++      *slot = (struct kk_hb_upscaler) {
++         .context = context,
++         .last_use_ns = os_time_get_nano(),
++         .needs_reset = true,
++         .flags = flags,
++         .scaler = scaler,
++      };
++      p_atomic_set(&dev->hb_upscale.has_scalers, true);
++
++      if (!mtl_upscaler_content_fits(dev->mtl_handle, scaler, upscale))
++         goto outside_range;
++   }
++   return slot;
++
++outside_range:
++   if (slot)
++      slot->needs_reset = true;
++   if (!dev->hb_upscale.logged_content_range) {
++      dev->hb_upscale.logged_content_range = true;
++      mesa_logi("kk: MetalFX content %ux%u is outside the scaler's range; using an ordinary blit",
++                upscale->content_width, upscale->content_height);
++   }
++   return NULL;
++}
++
++bool
++kk_hb_upscale(struct kk_cmd_buffer *cmd, const VkBlitImageInfo2 *blit,
++              const VkHbTemporalUpscaleInfo *info)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++
++   if (!dev->hb_upscale.supported || !info->context || blit->regionCount != 1)
++      return false;
++
++   VK_FROM_HANDLE(kk_image, src, blit->srcImage);
++   VK_FROM_HANDLE(kk_image, dst, blit->dstImage);
++   const VkImageBlit2 *region = &blit->pRegions[0];
++   if (region->srcSubresource.mipLevel || region->srcSubresource.baseArrayLayer ||
++       region->dstSubresource.mipLevel || region->dstSubresource.baseArrayLayer ||
++       region->srcOffsets[0].x || region->srcOffsets[0].y ||
++       region->dstOffsets[0].x || region->dstOffsets[0].y ||
++       region->srcOffsets[1].x <= 0 || region->srcOffsets[1].y <= 0 ||
++       (uint32_t)region->dstOffsets[1].x != dst->vk.extent.width ||
++       (uint32_t)region->dstOffsets[1].y != dst->vk.extent.height)
++      return false;
++
++   struct mtl_upscale upscale = {
++      .color = src->planes[0].mtl_handle,
++      .depth = kk_hb_upscale_texture(info->depth),
++      .motion = kk_hb_upscale_texture(info->motion),
++      .reactive = kk_hb_upscale_texture(info->reactive),
++      .exposure = kk_hb_upscale_texture(info->exposure),
++      .output = dst->planes[0].mtl_handle,
++      .content_width = region->srcOffsets[1].x,
++      .content_height = region->srcOffsets[1].y,
++      .jitter_x = info->jitterX,
++      .jitter_y = info->jitterY,
++      .motion_scale_x = info->motionScaleX,
++      .motion_scale_y = info->motionScaleY,
++      .pre_exposure = info->preExposure,
++      .reset = info->flags & HB_TEMPORAL_UPSCALE_RESET_BIT,
++      .depth_reversed = info->flags & HB_TEMPORAL_UPSCALE_DEPTH_REVERSED_BIT,
++      .auto_exposure = info->flags & HB_TEMPORAL_UPSCALE_AUTO_EXPOSURE_BIT,
++      .motion_at_output = info->flags & HB_TEMPORAL_UPSCALE_MOTION_AT_OUTPUT_BIT,
++   };
++   if (!upscale.color || !upscale.depth || !upscale.motion || !upscale.output)
++      return false;
++
++   uint32_t flags = (info->flags & (HB_TEMPORAL_UPSCALE_AUTO_EXPOSURE_BIT |
++                                    HB_TEMPORAL_UPSCALE_MOTION_AT_OUTPUT_BIT)) |
++                    (upscale.reactive ? 1u << 16 : 0u);
++   simple_mtx_lock(&dev->hb_upscale.lock);
++   struct kk_hb_upscaler *slot = kk_hb_upscaler_get(dev, info->context, flags, &upscale);
++   if (!slot) {
++      simple_mtx_unlock(&dev->hb_upscale.lock);
++      return false;
++   }
++
++   if (slot->needs_reset) {
++      mesa_logi("kk: MetalFX temporal %ux%u, content %ux%u -> %ux%u",
++                src->vk.extent.width, src->vk.extent.height,
++                upscale.content_width, upscale.content_height,
++                dst->vk.extent.width, dst->vk.extent.height);
++      upscale.reset = true;
++      slot->needs_reset = false;
++   }
++   slot->last_use_ns = os_time_get_nano();
++
++   cs_end(cmd);
++   mtl_upscaler_encode(slot->scaler, cmd->metal.cmd_buf, &upscale);
++   util_dynarray_append(&cmd->hb_upscalers, mtl_retain(slot->scaler));
++   simple_mtx_unlock(&dev->hb_upscale.lock);
++
++   /* An all-stage producer barrier covers the scaler's preceding Metal
++    * encoders and later encoders on this queue, even in other command buffers. */
++   mtl_compute_encoder *encoder = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
++   mtl_barrier_after_stages_device(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   mtl_end_encoding(encoder);
++   mtl_release(encoder);
++   cmd->metal.cmd_buf_used = true;
++   return true;
++}
+diff --git a/src/kosmickrisp/vulkan/kk_hb_upscale.h b/src/kosmickrisp/vulkan/kk_hb_upscale.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2b815446e38acbd9ea5471394a0b57d88ec884d
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_hb_upscale.h
+@@ -0,0 +1,60 @@
++/*
++ * Copyright 2026 Highball
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_HB_UPSCALE_H
++#define KK_HB_UPSCALE_H 1
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include <vulkan/vulkan_core.h>
++
++#define VK_STRUCTURE_TYPE_HB_TEMPORAL_UPSCALE_INFO ((VkStructureType)1000999300)
++#define HB_TEMPORAL_UPSCALE_DRIVER_INFO            "hb-upscale"
++
++enum {
++   HB_TEMPORAL_UPSCALE_RESET_BIT = 1u << 0,
++   HB_TEMPORAL_UPSCALE_DEPTH_REVERSED_BIT = 1u << 1,
++   HB_TEMPORAL_UPSCALE_AUTO_EXPOSURE_BIT = 1u << 2,
++   HB_TEMPORAL_UPSCALE_MOTION_AT_OUTPUT_BIT = 1u << 3,
++};
++
++typedef struct VkHbTemporalUpscaleInfo {
++   VkStructureType sType;
++   const void *pNext;
++   uint64_t context;
++   uint32_t flags;
++   VkImage depth;
++   VkImage motion;
++   VkImage reactive;
++   VkImage exposure;
++   float jitterX;
++   float jitterY;
++   float motionScaleX;
++   float motionScaleY;
++   float preExposure;
++} VkHbTemporalUpscaleInfo;
++
++#define KK_HB_UPSCALERS 8
++
++struct kk_hb_upscaler {
++   uint64_t context;
++   int64_t last_use_ns;
++   bool needs_reset;
++   uint32_t flags;
++   void *scaler;
++};
++
++struct kk_cmd_buffer;
++struct kk_device;
++
++bool kk_hb_upscale(struct kk_cmd_buffer *cmd, const VkBlitImageInfo2 *blit,
++                   const VkHbTemporalUpscaleInfo *info);
++void kk_hb_upscale_init(struct kk_device *dev);
++void kk_hb_upscale_finish(struct kk_device *dev);
++void kk_hb_upscale_trim(struct kk_device *dev);
++void kk_hb_upscale_release_cmd(struct kk_cmd_buffer *cmd);
++
++#endif
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 0458290e7e56666ccc5a0381e3cab273d74a4132..dd4f87fd63b5610978f8a6b91c460b44b7bdbfd2 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -7,6 +7,8 @@
+ 
+ #include "kk_physical_device.h"
+ 
++#include "kk_hb_upscale.h"
++
+ #include "kk_debug.h"
+ #include "kk_entrypoints.h"
+ #include "kk_image.h"
+@@ -980,7 +982,7 @@ kk_get_device_properties(
+ 
+    snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "KosmicKrisp");
+    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
+-            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
++            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 " " HB_TEMPORAL_UPSCALE_DRIVER_INFO);
+ }
+ 
+ static void
+diff --git a/src/kosmickrisp/vulkan/kk_queue.c b/src/kosmickrisp/vulkan/kk_queue.c
+index 2795e228f7cc586fe82519c50907a6d826c57e0d..d84a3a0a3c290b2ac24c54789c940bf9d9588b3c 100644
+--- a/src/kosmickrisp/vulkan/kk_queue.c
++++ b/src/kosmickrisp/vulkan/kk_queue.c
+@@ -544,6 +544,8 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+    if (vk_queue_is_lost(&queue->vk))
+       return VK_ERROR_DEVICE_LOST;
+ 
++   kk_hb_upscale_trim(dev);
++
+    for (struct vk_sync_wait *wait = submit->waits,
+                             *end = submit->waits + submit->wait_count;
+         wait != end; ++wait) {
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 3f33fa23bb32b97ab118e5fbd56f95a9112abed3..af0beda455af4fa121f4f384aec053590ecbb113 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -82,6 +82,8 @@ kk_files = files(
+   'kk_event.c',
+   'kk_format.h',
+   'kk_format.c',
++  'kk_hb_upscale.c',
++  'kk_hb_upscale.h',
+   'kk_image_layout.h',
+   'kk_image_layout.c',
+   'kk_image_view.h',
