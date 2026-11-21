@@ -23,6 +23,14 @@ with two sets of patches, applied in this order:
     constant buffer reads, 24.4 to 21 ms there, and null constant buffer descriptors then read a buffer of zeros. A read
     past a bound constant buffer returns the memory after it instead of zero. Also 256 command buffer records, so
     `MESA_KK_DEBUG=cbs` logs all of a frame's.
+  - `0012` `HB_KK_HEAP_BUDGET=1` (off by default, asked for per game, read once) makes the memory heap's budget 90% of
+    the Metal device's recommended working set; the heap's size is 100% of it. By default the budget stays Mesa's: the
+    smaller of the heap size and 90% of the memory macOS reports available, plus what the program already uses. With a
+    game, Steam and a browser open that was about 10 GB on a 48 GB Mac, and Forza Horizon 6 sized its texture
+    streaming to it, leaving tyres and fine detail at low resolution on many cars; they came back with the switch (M5
+    Max, 2026-11-17). The switch ignores memory pressure: on a 16 GB Mac a game would be told it has about 9.6 GB of
+    GPU memory out of shared memory whatever else is running, the stall pattern DXVK's `0002` caps, so it is for
+    recipes of games that need it on Macs with memory to spare, and has not been tried on a 16 GB Mac.
 
 The driver needs macOS 26 for Metal 4. The archive holds the driver in `renderers/kosmickrisp` with its ICD file, and
 the Khronos loader as `lib/libMoltenVK.dylib`, the name Wine's winevulkan opens on this line.
