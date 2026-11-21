@@ -42,6 +42,8 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0041` ntdll-arm64ec-the-x64-state-on-an-unhandled-exception | A crash log named the instruction but not the x64 registers. | Microsoft Flight Simulator 2024 | diagnostics | |
 | `0042` ntdll-arm64ec-rtliseccode-above-the-user-address-space | A thread could fault in a loop until its stack ran out. | Microsoft Flight Simulator 2024 | general | |
 | `0043` ntdll-arm64ec-a-program-sees-its-own-page-protection | Programs saw the emulator's page protection, so restoring it made their own pages fault. | Microsoft Flight Simulator 2024, copy protections | x86-64 fidelity | pairs with FEX 0022 |
+| `0059` ntdll-dualstack-ipv4-options | Online sessions never started: macOS refuses IPv4 options on a dual-stack UDP socket, so the game closed its socket. | Forza Horizon 6 (online) | macOS | not sent; the Intel line's 0034, same change as MacGameFix#73 |
+| `0060` ws2_32-sio-udp-netreset-from-upstream | `SIO_UDP_NETRESET` failed with 10045, set by the same game socket right before matchmaking. | Forza Horizon 6 (online) | general | backport of Wine 19d5fbd382 (in 11.19); the Intel line's 0035 |
 
 ## Details
 
@@ -321,6 +323,12 @@ account, cloud save and main menu. Driving, a complete repeat and the same-build
 emulator's code buffers MAP_JIT and lets the emulator flip its own thread between writing and executing
 (ThreadHbJitWrite, class 0x7fe of NtSetInformationThread), with no W^X page flips. `HB_DIRECT_CONTINUE=1` continues
 emulated code straight from the syscall instead of through a signal. Both are off unless set.
+
+`0059` and `0060` are the Intel line's `0034` and `0035`: an IPv4 option macOS refuses on a dual-stack socket is set
+as its IPv6 counterpart, and SIO_UDP_NETRESET is accepted (upstream Wine 19d5fbd382, in 11.19, after this line's
+11.18). Forza Horizon 6 sets both kinds on its UDP game socket before matchmaking and closed the socket when they
+failed, so online play never started on this line either (arm64-kk-wine11.18-r4, M5 Pro, macOS 27.3 beta,
+2026-11-14). The test program (`tests/dualstack-udp`), built for arm64, fails 12 of 26 checks on r4 and none with both patches.
 
 ### Forza Horizon 6
 

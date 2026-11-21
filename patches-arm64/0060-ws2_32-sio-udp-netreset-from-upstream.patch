@@ -1,0 +1,53 @@
+ws2_32: SIO_UDP_NETRESET is accepted, like SIO_UDP_CONNRESET, as upstream Wine has it.
+
+Upstream Wine 19d5fbd382 (Mikhail Zhadanov, 2026-09-07, "ws2_32: Add support for SIO_UDP_NETRESET.",
+in Wine 11.19), which neither the CrossOver 26.3 tree nor Wine 11.18 carries; the change to
+dlls/ws2_32/tests is left out. Without it WSAIoctl() answers SIO_UDP_NETRESET with WSAEOPNOTSUPP (10045).
+
+Forza Horizon 6 sets SIO_UDP_CONNRESET and SIO_UDP_NETRESET on its UDP game socket right before
+matchmaking (see 0059). With both patches the test program in 0059 passes all 26 checks on
+arm64-kk-wine11.18-r4, where it fails 12 without them. The Intel line's 0035 is the same backport.
+
+diff --git a/dlls/ws2_32/socket.c b/dlls/ws2_32/socket.c
+index b2601c6..b398d80 100644
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -2343,6 +2343,7 @@ static const char *debugstr_wsaioctl(DWORD code)
+         IOCTL_NAME(SIO_SET_QOS);
+         IOCTL_NAME(SIO_TRANSLATE_HANDLE);
+         IOCTL_NAME(SIO_UDP_CONNRESET);
++        IOCTL_NAME(SIO_UDP_NETRESET);
+     }
+ #undef IOCTL_NAME
+ 
+@@ -2779,11 +2780,12 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID
+     }
+ 
+     case SIO_UDP_CONNRESET:
++    case SIO_UDP_NETRESET:
+     {
+         NTSTATUS status = STATUS_SUCCESS;
+         DWORD ret;
+ 
+-        FIXME( "SIO_UDP_CONNRESET stub\n" );
++        FIXME( "%s stub\n", debugstr_wsaioctl( code ) );
+         ret = server_ioctl_sock( s, IOCTL_AFD_WINE_COMPLETE_ASYNC, &status, sizeof(status),
+                                  NULL, 0, ret_size, overlapped, completion );
+         SetLastError( ret );
+diff --git a/include/mswsock.h b/include/mswsock.h
+index fa97d5b..2a6d2a2 100644
+--- a/include/mswsock.h
++++ b/include/mswsock.h
+@@ -84,10 +84,12 @@ extern "C" {
+ 
+ #ifndef USE_WS_PREFIX
+ #define SIO_UDP_CONNRESET               _WSAIOW(IOC_VENDOR, 12)
++#define SIO_UDP_NETRESET                _WSAIOW(IOC_VENDOR, 15)
+ #define SIO_SET_COMPATIBILITY_MODE      _WSAIOW(IOC_VENDOR, 300)
+ #define SIO_BASE_HANDLE                 _WSAIOR(IOC_WS2, 34)
+ #else
+ #define WS_SIO_UDP_CONNRESET            _WSAIOW(WS_IOC_VENDOR, 12)
++#define WS_SIO_UDP_NETRESET             _WSAIOW(WS_IOC_VENDOR, 15)
+ #define WS_SIO_SET_COMPATIBILITY_MODE   _WSAIOW(WS_IOC_VENDOR, 300)
+ #define WS_SIO_BASE_HANDLE              _WSAIOR(WS_IOC_WS2, 34)
+ #endif
