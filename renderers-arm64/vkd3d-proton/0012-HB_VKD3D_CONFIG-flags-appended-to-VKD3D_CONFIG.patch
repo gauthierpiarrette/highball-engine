@@ -1,0 +1,35 @@
+From 5477f6842caf7edc12f3ff03453a043f283ec432 Mon Sep 17 00:00:00 2001
+From: TxCsOffc <243226414+TxCsOffc@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 07:42:54 +0500
+Subject: [PATCH 12/12] HB_VKD3D_CONFIG: flags appended to VKD3D_CONFIG
+
+A recipe's VKD3D_CONFIG replaces the bottle's on every launch, so a bottle could not add a flag (single_queue, for example)
+without editing the recipe. HB_VKD3D_CONFIG is appended to VKD3D_CONFIG before it is parsed.
+---
+ libs/vkd3d/device.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 3049d7e8..5a5b9025 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -1312,6 +1312,16 @@ static void vkd3d_config_flags_init_once(void)
+     char config[VKD3D_PATH_MAX];
+ 
+     vkd3d_get_env_var("VKD3D_CONFIG", config, sizeof(config));
++    {
++        /* Highball: HB_VKD3D_CONFIG is appended to VKD3D_CONFIG, so a bottle can add flags to the ones its
++         * recipe sets (the recipe's VKD3D_CONFIG replaces the bottle's on every launch). */
++        char extra[VKD3D_PATH_MAX];
++        if (vkd3d_get_env_var("HB_VKD3D_CONFIG", extra, sizeof(extra)) && extra[0])
++        {
++            size_t len = strlen(config);
++            snprintf(config + len, sizeof(config) - len, "%s%s", len ? "," : "", extra);
++        }
++    }
+     vkd3d_config_flags = vkd3d_parse_debug_options(config, vkd3d_config_options, ARRAY_SIZE(vkd3d_config_options));
+ 
+     if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_APPLICATION_WORKAROUNDS))
+-- 
+2.54.0 (Apple Git-157)
+
