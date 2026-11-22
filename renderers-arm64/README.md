@@ -81,7 +81,9 @@ vkd3d-proton or DXVK yet.
   root CBVs cleared on reset. The upscale function previously followed MetalSharp's
   d3d12_command_list_metalfx_scale. It was reworked around vkCmdBlitImage2 with vkd3d's standard barrier setup.
   Forza Horizon 6: FSR Quality on MetalFX, full frame, the game's
-  sharpening kept (2026-11-19). No frame time against stock FSR and no second FSR 3.1 game yet.
+  sharpening kept (2026-11-19). No frame time against stock FSR and no second FSR 3.1 game yet. MetalFX scales by at
+  most 3x, so FSR Ultra Performance at a display height not divisible by 3 asks for more than that and, with the
+  switch on, gets a plain stretch instead of an upscale.
 
 ### DXVK (master of 2026-10-09, 1cad6cd)
 
