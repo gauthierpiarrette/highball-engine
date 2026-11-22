@@ -23,6 +23,21 @@ with two sets of patches, applied in this order:
     constant buffer reads, 24.4 to 21 ms there, and null constant buffer descriptors then read a buffer of zeros. A read
     past a bound constant buffer returns the memory after it instead of zero. Also 256 command buffer records, so
     `MESA_KK_DEBUG=cbs` logs all of a frame's.
+  - `0011` HDR swapchains reach the display as HDR. The Metal layer asked for extended dynamic range only for float
+    formats, so an HDR10 (PQ) swapchain in a 10-bit integer format was shown as SDR: washed out, grey. EDR is now on
+    for HDR10 and HLG too, and a PQ layer gets HDR10 metadata when the program sets none (peak `HB_HDR_MAX_NITS`, 1000
+    by default; HLG gets Apple's HLG metadata), so macOS tone-maps highlights into the panel's headroom instead of
+    clipping them. An extended-linear sRGB (scRGB) layer gets that default metadata only with
+    `HB_HDR_SCRGB_METADATA=1`, asked for per game: DXVK's dxgi puts every RGBA16F swap chain in scRGB once the
+    presenter accepts it, so without the switch an SDR game with an FP16 swap chain would get 1000 nit metadata and
+    tone mapping too; without it an scRGB layer keeps what it had before this patch (EDR for float formats, no
+    metadata) unless the program sets its own. The optical output scale is 100 on both paths, the default metadata and
+    the metadata a program sets (which was 1): Apple maps 1.0 to 100 nits, and the scale only matters for float
+    buffers, so this changes scRGB only. Forza Horizon 6 (PQ) on an M5 Max, macOS 27.2: correct HDR, highlights no
+    longer clipped (2026-11-17); EA SPORTS FC 27 (scRGB) with `HB_HDR_SCRGB_METADATA=1` and the scale of 100: correct
+    HDR and brightness (2026-11-19). An SDR game with an FP16 swap chain was not tried; without the switch it gets no
+    metadata from this patch. Needs vkd3d-proton to enable VK_EXT_swapchain_colorspace, or the surface offers sRGB
+    only.
 
   - `0009` `HB_KK_NO_SSBO_ROBUST=1`, asked for per game, drops the bounds check on storage buffer access as `0007` does
     for constant buffers. When either switch is set, both go into the pipeline cache UUID and the disk cache key, which
