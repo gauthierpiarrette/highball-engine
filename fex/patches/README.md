@@ -38,11 +38,13 @@ code buffer without it and crashed Forza Horizon 6 at `HandleUnalignedAccess`, s
 out, set again on the way in), and an FPCR write stalls Apple cores: in saved Forza Horizon 6 profiles the write in
 `ExitFunctionEC` was FEX's hottest instruction, about 19% of a hot thread. With the switch the JIT uses NEP but not AH
 (x86 MIN/MAX and RCP/RSQRT are emulated as on hosts without AFP, RPRES is not used) and NEP stays set in native code,
-so no FPCR write happens on those calls or on calls into FEX's helpers. On an M5 Max (2026-11-17): a native call 24.0 to
-4.3 ns, QueryPerformanceCounter 40 to 20 ns, scalar SSE unchanged, SSE MIN/MAX 1.80 to 2.27 ns. Wine's CRT math gave
-bit-identical results over 10,610 calls with NEP left set; leaving AH set as well changed them (sinh(-1) came out
-positive), which is why the JIT drops AH instead. The x64 fidelity programs give the same results except x87test's
-`mxcsr.ftz.flags` (no PE after a flushed underflow without AH). Forza Horizon 6 played normally with it. Under the
+so no FPCR write happens on those calls or on calls into FEX's helpers. On an M5 Max, with the 2026-11-17 build, before
+scalar min/max kept the upper lanes: a native call 24.0 to 4.3 ns, QueryPerformanceCounter 40 to 20 ns, scalar SSE
+unchanged, SSE MIN/MAX 1.80 to 2.27 ns. Wine's CRT math gave bit-identical results over 10,610 calls with NEP left set;
+leaving AH set as well changed them (sinh(-1) came out positive), which is why the JIT drops AH instead. The x64
+fidelity programs gave the same results except x87test's `mxcsr.ftz.flags` (no PE after a flushed underflow without
+AH), and Forza Horizon 6 played normally with it. These figures and runs are from that build and have not been repeated
+with the current patch; `scalarminmax` has not yet run with the switch both ways. Under the
 switch a program also sees DAZ whenever it sets FTZ (FZ flushes inputs too with AH clear), a positive default NaN
 where x86's is negative, and FIZ set in FEX's helpers; and NEP reaches native code, macOS code included, where LLVM
 assumes scalar SIMD&FP results zero the upper lanes, so native code other than the CRT math that was checked can

@@ -25,9 +25,11 @@ Under the switch the program sees these differences:
   came out positive), which is why the switch drops AH rather than keeping it.
 - FIZ, set from MXCSR.DAZ, stays set while FEX's own helpers run.
 
-On an M5 Max, macOS 27.2 (2026-11-17): a native call 24.0 to 4.3 ns, QueryPerformanceCounter 40 to 20 ns, scalar SSE
-unchanged, SSE MIN/MAX 1.80 to 2.27 ns. The x64 fidelity programs give the same results except x87test's
-mxcsr.ftz.flags. Forza Horizon 6 played normally with it. Off unless HB_FEX_LAZY_AFP=1 is set.
+On an M5 Max, macOS 27.2, with the 2026-11-17 build, before scalar min/max kept the upper lanes: a native call 24.0
+to 4.3 ns, QueryPerformanceCounter 40 to 20 ns, scalar SSE unchanged, SSE MIN/MAX 1.80 to 2.27 ns. The x64 fidelity
+programs gave the same results except x87test's mxcsr.ftz.flags, and Forza Horizon 6 played normally with it. None of
+this has been repeated with the current patch, and scalarminmax has not yet run with the switch both ways. Off unless
+HB_FEX_LAZY_AFP=1 is set.
 
 Built for arm64ec on FEX 2610 plus 0001 to 0034.
 ---
