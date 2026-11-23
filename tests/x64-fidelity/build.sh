@@ -20,6 +20,7 @@ $CC -o "$OUT/drdbg.exe"     "$HERE/drdbg.c"
 $CC -o "$OUT/ordertest.exe" "$HERE/ordertest.c"
 $CC -o "$OUT/smcdata.exe"   "$HERE/smcdata.c"
 $CC -o "$OUT/smcretire.exe" "$HERE/smcretire.c"
+$CC -o "$OUT/syscallwrite.exe" "$HERE/syscallwrite.c"
 $CC -o "$OUT/globalroot.exe" "$HERE/globalroot.c" -lpsapi
 $CC -o "$OUT/topdown.exe" "$HERE/topdown.c"
 $CC -o "$OUT/regiontest.exe" "$HERE/regiontest.c"
