@@ -9,6 +9,7 @@
 | SPIRV-Cross (built into the arm64 line's MoltenVK, with moltenvk-arm64/spirv-cross/) | github.com/KhronosGroup/SPIRV-Cross | Apache-2.0 | yes, inside MoltenVK |
 | Mesa (the Apple GPU miptree layout of src/asahi/layout/layout.c, which moltenvk-arm64 patch 0010 follows) | gitlab.freedesktop.org/mesa/mesa | MIT | yes, inside MoltenVK |
 | DXVK (the macOS build on the Intel line, and master 1cad6cd with renderers-arm64/dxvk/ on the arm64 line) | github.com/doitsujin/dxvk, Gcenx/DXVK-macOS | zlib | as a renderer overlay |
+| DXVK-macOS v3.1-macos1.0, its Direct3D 9 (the Wine 10 engines' d9vk-modern component, release d9vk-dxvk-macos-3.1-20260916) | github.com/metalsharp/DXVK-macOS (Avery Felts, after DXVK and Gcenx's MoltenVK work) | zlib | as a renderer overlay |
 | vkd3d-proton (v3.0.1 with renderers-arm64/vkd3d-proton/, arm64 line) | github.com/HansKristian-Work/vkd3d-proton | LGPL-2.1-or-later | yes, as the arm64 engine's vkd3d renderer overlay |
 | dxil-spirv (built into vkd3d-proton) | github.com/HansKristian-Work/dxil-spirv | MIT | yes, inside vkd3d-proton |
 | DXMT | github.com/3Shain/dxmt | see upstream LICENSE | as a renderer overlay |
