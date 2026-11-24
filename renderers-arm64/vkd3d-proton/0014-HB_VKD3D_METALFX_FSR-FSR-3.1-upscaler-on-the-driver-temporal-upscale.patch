@@ -37,9 +37,9 @@ RCAS sharpens)", and "kk: MetalFX temporal 1728x1117, content 1152x744 -> 1728x1
 Retina); full frame, the game's sharpening and HDR, no visible artifacts. No frame time against stock FSR, and no second
 FSR 3.1 game tried yet.
 
-The earlier upscale function followed MetalSharp's d3d12_command_list_metalfx_scale (AGPL-3.0). It was reworked
-around vkCmdBlitImage2 and Highball's own interface, retaining vkd3d's standard barrier setup. Pass recognition
-uses the FidelityFX SDK's public pass and binding layout.
+Based in part on Avery Felts' d3d12_command_list_metalfx_scale (MetalVulkan), used with permission under LGPL 2.1
+or later (highball#780): the barrier setup around the upscale follows it. The upscale itself is a vkCmdBlitImage2
+with Highball's own interface. Pass recognition uses the FidelityFX SDK's public pass and binding layout.
 
 Upstream: not sent.
 

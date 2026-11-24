@@ -78,8 +78,8 @@ vkd3d-proton or DXVK yet.
   own FSR path runs if the provider scan fails or lacks either required pass shape. Accumulate becomes one vkCmdBlitImage2 carrying Highball's VkHbTemporalUpscaleInfo
   (`include/private/vkd3d_hb_upscale.h`), into the output, or into the upscaled color the game's RCAS sharpens, so RCAS
   need not be recognized; one scaler per FSR context; pre-exposure from FSR's per-frame ratios; FSR state and saved
-  root CBVs cleared on reset. The upscale function previously followed MetalSharp's
-  d3d12_command_list_metalfx_scale. It was reworked around vkCmdBlitImage2 with vkd3d's standard barrier setup.
+  root CBVs cleared on reset. Based in part on Avery Felts' d3d12_command_list_metalfx_scale (MetalVulkan), used
+  with permission under LGPL 2.1 or later: the barrier setup around the upscale follows it.
   Forza Horizon 6: FSR Quality on MetalFX, full frame, the game's
   sharpening kept (2026-11-19). No frame time against stock FSR and no second FSR 3.1 game yet. MetalFX scales by at
   most 3x, so FSR Ultra Performance at a display height not divisible by 3 asks for more than that and, with the
