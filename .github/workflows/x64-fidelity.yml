@@ -51,8 +51,10 @@ jobs:
           foreach ($t in 'cpuidtest','kattest','x87test','x87test32','ctxtest','fibertest','memtest','regiontest','cowtest','imagequery','imagemap','tsctest','syscalltest','drtest','drtest32','drdbg','drdbg32','ordertest','ordertest32','globalroot','topdown','syscallwrite','wakestress','wpmtest','msync-thread-exit','msync-pingpong','scalarminmax') {
             $out = "results/$t.txt"
             $p = Start-Process -FilePath "exe/$t.exe" -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError "results/$t.err"
-            if (-not $p.WaitForExit(300000)) { $p.Kill(); "TIMEOUT" | Out-File -Append $out }
-            "exit $($p.ExitCode)" | Out-File -Append $out
+            # A killed test still holds its redirected output for a moment; wait for it, or the
+            # append below fails on a locked file and stops every test after it (drdbg on ARM64).
+            if (-not $p.WaitForExit(300000)) { $p.Kill($true); $p.WaitForExit(30000) | Out-Null; "TIMEOUT" | Out-File -Append $out }
+            try { "exit $($p.ExitCode)" | Out-File -Append $out } catch { "exit unknown: $($_.Exception.Message)" | Out-File -Append "results/$t.err" }
             Get-Content $out | Select-String -Pattern '^(FAIL|SUMMARY)' | ForEach-Object { $_.Line }
           }
       - uses: actions/upload-artifact@v4
