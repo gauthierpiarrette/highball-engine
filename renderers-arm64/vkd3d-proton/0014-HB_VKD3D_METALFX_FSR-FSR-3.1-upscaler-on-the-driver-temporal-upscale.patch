@@ -1,0 +1,820 @@
+vkd3d-proton: HB_VKD3D_METALFX_FSR=1 runs a game's FSR 3.1 upscaler on the driver's temporal upscale (MetalFX).
+
+When the driver lists "hb-upscale" in driverInfo (KosmicKrisp with Highball's 0013, which runs it on MetalFX's temporal
+scaler), the game's own FSR 3.1 upscaler is recorded as one upscale instead of its passes. The passes are recognized
+without game-specific data: at pipeline creation the game's amd_fidelityfx_upscaler_dx12.dll (next to its executable,
+read only, never loaded or replaced) is scanned for its DXBC containers, each one's HASH part and PSV0 bindings tell its
+pass (prepare_inputs b0 t0-t2 u0-u4, accumulate b0 s1 t8 u0 u2, any other FSR 3.1 pass "other"; FSR 2 and FSR 4
+containers are left out), and a compute pipeline whose DXIL hash is in that table is marked. The table
+is enabled only if the scan completes and finds both the prepare_inputs and accumulate binding shapes.
+
+At dispatch, prepare_inputs gives color (t2), depth (t1), motion vectors (t0), the constants (b0) and the context: its
+u0, an image the FSR context owns, so every FSR context gets its own scaler and history. The passes after it are
+dropped up to accumulate; prepare_reactivity, which has accumulate's binding shape but does not read the game's color,
+gives the reactive mask when the game sets one. Accumulate becomes the upscale: into its output (u1), or, when the
+game sharpens and u1 is not bound, into the upscaled color (u0) that the game's RCAS reads, so RCAS runs as the game
+ships it with the game's sharpness, and nothing depends on recognizing RCAS. Everything after accumulate runs as
+shipped. If the inputs or constants cannot be read, every pass runs as shipped.
+
+The upscale is a vkCmdBlitImage2 from the color image's rendered region to the whole output, with a
+VkHbTemporalUpscaleInfo (include/private/vkd3d_hb_upscale.h, Highball's own interface) in VkBlitImageInfo2's pNext
+chain, which Wine passes to the driver as it is, between a barrier before (all earlier writes before the blit) and
+one after (the blit's writes before everything later). A driver that cannot take the blit performs an ordinary blit.
+FSR 3.1's constants carry only the ratio of this frame's pre-exposure to the last one's (deltaPreExposure), so the
+pre-exposure passed is the product of those ratios since the context's last reset, kept for the last four contexts.
+No exposure texture is passed: FSR's exposure resource is its own frame-information texture unless the game gives
+one, and the luminance pass that writes it is one of those dropped. The compute root CBVs that are saved to read
+the constants, and the FSR state, are cleared when the command list is reset, and the CBVs when the compute root
+signature changes.
+
+Without "hb-upscale" the switch logs once and the game's FSR runs as shipped. HB_VKD3D_METALFX_FSR=log only logs the
+bindings. Optional switches: HB_FSR_MFX_AUTO_EXPOSURE (0), _REACTIVE (1), _DEPTH_REVERSED (1), _HIRES_MV (0, motion
+vectors at the output size; needs a driver that supports them, KosmicKrisp only with the macOS 27 SDK and runtime).
+
+Checked on an M5 Max, macOS 27.2 (2026-11-19), x86-64 build of this series with KosmicKrisp 0011 to 0013 built as in
+CI: Forza Horizon 6 logs 301 FSR 3.1 shaders in its provider, "accumulate writes ... (the upscaled color the game's
+RCAS sharpens)", and "kk: MetalFX temporal 1728x1117, content 1152x744 -> 1728x1117" at FSR Quality (3456x2234 at
+Retina); full frame, the game's sharpening and HDR, no visible artifacts. No frame time against stock FSR, and no second
+FSR 3.1 game tried yet.
+
+Based in part on Avery Felts' d3d12_command_list_metalfx_scale (MetalVulkan), used with permission under LGPL 2.1
+or later (highball#780): the barrier setup around the upscale follows it. The upscale itself is a vkCmdBlitImage2
+with Highball's own interface. Pass recognition uses the FidelityFX SDK's public pass and binding layout.
+
+Upstream: not sent.
+
+diff --git a/include/private/vkd3d_hb_upscale.h b/include/private/vkd3d_hb_upscale.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..186be6c1768e9279f5aa7c1ac32797232205986d
+--- /dev/null
++++ b/include/private/vkd3d_hb_upscale.h
+@@ -0,0 +1,55 @@
++/*
++ * Copyright 2026 TxCsOffc
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __VKD3D_HB_UPSCALE_H
++#define __VKD3D_HB_UPSCALE_H
++
++/* Highball's temporal upscale. A driver that lists the word "hb-upscale" in
++ * VkPhysicalDeviceDriverProperties::driverInfo (KosmicKrisp with Highball's patch, which runs it on MetalFX's
++ * temporal scaler) upscales a vkCmdBlitImage2 whose VkBlitImageInfo2 carries this structure in its pNext chain:
++ * the blit's source is the color image, its source region the rendered content from the origin, its destination
++ * the output image, whole. A driver that cannot upscale that blit performs it as an ordinary blit. Wine's Vulkan
++ * layer passes the pNext chain of VkBlitImageInfo2 to the driver as it is. The layout below is the interface and
++ * must stay as it is. */
++
++#define VK_STRUCTURE_TYPE_HB_TEMPORAL_UPSCALE_INFO ((VkStructureType)1000999300)
++#define VKD3D_HB_UPSCALE_DRIVER_WORD "hb-upscale"
++
++#define VKD3D_HB_UPSCALE_RESET            0x1u /* the history is dropped */
++#define VKD3D_HB_UPSCALE_DEPTH_REVERSED   0x2u /* depth 1 is near */
++#define VKD3D_HB_UPSCALE_AUTO_EXPOSURE    0x4u /* the scaler computes exposure itself */
++#define VKD3D_HB_UPSCALE_MOTION_AT_OUTPUT 0x8u /* the motion vectors are at the output size */
++
++typedef struct VkHbTemporalUpscaleInfo
++{
++    VkStructureType sType;
++    const void *pNext;
++    uint64_t context;   /* nonzero; the driver keeps one scaler, and its history, per context */
++    uint32_t flags;     /* VKD3D_HB_UPSCALE_* */
++    VkImage depth;      /* required */
++    VkImage motion;     /* required */
++    VkImage reactive;   /* optional */
++    VkImage exposure;   /* optional, 1x1, exposure in red */
++    float jitterX;      /* in input pixels */
++    float jitterY;
++    float motionScaleX; /* to pixels at the motion vectors' size */
++    float motionScaleY;
++    float preExposure;  /* the factor the color input was multiplied by */
++} VkHbTemporalUpscaleInfo;
++
++#endif /* __VKD3D_HB_UPSCALE_H */
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 84976e6af3949c0b5949029e011550379d27211d..57ff3b8b8c237c8a758520acccd089d4b2d43eb3 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7215,6 +7215,8 @@ static void d3d12_command_list_reset_state(struct d3d12_command_list *list,
+ {
+     d3d12_command_list_reset_api_state(list, initial_pipeline_state);
+     d3d12_command_list_reset_internal_state(list);
++    memset(list->hb_compute_root_cbv, 0, sizeof(list->hb_compute_root_cbv));
++    memset(&list->hb_fsr, 0, sizeof(list->hb_fsr));
+ }
+ 
+ void d3d12_command_list_invalidate_all_state(struct d3d12_command_list *list)
+@@ -9148,6 +9150,350 @@ static void d3d12_command_list_check_compute_barrier(struct d3d12_command_list *
+             list->device, list->cmd.vk_command_buffer);
+ }
+ 
++/* Highball: an upscale through vkCmdBlitImage2 with a VkHbTemporalUpscaleInfo (vkd3d_hb_upscale.h), ordered after
++ * everything recorded before it and before everything after it. */
++static void d3d12_command_list_hb_upscale(struct d3d12_command_list *list, VkImage color, VkImage output,
++        uint32_t content_width, uint32_t content_height, uint32_t output_width, uint32_t output_height,
++        const VkHbTemporalUpscaleInfo *info)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkDependencyInfo dependency_info;
++    VkBlitImageInfo2 blit_info;
++    VkMemoryBarrier2 barrier;
++    VkImageBlit2 region;
++
++    d3d12_command_list_end_current_render_pass(list, false);
++    d3d12_command_list_end_transfer_batch(list);
++
++    memset(&barrier, 0, sizeof(barrier));
++    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
++    barrier.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
++    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    memset(&dependency_info, 0, sizeof(dependency_info));
++    dependency_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dependency_info.memoryBarrierCount = 1;
++    dependency_info.pMemoryBarriers = &barrier;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dependency_info));
++
++    memset(&region, 0, sizeof(region));
++    region.sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
++    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    region.srcSubresource.layerCount = 1;
++    region.srcOffsets[1].x = content_width;
++    region.srcOffsets[1].y = content_height;
++    region.srcOffsets[1].z = 1;
++    region.dstSubresource = region.srcSubresource;
++    region.dstOffsets[1].x = output_width;
++    region.dstOffsets[1].y = output_height;
++    region.dstOffsets[1].z = 1;
++    memset(&blit_info, 0, sizeof(blit_info));
++    blit_info.sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
++    blit_info.pNext = info;
++    blit_info.srcImage = color;
++    blit_info.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    blit_info.dstImage = output;
++    blit_info.dstImageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    blit_info.regionCount = 1;
++    blit_info.pRegions = &region;
++    blit_info.filter = VK_FILTER_LINEAR;
++    VK_CALL(vkCmdBlitImage2(list->cmd.vk_command_buffer, &blit_info));
++
++    barrier.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
++    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dependency_info));
++
++    list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
++}
++
++/* Highball (HB_VKD3D_METALFX_FSR): FSR 3.1's upscaler on the driver's temporal upscale. The game records its FSR
++ * passes as usual. prepare_inputs gives the color (t2), depth (t1) and motion vectors (t0) and the constants (b0);
++ * the passes after it are dropped up to accumulate, which becomes the upscale: into its output (u1), or, when the
++ * game sharpens, into the upscaled color (u0) that the game's RCAS then reads and sharpens into the output.
++ * prepare_reactivity, which has accumulate's binding shape but does not read the game's color, gives the reactive
++ * mask. Everything after accumulate runs as the game ships it. "log" only reports what was found. Bindings from
++ * FidelityFX SDK 1.1.4, src/backends/dx12/shaders; constants as in FSR 3.1's Fsr3UpscalerConstants (dwords: render
++ * size 0-1, upscale size 4-5, jitter 16-17, motion vector scale 20-21, delta pre-exposure 29, frame index 31). */
++enum hb_fsr_mode { HB_FSR_OFF, HB_FSR_LOG, HB_FSR_ON };
++
++static enum hb_fsr_mode hb_fsr_mode(void)
++{
++    static int mode = -1;
++    if (mode < 0)
++    {
++        char value[16];
++        mode = HB_FSR_OFF;
++        if (vkd3d_get_env_var("HB_VKD3D_METALFX_FSR", value, sizeof(value)))
++            mode = !strcmp(value, "log") ? HB_FSR_LOG : (value[0] == '1' ? HB_FSR_ON : HB_FSR_OFF);
++    }
++    return (enum hb_fsr_mode)mode;
++}
++
++static bool hb_fsr_env_switch(const char *name, bool fallback)
++{
++    char value[16];
++    return vkd3d_get_env_var(name, value, sizeof(value)) ? value[0] != '0' : fallback;
++}
++
++static const struct vkd3d_shader_resource_binding *hb_fsr_find_binding(const struct d3d12_root_signature *rs,
++        enum vkd3d_shader_descriptor_type type, unsigned int reg, unsigned int *param_index)
++{
++    const struct vkd3d_shader_root_parameter *p;
++    unsigned int i, j;
++
++    for (i = 0; i < rs->parameter_count; i++)
++    {
++        p = &rs->parameters[i];
++        if (p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++        {
++            for (j = 0; j < p->descriptor_table.binding_count; j++)
++            {
++                const struct vkd3d_shader_resource_binding *b = &p->descriptor_table.first_binding[j];
++                if (b->type == type && b->register_space == 0 && reg >= b->register_index &&
++                        reg - b->register_index < b->register_count)
++                {
++                    *param_index = i;
++                    return b;
++                }
++            }
++        }
++        else if (type == VKD3D_SHADER_DESCRIPTOR_TYPE_CBV && p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV &&
++                p->descriptor.binding && p->descriptor.binding->register_space == 0 &&
++                p->descriptor.binding->register_index == reg)
++        {
++            *param_index = i;
++            return p->descriptor.binding;
++        }
++    }
++    return NULL;
++}
++
++static VkImage hb_fsr_image(struct d3d12_command_list *list, enum vkd3d_shader_descriptor_type type, unsigned int reg)
++{
++    const struct vkd3d_pipeline_bindings *bindings = &list->compute_bindings;
++    const struct vkd3d_shader_resource_binding *b;
++    const struct vkd3d_descriptor_metadata_view *view;
++    unsigned int param;
++
++    if (!bindings->root_signature || !list->cbv_srv_uav_descriptors_view)
++        return VK_NULL_HANDLE;
++    if (!(b = hb_fsr_find_binding(bindings->root_signature, type, reg, &param)))
++        return VK_NULL_HANDLE;
++    view = list->cbv_srv_uav_descriptors_view + bindings->descriptor_tables[b->descriptor_table] +
++            b->descriptor_offset + (reg - b->register_index);
++    if (!(view->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) || !view->info.image.view)
++        return VK_NULL_HANDLE;
++    return view->info.image.view->hb_vk_image;
++}
++
++static void hb_fsr_log_bindings(struct d3d12_command_list *list, const char *what)
++{
++    const struct vkd3d_pipeline_bindings *bindings = &list->compute_bindings;
++    const struct vkd3d_shader_resource_binding *b;
++    const struct vkd3d_descriptor_metadata_view *view;
++    char text[1024];
++    unsigned int reg, param, t;
++    size_t len = 0;
++
++    if (!bindings->root_signature || !list->cbv_srv_uav_descriptors_view)
++        return;
++    text[0] = 0;
++    for (t = 0; t < 2 && len < sizeof(text); t++)
++    {
++        for (reg = 0; reg < 12 && len < sizeof(text); reg++)
++        {
++            enum vkd3d_shader_descriptor_type type = t ? VKD3D_SHADER_DESCRIPTOR_TYPE_UAV : VKD3D_SHADER_DESCRIPTOR_TYPE_SRV;
++            if (!(b = hb_fsr_find_binding(bindings->root_signature, type, reg, &param)))
++                continue;
++            view = list->cbv_srv_uav_descriptors_view + bindings->descriptor_tables[b->descriptor_table] +
++                    b->descriptor_offset + (reg - b->register_index);
++            len += snprintf(text + len, sizeof(text) - len, " %c%u=", t ? 'u' : 't', reg);
++            if (len >= sizeof(text))
++                break;
++            if ((view->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) && view->info.image.view)
++                len += snprintf(text + len, sizeof(text) - len, "img%#"PRIx64"/vk%u",
++                        (uint64_t)view->info.image.view->hb_vk_image,
++                        view->info.image.view->format ? (unsigned int)view->info.image.view->format->vk_format : 0);
++            else
++                len += snprintf(text + len, sizeof(text) - len, "flags%#x", view->info.flags);
++        }
++    }
++    ERR("HB FSR: %s bindings:%s\n", what, text);
++}
++
++static bool hb_fsr_read_constants(struct d3d12_command_list *list, uint32_t *cb, size_t size)
++{
++    const struct vkd3d_unique_resource *u;
++    const struct vkd3d_shader_resource_binding *b;
++    const struct vkd3d_memory_allocation *allocation;
++    D3D12_GPU_VIRTUAL_ADDRESS va;
++    unsigned int param;
++
++    if (!list->compute_bindings.root_signature ||
++            !(b = hb_fsr_find_binding(list->compute_bindings.root_signature, VKD3D_SHADER_DESCRIPTOR_TYPE_CBV, 0, &param)) ||
++            param >= ARRAY_SIZE(list->hb_compute_root_cbv) || !(va = list->hb_compute_root_cbv[param]))
++        return false;
++    if (!(u = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, va)))
++        return false;
++    allocation = CONTAINING_RECORD(u, struct vkd3d_memory_allocation, resource);
++    if (!allocation->cpu_address || va < u->va || va + size > u->va + u->size)
++        return false;
++    memcpy(cb, (const uint8_t *)allocation->cpu_address + (va - u->va), size);
++    return true;
++}
++
++/* FSR 3.1 passes only the ratio of this frame's pre-exposure to the last one's; the scaler wants the factor itself,
++ * which only has to be consistent from frame to frame, so it is the product of the ratios since the context's last
++ * reset. Kept per context (FSR's prepare_inputs u0, an image of the context) for the last few contexts. */
++static float hb_fsr_pre_exposure(uint64_t context, float delta, bool reset)
++{
++    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    static struct { uint64_t context; float value; uint64_t used; } slots[4];
++    static uint64_t clock;
++    unsigned int i, slot = 0;
++    float value;
++
++    pthread_mutex_lock(&lock);
++    for (i = 0; i < ARRAY_SIZE(slots); i++)
++    {
++        if (slots[i].context == context)
++        {
++            slot = i;
++            break;
++        }
++        if (slots[i].used < slots[slot].used)
++            slot = i;
++    }
++    if (slots[slot].context != context || reset)
++    {
++        slots[slot].context = context;
++        slots[slot].value = 1.0f;
++    }
++    else if (delta > 0.0f && isfinite(delta))
++    {
++        slots[slot].value *= delta;
++        if (!(slots[slot].value > 1.0e-6f && slots[slot].value < 1.0e6f))
++            slots[slot].value = 1.0f;
++    }
++    slots[slot].used = ++clock;
++    value = slots[slot].value;
++    pthread_mutex_unlock(&lock);
++    return value;
++}
++
++/* Returns true when the dispatch is handled (dropped or replaced) */
++static bool hb_fsr_dispatch(struct d3d12_command_list *list)
++{
++    const uint32_t pass = list->state->hb_fsr_pass;
++    enum hb_fsr_mode mode = hb_fsr_mode();
++    static uint32_t logged_passes;
++    VkHbTemporalUpscaleInfo info;
++    VkImage output, reactive;
++    const int32_t *i32;
++    const float *f;
++    bool sharpen;
++
++    if (mode == HB_FSR_ON && !list->device->hb_upscale_supported)
++    {
++        static bool warned;
++        if (!warned)
++            ERR("HB FSR: the driver does not list \"" VKD3D_HB_UPSCALE_DRIVER_WORD "\", FSR runs as the game ships it.\n");
++        warned = true;
++        mode = HB_FSR_LOG;
++    }
++    if (mode == HB_FSR_OFF)
++        return false;
++
++    if (pass == HB_FSR_PASS_PREPARE_INPUTS)
++    {
++        list->hb_fsr.motion = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 0);
++        list->hb_fsr.depth = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 1);
++        list->hb_fsr.color = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 2);
++        list->hb_fsr.context = (uint64_t)hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_UAV, 0);
++        list->hb_fsr.reactive = VK_NULL_HANDLE;
++        list->hb_fsr.have_inputs = list->hb_fsr.color && list->hb_fsr.depth && list->hb_fsr.motion &&
++                list->hb_fsr.context && hb_fsr_read_constants(list, list->hb_fsr.cb, sizeof(list->hb_fsr.cb));
++        if (!(logged_passes & (1u << pass)) || !list->hb_fsr.have_inputs)
++        {
++            if (!(logged_passes & (1u << pass)))
++                hb_fsr_log_bindings(list, "prepare_inputs");
++            logged_passes |= 1u << pass;
++            i32 = (const int32_t *)list->hb_fsr.cb;
++            f = (const float *)list->hb_fsr.cb;
++            ERR("HB FSR: prepare_inputs context %#"PRIx64" color %#"PRIx64" depth %#"PRIx64" mv %#"PRIx64", "
++                    "constants %s: render %dx%d upscale %dx%d jitter %.3f %.3f mv scale %.6f %.6f "
++                    "delta pre-exposure %.3f frame %.0f.\n",
++                    list->hb_fsr.context, (uint64_t)list->hb_fsr.color, (uint64_t)list->hb_fsr.depth,
++                    (uint64_t)list->hb_fsr.motion, list->hb_fsr.have_inputs ? "read" : "MISSING",
++                    i32[0], i32[1], i32[4], i32[5], f[16], f[17], f[20], f[21], f[29], f[31]);
++        }
++        return mode == HB_FSR_ON && list->hb_fsr.have_inputs;
++    }
++
++    if (!list->hb_fsr.have_inputs)
++        return false;
++    if (pass == HB_FSR_PASS_OTHER)
++        return mode == HB_FSR_ON;
++
++    /* prepare_reactivity: t3 the game's reactive mask, t4 its transparency and composition mask; FSR binds one
++     * placeholder to both when the game gives neither */
++    if (hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 8) != list->hb_fsr.color)
++    {
++        reactive = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 3);
++        list->hb_fsr.reactive = reactive != hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV, 4) ? reactive : VK_NULL_HANDLE;
++        return mode == HB_FSR_ON;
++    }
++
++    output = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_UAV, 1);
++    sharpen = !output;
++    if (sharpen)
++        output = hb_fsr_image(list, VKD3D_SHADER_DESCRIPTOR_TYPE_UAV, 0);
++    if (!(logged_passes & (1u << pass)))
++    {
++        logged_passes |= 1u << pass;
++        hb_fsr_log_bindings(list, "accumulate");
++        ERR("HB FSR: accumulate writes %#"PRIx64" (%s), reactive mask %#"PRIx64".\n", (uint64_t)output,
++                sharpen ? "the upscaled color the game's RCAS sharpens" : "the output",
++                (uint64_t)list->hb_fsr.reactive);
++    }
++    list->hb_fsr.have_inputs = false;
++    if (mode != HB_FSR_ON || !output)
++        return false;
++
++    i32 = (const int32_t *)list->hb_fsr.cb;
++    f = (const float *)list->hb_fsr.cb;
++    if (i32[0] <= 0 || i32[1] <= 0 || i32[4] <= 0 || i32[5] <= 0)
++        return false;
++
++    memset(&info, 0, sizeof(info));
++    info.sType = VK_STRUCTURE_TYPE_HB_TEMPORAL_UPSCALE_INFO;
++    info.context = list->hb_fsr.context;
++    if (f[31] == 0.0f)
++        info.flags |= VKD3D_HB_UPSCALE_RESET;
++    if (hb_fsr_env_switch("HB_FSR_MFX_DEPTH_REVERSED", true))
++        info.flags |= VKD3D_HB_UPSCALE_DEPTH_REVERSED;
++    if (hb_fsr_env_switch("HB_FSR_MFX_AUTO_EXPOSURE", false))
++        info.flags |= VKD3D_HB_UPSCALE_AUTO_EXPOSURE;
++    if (hb_fsr_env_switch("HB_FSR_MFX_HIRES_MV", false))
++        info.flags |= VKD3D_HB_UPSCALE_MOTION_AT_OUTPUT;
++    info.depth = list->hb_fsr.depth;
++    info.motion = list->hb_fsr.motion;
++    if (hb_fsr_env_switch("HB_FSR_MFX_REACTIVE", true))
++        info.reactive = list->hb_fsr.reactive;
++    info.jitterX = f[16];
++    info.jitterY = f[17];
++    /* FSR's motion vector scale takes the vectors to UV; the scaler wants pixels at the vectors' size */
++    info.motionScaleX = f[20] * (float)(info.flags & VKD3D_HB_UPSCALE_MOTION_AT_OUTPUT ? i32[4] : i32[0]);
++    info.motionScaleY = f[21] * (float)(info.flags & VKD3D_HB_UPSCALE_MOTION_AT_OUTPUT ? i32[5] : i32[1]);
++    info.preExposure = hb_fsr_pre_exposure(info.context, f[29], info.flags & VKD3D_HB_UPSCALE_RESET);
++
++    d3d12_command_list_hb_upscale(list, list->hb_fsr.color, output, i32[0], i32[1], i32[4], i32[5], &info);
++    return true;
++}
++
+ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_iface *iface,
+         UINT x, UINT y, UINT z)
+ {
+@@ -9158,6 +9504,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
+ 
+     TRACE("iface %p, x %u, y %u, z %u.\n", iface, x, y, z);
+ 
++    if (list->state && list->state->hb_fsr_pass && hb_fsr_dispatch(list))
++        return;
++
+     d3d12_command_list_check_render_pass_validation(list, "Dispatch called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+ 
+@@ -13554,6 +13903,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetComputeRootSignature(d3d12_c
+ 
+     TRACE("iface %p, root_signature %p.\n", iface, root_signature);
+ 
++    memset(list->hb_compute_root_cbv, 0, sizeof(list->hb_compute_root_cbv));
+     d3d12_command_list_set_root_signature(list, &list->compute_bindings,
+             impl_from_ID3D12RootSignature(root_signature));
+ 
+@@ -13909,6 +14259,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetComputeRootConstantBufferVie
+     TRACE("iface %p, root_parameter_index %u, address %#"PRIx64".\n",
+             iface, root_parameter_index, address);
+ 
++    if (root_parameter_index < ARRAY_SIZE(list->hb_compute_root_cbv))
++        list->hb_compute_root_cbv[root_parameter_index] = address;
+     d3d12_command_list_set_root_descriptor(list, &list->compute_bindings,
+             root_parameter_index, address);
+ }
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index dfb412f86b0859874aadf98f60a40c3f6fad582e..0c7a1b8babd8ce9f1fbba489b3f9e880cd76ccbc 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -3982,6 +3982,8 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
+             user_extension_supported);
+ 
+     vkd3d_physical_device_info_init(&device->device_info, device);
++    device->hb_upscale_supported = !!strstr(device->device_info.vulkan_1_2_properties.driverInfo,
++            VKD3D_HB_UPSCALE_DRIVER_WORD);
+     vkd3d_physical_device_info_apply_workarounds(&device->device_info, device);
+ 
+     if (FAILED(hr = vkd3d_init_device_caps(device, create_info, &device->device_info)))
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index b52a038f1f337021ef2638372fb64bdf01612f4b..3f6b64c4910c4e1ba8b1e9a03a8ed4d96c3813a1 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -5599,6 +5599,7 @@ bool vkd3d_create_texture_view(struct d3d12_device *device, const struct vkd3d_t
+ 
+     object->vk_image_view = vk_view;
+     object->format = format;
++    object->hb_vk_image = desc->image;
+     object->info.texture.vk_view_type = desc->view_type;
+     object->info.texture.aspect_mask = desc->aspect_mask;
+     object->info.texture.miplevel_idx = desc->miplevel_idx;
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index c5ae9100537df5cfd51cb21bc8177bd7f73b7f31..71587603cda34e17d3d903618fc57f7d172b282f 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3264,6 +3264,215 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     return S_OK;
+ }
+ 
++/* Highball (HB_VKD3D_METALFX_FSR): the game's FSR 3.1 passes, recognized by the HASH part of their DXIL container. The
++ * table comes from the provider beside the executable (amd_fidelityfx_upscaler_dx12.dll, only read): every DXIL
++ * container in it is classified by its resource bindings (PSV0), with FidelityFX SDK 1.1/2.x's dx12 bindings:
++ * prepare_inputs b0 t0-t2 u0-u4, accumulate b0 s1 t8 u0 u2 (u1 the output); every other FSR 3.1 pass is "other".
++ * FSR2's and FSR4's containers (t10, or the "fsr4" string) are left out. */
++struct hb_fsr_shader
++{
++    uint8_t digest[16];
++    uint32_t pass;
++};
++
++static struct hb_fsr_shader *hb_fsr_shaders;
++static size_t hb_fsr_shader_count;
++static pthread_once_t hb_fsr_once = PTHREAD_ONCE_INIT;
++
++static uint32_t hb_u32(const uint8_t *p)
++{
++    uint32_t v;
++    memcpy(&v, p, sizeof(v));
++    return v;
++}
++
++static const uint8_t *hb_dxbc_part(const uint8_t *blob, size_t size, const char *fourcc, uint32_t *part_size)
++{
++    uint32_t count, k, off;
++
++    if (size < 32 || memcmp(blob, "DXBC", 4))
++        return NULL;
++    count = hb_u32(blob + 28);
++    if (count > 64 || 32 + 4 * (size_t)count > size)
++        return NULL;
++    for (k = 0; k < count; k++)
++    {
++        off = hb_u32(blob + 32 + 4 * k);
++        if ((size_t)off + 8 > size || memcmp(blob + off, fourcc, 4))
++            continue;
++        *part_size = hb_u32(blob + off + 4);
++        if ((size_t)off + 8 + *part_size > size)
++            return NULL;
++        return blob + off + 8;
++    }
++    return NULL;
++}
++
++static uint32_t hb_fsr_pass_from_psv0(const uint8_t *p, uint32_t size)
++{
++    uint64_t t = 0, u = 0, b = 0, smp = 0, *mask;
++    uint32_t runtime_size, count, entry_size, r, type, space, lo, hi, q;
++
++    if (size < 8)
++        return HB_FSR_PASS_NONE;
++    runtime_size = hb_u32(p);
++    q = 4 + runtime_size;
++    if (q + 4 > size)
++        return HB_FSR_PASS_NONE;
++    count = hb_u32(p + q);
++    q += 4;
++    if (count)
++    {
++        if (q + 4 > size)
++            return HB_FSR_PASS_NONE;
++        entry_size = hb_u32(p + q);
++        q += 4;
++        if (entry_size < 16 || q + (uint64_t)count * entry_size > size)
++            return HB_FSR_PASS_NONE;
++        for (r = 0; r < count; r++)
++        {
++            type = hb_u32(p + q + r * entry_size);
++            space = hb_u32(p + q + r * entry_size + 4);
++            lo = hb_u32(p + q + r * entry_size + 8);
++            hi = hb_u32(p + q + r * entry_size + 12);
++            if (space)
++                return HB_FSR_PASS_NONE;
++            mask = type == 1 ? &smp : type == 2 ? &b : (type >= 3 && type <= 5) ? &t : (type >= 6 && type <= 10) ? &u : NULL;
++            if (!mask)
++                continue;
++            for (; lo <= hi && lo < 64; lo++)
++                *mask |= 1ull << lo;
++        }
++    }
++    if (t & (1ull << 10))
++        return HB_FSR_PASS_NONE; /* FSR2 */
++    if (b == 1 && t == 0x7 && u == 0x1f && !smp)
++        return HB_FSR_PASS_PREPARE_INPUTS;
++    if ((b & 1) && (smp & 2) && (t & (1ull << 8)) && (u & 1) && (u & 4) && !(u & ~0x7ull))
++        return HB_FSR_PASS_ACCUMULATE;
++    return b ? HB_FSR_PASS_OTHER : HB_FSR_PASS_NONE;
++}
++
++static bool hb_contains(const uint8_t *data, size_t size, const char *needle, size_t length)
++{
++    size_t i;
++    for (i = 0; i + length <= size; i++)
++    {
++        if (data[i] == (uint8_t)needle[0] && !memcmp(data + i, needle, length))
++            return true;
++    }
++    return false;
++}
++
++static void hb_fsr_load_table(void)
++{
++    static const char fsr4[] = "fsr4";
++    bool have_prepare = false, have_accumulate = false;
++    size_t capacity = 0, i, file_size;
++    const uint8_t *hash, *psv0;
++    uint32_t hash_size, psv0_size, size, pass;
++    WCHAR path[MAX_PATH];
++    LARGE_INTEGER length;
++    uint8_t *data;
++    DWORD got, n;
++    HANDLE file;
++
++    n = GetModuleFileNameW(NULL, path, MAX_PATH);
++    while (n && path[n - 1] != '\\' && path[n - 1] != '/')
++        n--;
++    path[n] = 0;
++    if (n + 40 >= MAX_PATH)
++        return;
++    wcscat(path, L"amd_fidelityfx_upscaler_dx12.dll");
++    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++    if (file == INVALID_HANDLE_VALUE)
++    {
++        ERR("HB FSR: no FSR provider beside the program.\n");
++        return;
++    }
++    if (!GetFileSizeEx(file, &length) || length.QuadPart > (1 << 28) || !(data = vkd3d_malloc(length.QuadPart)))
++    {
++        CloseHandle(file);
++        return;
++    }
++    file_size = length.QuadPart;
++    if (!ReadFile(file, data, file_size, &got, NULL) || got != file_size)
++    {
++        CloseHandle(file);
++        vkd3d_free(data);
++        return;
++    }
++    CloseHandle(file);
++
++    for (i = 0; i + 32 <= file_size; i++)
++    {
++        if (data[i] != 'D' || memcmp(data + i, "DXBC", 4))
++            continue;
++        size = hb_u32(data + i + 24);
++        if (size < 32 || i + size > file_size)
++            continue;
++        if ((hash = hb_dxbc_part(data + i, size, "HASH", &hash_size)) && hash_size >= 20 &&
++                (psv0 = hb_dxbc_part(data + i, size, "PSV0", &psv0_size)) &&
++                !hb_contains(data + i, size, fsr4, 4) &&
++                (pass = hb_fsr_pass_from_psv0(psv0, psv0_size)) != HB_FSR_PASS_NONE)
++        {
++            if (!vkd3d_array_reserve((void **)&hb_fsr_shaders, &capacity, hb_fsr_shader_count + 1, sizeof(*hb_fsr_shaders)))
++            {
++                ERR("HB FSR: could not build the pass table.\n");
++                goto disable;
++            }
++            have_prepare |= pass == HB_FSR_PASS_PREPARE_INPUTS;
++            have_accumulate |= pass == HB_FSR_PASS_ACCUMULATE;
++            memcpy(hb_fsr_shaders[hb_fsr_shader_count].digest, hash + 4, 16);
++            hb_fsr_shaders[hb_fsr_shader_count++].pass = pass;
++        }
++        i += size - 1;
++    }
++    if (!have_prepare || !have_accumulate)
++    {
++        WARN("HB FSR: provider has no complete prepare_inputs/accumulate pair; leaving FSR dispatches intact.\n");
++        goto disable;
++    }
++
++    vkd3d_free(data);
++    ERR("HB FSR: %zu FSR 3.1 shaders in the provider.\n", hb_fsr_shader_count);
++    return;
++
++disable:
++    vkd3d_free(data);
++    vkd3d_free(hb_fsr_shaders);
++    hb_fsr_shaders = NULL;
++    hb_fsr_shader_count = 0;
++}
++
++static bool hb_fsr_enabled(void)
++{
++    static int enabled = -1;
++    char value[16];
++    if (enabled < 0)
++        enabled = vkd3d_get_env_var("HB_VKD3D_METALFX_FSR", value, sizeof(value)) && (value[0] == '1' || !strcmp(value, "log"));
++    return enabled;
++}
++
++static uint32_t hb_fsr_classify(const void *code, size_t size)
++{
++    const uint8_t *hash;
++    uint32_t hash_size;
++    size_t i;
++
++    if (!hb_fsr_enabled() || !code)
++        return HB_FSR_PASS_NONE;
++    pthread_once(&hb_fsr_once, hb_fsr_load_table);
++    if (!(hash = hb_dxbc_part(code, size, "HASH", &hash_size)) || hash_size < 20)
++        return HB_FSR_PASS_NONE;
++    for (i = 0; i < hb_fsr_shader_count; i++)
++    {
++        if (!memcmp(hb_fsr_shaders[i].digest, hash + 4, 16))
++            return hb_fsr_shaders[i].pass;
++    }
++    return HB_FSR_PASS_NONE;
++}
++
+ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *state,
+         struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc,
+         const struct d3d12_cached_pipeline_state *cached_pso)
+@@ -3290,6 +3499,8 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
+         return hr;
+     }
+ 
++    state->hb_fsr_pass = hb_fsr_classify(desc->cs.pShaderBytecode, desc->cs.BytecodeLength);
++
+     if (FAILED(hr = vkd3d_private_store_init(&state->private_store)))
+     {
+         VK_CALL(vkDestroyPipeline(device->vk_device, state->compute.vk_pipeline, NULL));
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 121dd86a43339509673ac947e41e7a63f76de3d6..0868ad2e3c9b460d41b04010dce7df65eebe3bb8 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -32,6 +32,7 @@
+ #include "vkd3d.h"
+ #include "vkd3d_build.h"
+ #include "vkd3d_version.h"
++#include "vkd3d_hb_upscale.h"
+ #include "vkd3d_shader.h"
+ #include "vkd3d_threads.h"
+ #include "vkd3d_platform.h"
+@@ -1296,6 +1297,7 @@ struct vkd3d_view
+         VkMicromapEXT vk_micromap;
+     };
+     const struct vkd3d_format *format;
++    VkImage hb_vk_image; /* Highball: the image of a texture view (HB_VKD3D_METALFX_FSR) */
+     union
+     {
+         struct
+@@ -2268,6 +2270,15 @@ struct vkd3d_pipeline_cache_compatibility
+ };
+ 
+ /* ID3D12PipelineState */
++/* Highball (HB_VKD3D_METALFX_FSR): FSR 3.1 upscaler passes, recognized by the resource names in their DXIL */
++enum hb_fsr_pass
++{
++    HB_FSR_PASS_NONE = 0,
++    HB_FSR_PASS_OTHER,
++    HB_FSR_PASS_PREPARE_INPUTS,
++    HB_FSR_PASS_ACCUMULATE,
++};
++
+ struct d3d12_pipeline_state
+ {
+     ID3D12PipelineState ID3D12PipelineState_iface;
+@@ -2290,6 +2301,7 @@ struct d3d12_pipeline_state
+     bool root_signature_compat_hash_is_dxbc_derived;
+     bool pso_is_loaded_from_cached_blob;
+     bool pso_is_fully_dynamic;
++    uint32_t hb_fsr_pass; /* Highball: enum hb_fsr_pass, FSR 3.1 compute passes recognized by resource names */
+ 
+     struct vkd3d_private_store private_store;
+     struct d3d_destruction_notifier destruction_notifier;
+@@ -3201,6 +3213,16 @@ struct d3d12_command_list
+     d3d12_command_list_vkd3d_ext_iface ID3D12GraphicsCommandListExt_iface;
+     LONG refcount;
+ 
++    /* Highball (HB_VKD3D_METALFX_FSR): the compute root CBVs as set, and the FSR 3.1 inputs seen this frame */
++    D3D12_GPU_VIRTUAL_ADDRESS hb_compute_root_cbv[D3D12_MAX_ROOT_COST];
++    struct
++    {
++        VkImage color, depth, motion, reactive;
++        uint64_t context;
++        uint32_t cb[32];
++        bool have_inputs;
++    } hb_fsr;
++
+     D3D12_COMMAND_LIST_TYPE type;
+     VkQueueFlags vk_queue_flags;
+ 
+@@ -5528,6 +5550,7 @@ void vkd3d_null_resources_cleanup(struct d3d12_device *device);
+ struct d3d12_device
+ {
+     d3d12_device_iface ID3D12Device_iface;
++    bool hb_upscale_supported; /* Highball: the driver upscales blits with VkHbTemporalUpscaleInfo (vkd3d_hb_upscale.h) */
+     d3d12_device_vkd3d_ext_iface ID3D12DeviceExt_iface;
+     d3d12_dxvk_interop_device_iface ID3D12DXVKInteropDevice_iface;
+     d3d_low_latency_device_iface ID3DLowLatencyDevice_iface;

@@ -26,6 +26,7 @@ vkd3d-proton or DXVK yet.
 | vkd3d-proton `0006` SV_ShadingRate dropped | Pipelines writing a shading rate failed to compile on devices that cannot express it. | general | general | |
 | vkd3d-proton `0007` force_native_fp16 | Games lost pipelines using 16-bit shader operations (16 per Microsoft Flight Simulator 2024 run). | Microsoft Flight Simulator 2024 (its recipe sets it) | workaround (opt-in: `VKD3D_CONFIG=force_native_fp16`) | |
 | vkd3d-proton `0013` swapchain color space | HDR games showed a washed-out grey picture: the surface offered sRGB only, so SetColorSpace1 failed. | games opting in with `DXVK_HDR=1` (Forza Horizon 6, EA SPORTS FC 27) | opt in | KosmicKrisp `0011` |
+| vkd3d-proton `0014` FSR 3.1 on the driver's temporal upscale (MetalFX) | MetalFX's temporal scaler can run in place of the game's FSR 3.1 upscale. | games with FSR 3.1 whose recipe sets `HB_VKD3D_METALFX_FSR=1` (Forza Horizon 6) | Apple GPU (opt in) | KosmicKrisp `0013` |
 | DXVK `0001` unshared fallback | A crash at the game's first boot video when a texture could not be shared. | Microsoft Flight Simulator 2024 | general | Wine 0036 made sharing work later |
 | DXVK `0002` video memory budget | Games filled more memory than the GPU may wire, and the GPU stalled. | Microsoft Flight Simulator 2024 (its recipe sets it) | Apple GPU (opt-in: `dxgi.maxVideoMemoryBudget`) | |
 | DXVK `0003` relaxed features | DXVK rejected Apple GPUs for missing features, geometry shaders included. | every DXVK game on this line (the engine's base environment sets it) | workaround (opt-in: `DXVK_RELAX_FEATURES=1`) | from Michael Liendo's work (highball-db#6) |
@@ -70,6 +71,19 @@ vkd3d-proton or DXVK yet.
   barriers and render pass suspend/resume, `=2` the barriers only. Off by default. On KosmicKrisp suspend/resume only pays
   with KosmicKrisp `0010` (`HB_KK_SKIP_EMPTY_PASSES=1`), which skips the empty renderings its fixups record.
 - `0012` `HB_VKD3D_CONFIG` is appended to `VKD3D_CONFIG`, so a bottle can add flags to the ones its recipe sets.
+
+- `0014` `HB_VKD3D_METALFX_FSR=1` runs a game's own FSR 3.1 upscaler on the driver's temporal upscale when the driver
+  lists "hb-upscale" (KosmicKrisp `0013`, MetalFX's temporal scaler). The passes are recognized from the DXIL hashes
+  and bindings in the game's FSR 3.1 provider DLL, read at run time. A game's recipe turns it on, and the game's
+  own FSR path runs if the provider scan fails or lacks either required pass shape. Accumulate becomes one vkCmdBlitImage2 carrying Highball's VkHbTemporalUpscaleInfo
+  (`include/private/vkd3d_hb_upscale.h`), into the output, or into the upscaled color the game's RCAS sharpens, so RCAS
+  need not be recognized; one scaler per FSR context; pre-exposure from FSR's per-frame ratios; FSR state and saved
+  root CBVs cleared on reset. Based in part on Avery Felts' d3d12_command_list_metalfx_scale (MetalVulkan), used
+  with permission under LGPL 2.1 or later: the barrier setup around the upscale follows it.
+  Forza Horizon 6: FSR Quality on MetalFX, full frame, the game's
+  sharpening kept (2026-11-19). No frame time against stock FSR and no second FSR 3.1 game yet. MetalFX scales by at
+  most 3x, so FSR Ultra Performance at a display height not divisible by 3 asks for more than that and, with the
+  switch on, gets a plain stretch instead of an upscale.
 
 ### DXVK (master of 2026-10-09, 1cad6cd)
 
