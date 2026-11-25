@@ -1,0 +1,305 @@
+From: TxCsOffc <243226414+TxCsOffc@users.noreply.github.com>
+Subject: [PATCH] ARM64EC: opt-in lazy AFP, no FPCR writes on calls between x64 and ARM64EC code
+
+Each call between x64 and ARM64EC code wrote FPCR twice: ExitFunctionEC cleared AH and NEP on the way out and the
+JIT set them again on the way in, and so did every call into FEX's helpers. An FPCR write stalls Apple cores; in
+saved Forza Horizon 6 profiles the write in ExitFunctionEC was FEX's hottest instruction, about 19% of a hot thread.
+
+HB_FEX_LAZY_AFP=1 makes the JIT use NEP but not AH: x86 MIN/MAX and RCP/RSQRT are emulated as on hosts without AFP,
+and RPRES is not used, since it needs AH. Scalar min/max explicitly insert the FCSEL result to preserve x86's upper
+lanes. tests/x64-fidelity/scalarminmax.c checks all 128 destination bits. ExitFunctionEC leaves NEP set and clears
+only the trap enables, and
+only when one is armed, so neither native calls nor helper calls write FPCR. Without the switch, the exit mask is
+the three old ones in one load, and the JIT is unchanged, so everyone pays one load per exit.
+
+Under the switch the program sees these differences:
+
+- With AH clear, FPCR.FZ flushes denormal inputs as well as outputs, so a program that sets MXCSR.FTZ without DAZ
+  also gets DAZ. x87test's mxcsr.ftz.flags shows the related one: no PE after a flushed underflow.
+- The default NaN is positive, where x86's indefinite NaN is negative.
+- NEP stays set in native code. That includes macOS code, since Wine's unix call dispatcher does not touch FPCR, not
+  only ARM64EC code. With NEP set, a scalar SIMD&FP instruction keeps the upper lanes of its destination instead of
+  zeroing them, and LLVM assumes they are zeroed, so compiled code that relies on that, in Wine, the CRT or a macOS
+  library, can compute different results. Wine's CRT math gave bit-identical results over 10,610 calls with NEP set,
+  but that does not cover other native code. Leaving AH set the same way did change the CRT's results (sinh(-1)
+  came out positive), which is why the switch drops AH rather than keeping it.
+- FIZ, set from MXCSR.DAZ, stays set while FEX's own helpers run.
+
+On an M5 Max, macOS 27.2, with the 2026-11-17 build, before scalar min/max kept the upper lanes: a native call 24.0
+to 4.3 ns, QueryPerformanceCounter 40 to 20 ns, scalar SSE unchanged, SSE MIN/MAX 1.80 to 2.27 ns. The x64 fidelity
+programs gave the same results except x87test's mxcsr.ftz.flags, and Forza Horizon 6 played normally with it. None of
+this has been repeated with the current patch, and scalarminmax has not yet run with the switch both ways. Off unless
+HB_FEX_LAZY_AFP=1 is set.
+
+Built for arm64ec on FEX 2610 plus 0001 to 0034.
+---
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index 8986ec4cf00ef30eccc11195d965941fbbf3944d..cde5cefbe8fff2f31a14d0f40e6a9cfc429b3e5e 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -650,9 +650,13 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
+     //
+     // Additional interesting AFP bits:
+     // FIZ(0): Flush Inputs to Zero
+-    orr(ARMEmitter::Size::i64Bit, TmpReg, TmpReg,
+-        (1U << 2) |   // NEP
+-          (1U << 1)); // AH
++    if (FEXCore::Context::HbLazyAFP) {
++      orr(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 1U << 2); // NEP only (Highball HB_FEX_LAZY_AFP)
++    } else {
++      orr(ARMEmitter::Size::i64Bit, TmpReg, TmpReg,
++          (1U << 2) |   // NEP
++            (1U << 1)); // AH
++    }
+ 
+     if (Options.SetFIZ) {
+       // Insert MXCSR.DAZ in to FIZ
+@@ -706,7 +710,18 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
+ 
+ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOptions Options) {
+ #ifndef VIXL_SIMULATOR
+-  if (EmitterCTX->HostFeatures.SupportsAFP) {
++  if (EmitterCTX->HostFeatures.SupportsAFP && FEXCore::Context::HbLazyAFP) {
++    // Highball HB_FEX_LAZY_AFP: keep NEP and FIZ for FEX's helpers (AH is never set); clear the trap enables only when one is armed
++    ARMEmitter::ForwardLabel NoTraps;
++    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++    and_(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0xff00);
++    (void)cbz(ARMEmitter::Size::i64Bit, TmpReg, &NoTraps);
++    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++    bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x1f00);
++    bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x8000);
++    msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
++    (void)Bind(&NoTraps);
++  } else if (EmitterCTX->HostFeatures.SupportsAFP) {
+     // Disable AFP features when spilling registers.
+     //
+     // Disable FPCR.NEP and FPCR.AH and FPCR.FIZ
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 9f04f23f93ff58689f9865f3684b36468ef2ed61..78d3ed6a8e3f6b2164e0e3cc6357f18ea70783f8 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -100,6 +100,7 @@ static bool IsWaitingX87Instruction(const FEXCore::X86Tables::X86InstInfo* Info)
+ 
+ namespace FEXCore::Context {
+ void (*HbJitWriteFn)(bool Enable) = nullptr;
++bool HbLazyAFP = false;
+ 
+ #ifdef ARCHITECTURE_arm64ec
+ // Private profiling data, separate from the versioned shared statistics layout.
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index ce79d6ca242b711ded8f54b2b9d94db9ec023854..e3c2aa47db08f487c22a5c299cc1f90cf63536bc 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -700,8 +700,9 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
+   , HostSupportsSVE128 {ctx->HostFeatures.SupportsSVE128 != 0}
+   , HostSupportsSVE256 {ctx->HostFeatures.SupportsSVE256 != 0}
+   , HostSupportsAVX256 {ctx->HostFeatures.SupportsAVX && ctx->HostFeatures.SupportsSVE256}
+-  , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES != 0}
++  , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES != 0 && !FEXCore::Context::HbLazyAFP} // RPRES needs AH
+   , HostSupportsAFP {ctx->HostFeatures.SupportsAFP != 0}
++  , HostSupportsAH {ctx->HostFeatures.SupportsAFP != 0 && !FEXCore::Context::HbLazyAFP}
+   , HostSupportsFloatExceptions {ctx->HostFeatures.SupportsFloatExceptions != 0}
+   , CTX {ctx}
+   , TempCodeBufferAllocator(ctx->CPUBackendAllocator, 0) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 0e7e97c588920fb5ee022469f26b6fafed4f07d6..592c5c5f63e0a4f67af918bf323b0b88e3f0f241 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -78,6 +78,7 @@ private:
+   const bool HostSupportsAVX256 {};
+   const bool HostSupportsRPRES {};
+   const bool HostSupportsAFP {};
++  const bool HostSupportsAH {}; // Highball: AFP's AH in use (not with HB_FEX_LAZY_AFP)
+   const bool HostSupportsFloatExceptions {};
+ 
+   // x86 RCP*/RSQRT* never raise exceptions, but their host lowering (frecpe, frsqrte, fdiv, fsqrt) traps with the
+@@ -655,7 +656,8 @@ private:
+                             ARMEmitter::VRegister Addend);
+   using ScalarBinaryOpCaller = std::function<void(ARMEmitter::VRegister Dst, ARMEmitter::VRegister Src1, ARMEmitter::VRegister Src2)>;
+   void VFScalarOperation(IR::OpSize OpSize, IR::OpSize ElementSize, bool ZeroUpperBits, ScalarBinaryOpCaller ScalarEmit,
+-                         ARMEmitter::VRegister Dst, ARMEmitter::VRegister Vector1, ARMEmitter::VRegister Vector2);
++                         ARMEmitter::VRegister Dst, ARMEmitter::VRegister Vector1, ARMEmitter::VRegister Vector2,
++                         bool ScalarMergesWithNEP = true);
+   using ScalarUnaryOpCaller = std::function<void(ARMEmitter::VRegister Dst, std::variant<ARMEmitter::VRegister, ARMEmitter::Register> SrcVar)>;
+   void VFScalarUnaryOperation(IR::OpSize OpSize, IR::OpSize ElementSize, bool ZeroUpperBits, ScalarUnaryOpCaller ScalarEmit,
+                               ARMEmitter::VRegister Dst, ARMEmitter::VRegister Vector1,
+diff --git a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+index c6d8c28f5d220e9d1682475a58210b2b614eaaeb..ee2d6eddf29dc94175a83f378924cc4259c9cecf 100644
+--- a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+@@ -294,7 +294,8 @@ void Arm64JITCore::VFScalarFMAOperation(IR::OpSize OpSize, IR::OpSize ElementSiz
+ // The result is stored into the destination. The untouched bits of the destination come from Vector1, unless it's a 256 vector
+ // and ZeroUpperBits is true, in which case the upper bits are zero.
+ void Arm64JITCore::VFScalarOperation(IR::OpSize OpSize, IR::OpSize ElementSize, bool ZeroUpperBits, ScalarBinaryOpCaller ScalarEmit,
+-                                     ARMEmitter::VRegister Dst, ARMEmitter::VRegister Vector1, ARMEmitter::VRegister Vector2) {
++                                     ARMEmitter::VRegister Dst, ARMEmitter::VRegister Vector1, ARMEmitter::VRegister Vector2,
++                                     bool ScalarMergesWithNEP) {
+   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
+   LOGMAN_THROW_A_FMT(!Is256Bit || HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
+   LOGMAN_THROW_A_FMT(Is256Bit || !ZeroUpperBits, "128-bit operation doesn't support ZeroUpperBits in {}", __func__);
+@@ -307,6 +308,7 @@ void Arm64JITCore::VFScalarOperation(IR::OpSize OpSize, IR::OpSize ElementSize,
+                                                        ElementSize == IR::OpSize::i32Bit ? ARMEmitter::SubRegSize::i32Bit :
+                                                                                            ARMEmitter::SubRegSize::i64Bit);
+ 
++  const auto ScalarMerges = HostSupportsAFP && ScalarMergesWithNEP;
+   constexpr auto Predicate = ARMEmitter::PReg::p0;
+ 
+   if (Dst == Vector1) {
+@@ -315,12 +317,11 @@ void Arm64JITCore::VFScalarOperation(IR::OpSize OpSize, IR::OpSize ElementSize,
+       mov(Dst.Q(), Vector1.Q());
+     }
+ 
+-    if (HostSupportsAFP) {
+-      // If the host CPU supports AFP then scalar does an insert without modifying upper bits.
++    if (ScalarMerges) {
++      // The scalar instruction merges its result with the upper lanes.
+       ScalarEmit(Dst, Vector1, Vector2);
+     } else {
+-      // If AFP is unsupported then the operation result goes in to a temporary.
+-      // and then it gets inserted.
++      // Use a temporary when the instruction overwrites the upper lanes.
+       ScalarEmit(VTMP1, Vector1, Vector2);
+       if (!ZeroUpperBits && Is256Bit) {
+         ptrue(SubRegSize.Vector, Predicate, ARMEmitter::PredicatePattern::SVE_VL1);
+@@ -336,7 +337,7 @@ void Arm64JITCore::VFScalarOperation(IR::OpSize OpSize, IR::OpSize ElementSize,
+       mov(Dst.Q(), Vector1.Q());
+     }
+ 
+-    if (HostSupportsAFP) {
++    if (ScalarMerges) {
+       ScalarEmit(Dst, Vector1, Vector2);
+     } else {
+       ScalarEmit(VTMP1, Vector1, Vector2);
+@@ -445,7 +446,7 @@ DEF_OP(VFMinScalarInsert) {
+   const auto SubRegSize = ConvertSubRegSizePair248(IROp);
+ 
+   auto ScalarEmit = [this, SubRegSize](ARMEmitter::VRegister Dst, ARMEmitter::VRegister Src1, ARMEmitter::VRegister Src2) {
+-    if (HostSupportsAFP) {
++    if (HostSupportsAH) {
+       // AFP.AH lets fmin behave like x86 min
+       fmin(SubRegSize.Scalar, Dst, Src1, Src2);
+     } else {
+@@ -463,7 +464,8 @@ DEF_OP(VFMinScalarInsert) {
+   const auto Vector1 = GetVReg(Op->Vector1);
+   const auto Vector2 = GetVReg(Op->Vector2);
+ 
+-  VFScalarOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, ScalarEmit, Dst, Vector1, Vector2);
++  // FCSEL does not merge the upper lanes with FPCR.NEP set.
++  VFScalarOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, ScalarEmit, Dst, Vector1, Vector2, HostSupportsAH);
+ }
+ 
+ DEF_OP(VFMaxScalarInsert) {
+@@ -473,7 +475,7 @@ DEF_OP(VFMaxScalarInsert) {
+ 
+   // AFP can make this more optimal.
+   auto ScalarEmit = [this, SubRegSize](ARMEmitter::VRegister Dst, ARMEmitter::VRegister Src1, ARMEmitter::VRegister Src2) {
+-    if (HostSupportsAFP) {
++    if (HostSupportsAH) {
+       // AFP.AH lets fmax behave like x86 max
+       fmax(SubRegSize.Scalar, Dst, Src1, Src2);
+     } else {
+@@ -489,7 +491,8 @@ DEF_OP(VFMaxScalarInsert) {
+   const auto Vector1 = GetVReg(Op->Vector1);
+   const auto Vector2 = GetVReg(Op->Vector2);
+ 
+-  VFScalarOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, ScalarEmit, Dst, Vector1, Vector2);
++  // FCSEL does not merge the upper lanes with FPCR.NEP set.
++  VFScalarOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, ScalarEmit, Dst, Vector1, Vector2, HostSupportsAH);
+ }
+ 
+ DEF_OP(VFSqrtScalarInsert) {
+@@ -1449,7 +1452,7 @@ DEF_OP(VFMin) {
+   } else {
+     LOGMAN_THROW_A_FMT(!IsScalar, "should use VFMinScalarInsert instead");
+ 
+-    if (HostSupportsAFP) {
++    if (HostSupportsAH) {
+       // AFP.AH lets fmin behave like x86 min
+       fmin(SubRegSize, Dst.Q(), Vector1.Q(), Vector2.Q());
+       return;
+@@ -1508,7 +1511,7 @@ DEF_OP(VFMax) {
+   } else {
+     LOGMAN_THROW_A_FMT(!IsScalar, "should use VFMaxScalarInsert instead");
+ 
+-    if (HostSupportsAFP) {
++    if (HostSupportsAH) {
+       // AFP.AH lets fmax behave like x86 max
+       fmax(SubRegSize, Dst.Q(), Vector1.Q(), Vector2.Q());
+       return;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 7f4797476bd43f7226cc47abbacb8d14c7692649..6793f3461f6fdd86e0088bbef8fb55891a7f0a38 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1333,7 +1333,7 @@ protected:
+       /* On AFP platforms, becomes fmin/fmax and preserves NZCV. Otherwise
+        * becomes fcmp and clobbers.
+        */
+-      if (CTX->HostFeatures.SupportsAFP) {
++      if (CTX->HostFeatures.SupportsAFP && !FEXCore::Context::HbLazyAFP) {
+         return;
+       }
+       break;
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index c9757e13620a7ec610c30f97dd0079afffcd4501..a9215b60fa529d48aad533f5cdbafb664d349164 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -39,6 +39,11 @@ namespace FEXCore::Context {
+ // HbJitWriteFn(false) (its own write-or-execute state); null means the pages are plain read-write-execute memory
+ // that Wine flips between read-write and read-execute on every fault.
+ FEX_DEFAULT_VISIBILITY extern void (*HbJitWriteFn)(bool Enable);
++// Highball HB_FEX_LAZY_AFP=1: the JIT sets FPCR.NEP but not FPCR.AH (no AH-dependent code: MIN/MAX and RPRES are
++// emulated), and leaving the JIT keeps NEP and FIZ (only armed trap enables are cleared, and only when one is armed),
++// so neither helper calls nor native calls write FPCR. Read when code is emitted; set by the frontend before the
++// first compile.
++FEX_DEFAULT_VISIBILITY extern bool HbLazyAFP;
+ inline void HbJitWrite(bool Enable) {
+   if (HbJitWriteFn) {
+     HbJitWriteFn(Enable);
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 0cf6831fccf27037afe276d39fd682808793319d..fdd7243e6c530e2284a7be6e3294ab24b90ba947 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -56,10 +56,12 @@ BeginSimulation:
+ .global ExitFunctionEC
+ ExitFunctionEC:
+   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
++  // The bits cleared come from HbExitFpcrClearMask: NEP + AH (6), the floating-point trap enables IOE DZE OFE UFE
++  // IXE (0x1f00, armed from MXCSR while in the JIT) and IDE (0x8000). HB_FEX_LAZY_AFP=1 leaves NEP set.
+   mrs x17, fpcr
+-  and x16, x17, #~6 // NEP + AH
+-  and x16, x16, #~0x1f00 // floating-point trap enables IOE DZE OFE UFE IXE (armed from MXCSR while in the JIT)
+-  and x16, x16, #~0x8000 // IDE
++  adrp x16, HbExitFpcrClearMask
++  ldr x16, [x16, :lo12:HbExitFpcrClearMask]
++  bic x16, x17, x16
+   eor x17, x17, x16 // writing FPCR is slow on Apple cores, skip it when nothing changes
+   cbz x17, 1f
+   msr fpcr, x16
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 168669f1f96b968195ef9db81babfd33909b7513..0ae4c379fb973201773cfadb34d79a7b4e5d8894 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -79,6 +79,7 @@ extern uint64_t SyscallTable[];
+ extern uint64_t SyscallTableEnd[];
+ 
+ void* X64ReturnInstr; // See Module.S
++uint64_t HbExitFpcrClearMask = 0x9f06; // FPCR bits ExitFunctionEC clears, see Module.S
+ uintptr_t NtDllBase;
+ 
+ // Exports on ARM64EC point to x64 fast forward sequences to allow for redirecting to the JIT if functions are hotpatched. This LUT is from their addresses to the relative addresses of the native code exports.
+@@ -908,6 +909,15 @@ NTSTATUS ProcessInit() {
+   if (const char* Setting = std::getenv("HB_FEX_MAPJIT"); Setting && Setting[0] == '1') {
+     FEXCore::Context::HbJitWriteFn = HbJitWriteToggle;
+   }
++  // Highball HB_FEX_LAZY_AFP=1: the JIT uses FPCR.NEP but not FPCR.AH (x86 MIN/MAX and RCP/RSQRT are emulated as on
++  // hosts without AFP), and NEP stays set while native code and FEX's helpers run, so calls between x64 and ARM64EC
++  // code stop writing FPCR, which serializes the core on Apple chips. NEP only changes the upper lanes of scalar
++  // SIMD&FP results, which compiled code does not read: Wine's CRT math gave bit-identical results over 10,610 calls
++  // with it set (AH, set the same way, changed signs and results). Off unless set.
++  if (const char* Setting = std::getenv("HB_FEX_LAZY_AFP"); Setting && Setting[0] == '1') {
++    HbExitFpcrClearMask = 0x9f02; // AH (never set in this mode) and the trap enables; NEP stays
++    FEXCore::Context::HbLazyAFP = true;
++  }
+   FEX::Windows::SetupThreadHandlers();
+   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
+   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
