@@ -45,6 +45,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0058` ntdll-arm64ec-system-calls-write-into-the-emulators-write-trap | A system call that wrote into a page holding code that already ran failed with an access violation, where Windows writes. | Football Manager 27 | x86-64 fidelity | needs FEX's `BTCpu64NotifyMemoryDirty`; uses `0043`, test in `tests/x64-fidelity/syscallwrite` |
 | `0059` ntdll-dualstack-ipv4-options | Online sessions never started: macOS refuses IPv4 options on a dual-stack UDP socket, so the game closed its socket. | Forza Horizon 6 (online) | macOS | not sent; the Intel line's 0034, same change as MacGameFix#73 |
 | `0060` ws2_32-sio-udp-netreset-from-upstream | `SIO_UDP_NETRESET` failed with 10045, set by the same game socket right before matchmaking. | Forza Horizon 6 (online) | general | backport of Wine 19d5fbd382 (in 11.19); the Intel line's 0035 |
+| `0062` ntdll-wait-on-address-wake-fast-path-and-yielding-spinlock | Forza Horizon 6's job threads spent most of their time spinning on a futex bucket's spinlock in RtlWakeAddressSingle, taken even with nobody waiting. | programs that wake by address from many threads (Forza Horizon 6) | performance | not sent |
 
 ## Details
 
@@ -392,3 +393,17 @@ Games on r5 with `0058` (M5 Pro, macOS 27.2, 2026-11-16):
 | CPU Render | 62.7, 47.6, 39.9 | 62.3, 46.8, 34.4 |
 | GPU | 44.4, 39.2, 37.3 | 44.6, 39.4, 35.6 |
 | GPU limited | 99.8% | 99.8% |
+### Wake by address (0062)
+
+A live profile of Forza Horizon 6 on an M5 Max (2026-11-17) had six to eight of its job threads in a five-instruction
+loop of `ntdll.dll` most of the time: `spin_lock` in `RtlWakeAddressSingle`. `RtlWaitOnAddress` and the wakes hash an
+address to one of 256 queues, each guarded by a spinlock that only ever spins, and every wake took it, waiters or not.
+`0062` counts the waiters of a queue (incremented before the value comparison, with full barriers on both sides, so a
+wake either sees the waiter or the waiter sees the new value) and returns from a wake when there are none; the spinlock
+tests before it sets and yields the core after 256 spins, so a preempted holder no longer keeps every other thread
+spinning for its time slice. `tests/x64-fidelity/wakestress.c` (8 consumers, two runs each, M5 Max, macOS 27.2,
+2026-11-19) consumed every item before and after and went from 3.7-4.1 to 7.4-9.9 million items a second with 4 producers,
+from 2.2-2.9 to 11.4-11.6 million with 16 and from 2.4-2.6 to 11.4-11.5 million with 24; a wake with nobody waiting from
+33 to 27 ns.
+One in-game run showed 8.7 ms CPU and 11.0 ms GPU in the overlay with the patch. There is no recorded before value
+or repeat run to establish the roughly 2 ms CPU estimate.

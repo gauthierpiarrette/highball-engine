@@ -18,6 +18,7 @@ $CC -o "$OUT/kattest.exe"   "$HERE/kattest.c"
 $CC -o "$OUT/drtest.exe"    "$HERE/drtest.c"
 $CC -o "$OUT/drdbg.exe"     "$HERE/drdbg.c"
 $CC -o "$OUT/ordertest.exe" "$HERE/ordertest.c"
+$CC -o "$OUT/wakestress.exe" "$HERE/wakestress.c" -lsynchronization
 $CC -o "$OUT/smcdata.exe"   "$HERE/smcdata.c"
 $CC -o "$OUT/smcretire.exe" "$HERE/smcretire.c"
 $CC -o "$OUT/syscallwrite.exe" "$HERE/syscallwrite.c"
