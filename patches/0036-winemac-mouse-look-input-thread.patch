@@ -1,0 +1,401 @@
+winemac: while a program holds the mouse (mouse look), send its input as it arrives and drop none.
+
+While a program hides and confines the cursor, Cocoa mouse events were posted to the event queue of
+the window's thread, so they reached the server only when that thread pumped messages: once a frame,
+in one lump. SDL 3 reads raw input on a thread of its own (GetRawInputBuffer in relative mode), so
+each lump raced the game's read and its motion landed in that frame or the next. The camera turned
+by none, one or two frames' worth of motion while everything else moved smoothly. Motion was also
+lost outright: every click, release, scroll or warp forced the next move to be absolute, an absolute
+move replaced the relative motion still queued, and a confined cursor's absolute move is a raw delta
+of zero.
+
+While the mouse is locked (cursor hidden and clipped):
+  * the first ClipCursor starts a time-critical mouse thread with its own event queue, and moves,
+    buttons and scroll go to that queue, so they are sent the moment they arrive;
+  * moves are sent as relative deltas only; a forced absolute move waits until the mouse is unlocked;
+  * SetCursorPos discards queued absolute moves but keeps queued relative motion, as Windows does,
+    and events older than the warp are kept rather than dropped.
+Always: an absolute move is queued after relative motion instead of replacing it.
+
+HB_MAC_MOUSE_THREAD=0 turns the mouse thread off; the rest stays on. Menus and windows that don't
+lock the mouse take the old path.
+
+Tested with Deadlock (Source 2, SDL 3, -dx11 on D3DMetal) on engine r22, M4 Pro, macOS 27.2.1,
+165 Hz display with variable refresh: camera turns stuttered with vsync and variable refresh,
+at frame rates where the same game on Windows turns smoothly, and only while the game held the
+mouse. With this patch they are smooth. Not measured with a probe; other games not tried.
+
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 227d68b..70d66b6 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -108,6 +108,8 @@ - (void) setWineController:(WineApplicationController*)newController
+ @end
+ 
+ 
++static WineEventQueue* mouseInputQueue;
++
+ @interface WineApplicationController ()
+ 
+ @property (readwrite, copy, nonatomic) NSEvent* lastFlagsChanged;
+@@ -1259,6 +1261,20 @@ - (void) handleCommandTab
+         }
+     }
+ 
++    // Mouse look: the program hides the cursor and confines it.  Only motion
++    // matters then, so it is sent as relative deltas and never dropped.
++    - (BOOL) mouseIsLocked
++    {
++        return self.clippingCursor && clientWantsCursorHidden;
++    }
++
++    - (WineEventQueue*) queueForMouseEventInWindow:(WineWindow*)window
++    {
++        if (mouseInputQueue && [self mouseIsLocked])
++            return mouseInputQueue;
++        return window.queue;
++    }
++
+     - (BOOL) setCursorPosition:(CGPoint)pos
+     {
+         BOOL ret;
+@@ -1301,12 +1317,16 @@ - (BOOL) setCursorPosition:(CGPoint)pos
+         {
+             WineEventQueue* queue;
+ 
+-            // Discard all pending mouse move events.
++            // Discard all pending mouse move events.  While the mouse is
++            // locked, queued relative motion is real movement the program has
++            // not read yet; Windows keeps it, so keep it too.
++            macdrv_event_mask discard = event_mask_for_type(MOUSE_MOVED_ABSOLUTE);
++            if (![self mouseIsLocked])
++                discard |= event_mask_for_type(MOUSE_MOVED_RELATIVE);
+             [eventQueuesLock lock];
+             for (queue in eventQueues)
+             {
+-                [queue discardEventsMatchingMask:event_mask_for_type(MOUSE_MOVED_RELATIVE) |
+-                                                 event_mask_for_type(MOUSE_MOVED_ABSOLUTE)
++                [queue discardEventsMatchingMask:discard
+                                        forWindow:nil];
+                 [queue resetMouseEventPositions:pos];
+             }
+@@ -1474,6 +1494,7 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+             CGPoint point = CGEventGetLocation([anEvent CGEvent]);
+             macdrv_event* event;
+             BOOL absolute;
++            BOOL locked = [self mouseIsLocked];
+ 
+             // If we recently warped the cursor (other than in our cursor-clipping
+             // event tap), discard mouse move events until we see an event which is
+@@ -1481,13 +1502,25 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+             if (lastSetCursorPositionTime)
+             {
+                 if ([anEvent timestamp] <= lastSetCursorPositionTime)
+-                    return;
+-
+-                lastSetCursorPositionTime = 0;
+-                forceNextMouseMoveAbsolute = TRUE;
++                {
++                    // While locked the event's delta is real motion; keep it.
++                    if (!locked)
++                        return;
++                }
++                else
++                {
++                    lastSetCursorPositionTime = 0;
++                    forceNextMouseMoveAbsolute = TRUE;
++                }
+             }
+ 
+-            if (forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow)
++            if (locked)
++            {
++                // Relative only.  A forced absolute move (after a click,
++                // scroll or warp) stays pending until the mouse is unlocked.
++                absolute = FALSE;
++            }
++            else if (forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow)
+             {
+                 absolute = TRUE;
+                 forceNextMouseMoveAbsolute = FALSE;
+@@ -1575,7 +1608,7 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+                 event->mouse_moved.time_ms = [self ticksForEventTime:[anEvent timestamp]];
+                 event->mouse_moved.drag = drag;
+ 
+-                [targetWindow.queue postEvent:event];
++                [[self queueForMouseEventInWindow:targetWindow] postEvent:event];
+             }
+ 
+             macdrv_release_event(event);
+@@ -1697,7 +1730,7 @@ - (void) handleMouseButton:(NSEvent*)theEvent
+                 event->mouse_button.y = floor(pt.y);
+                 event->mouse_button.time_ms = [self ticksForEventTime:[theEvent timestamp]];
+ 
+-                [window.queue postEvent:event];
++                [[self queueForMouseEventInWindow:window] postEvent:event];
+ 
+                 macdrv_release_event(event);
+             }
+@@ -1879,7 +1912,7 @@ - (void) handleScrollWheel:(NSEvent*)theEvent
+                 }
+ 
+                 if (event->mouse_scroll.x_scroll || event->mouse_scroll.y_scroll)
+-                    [window.queue postEvent:event];
++                    [[self queueForMouseEventInWindow:window] postEvent:event];
+ 
+                 macdrv_release_event(event);
+ 
+@@ -2629,6 +2662,21 @@ static void PerformRequest(void *info)
+ }
+ }
+ 
++/***********************************************************************
++ *              macdrv_set_mouse_input_queue
++ *
++ * Make the given queue (the mouse thread's) receive mouse input while the
++ * mouse is locked.
++ */
++void macdrv_set_mouse_input_queue(macdrv_event_queue queue)
++{
++    WineEventQueue* q = [(WineEventQueue*)queue retain];
++    OnMainThreadAsync(^{
++        [mouseInputQueue release];
++        mouseInputQueue = q;
++    });
++}
++
+ /***********************************************************************
+  *              OnMainThreadAsync
+  *
+diff --git a/dlls/winemac.drv/cocoa_event.m b/dlls/winemac.drv/cocoa_event.m
+index 7c86fc1..f448afa 100644
+--- a/dlls/winemac.drv/cocoa_event.m
++++ b/dlls/winemac.drv/cocoa_event.m
+@@ -213,7 +213,12 @@ - (void) postEventObject:(MacDrvEvent*)event
+              lastEvent->event->type == MOUSE_MOVED_ABSOLUTE) &&
+             lastEvent->event->deliver == INT_MAX &&
+             lastEvent->event->window == event->event->window &&
+-            lastEvent->event->mouse_moved.drag == event->event->mouse_moved.drag)
++            lastEvent->event->mouse_moved.drag == event->event->mouse_moved.drag &&
++            /* Replacing queued relative motion with a position would drop it:
++               raw input reports an absolute move as the distance from the
++               current cursor position, which is zero for a confined cursor. */
++            !(event->event->type == MOUSE_MOVED_ABSOLUTE &&
++              lastEvent->event->type == MOUSE_MOVED_RELATIVE))
+         {
+             if (event->event->type == MOUSE_MOVED_RELATIVE)
+             {
+diff --git a/dlls/winemac.drv/dllmain.c b/dlls/winemac.drv/dllmain.c
+index 2d15f12..71dd1c2 100644
+--- a/dlls/winemac.drv/dllmain.c
++++ b/dlls/winemac.drv/dllmain.c
+@@ -455,6 +455,37 @@ static NTSTATUS WINAPI macdrv_regsetvalueexa(void *arg, ULONG size)
+ }
+ 
+ 
++/***********************************************************************
++ *              macdrv_mouse_thread
++ *
++ * While a program has the cursor hidden and confined (mouse look), the Mac
++ * driver sends mouse input from this thread as soon as it arrives instead of
++ * waiting for the program's window thread to pump messages.  Programs that
++ * read raw input on another thread (SDL 3 does) then see movement in the
++ * frame it happened, as on Windows.
++ */
++static DWORD WINAPI macdrv_mouse_thread(void *arg)
++{
++    MSG msg;
++
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++    if (MACDRV_CALL(mouse_thread_init, NULL)) return 0;
++    for (;;)
++    {
++        MsgWaitForMultipleObjectsEx(0, NULL, INFINITE, QS_ALLINPUT, 0);
++        while (PeekMessageW(&msg, 0, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
++    }
++    return 0;
++}
++
++static NTSTATUS WINAPI macdrv_start_mouse_thread(void *arg, ULONG size)
++{
++    HANDLE thread = CreateThread(NULL, 0, macdrv_mouse_thread, NULL, 0, NULL);
++    if (!thread) return STATUS_UNSUCCESSFUL;
++    CloseHandle(thread);
++    return STATUS_SUCCESS;
++}
++
+ static BOOL process_attach(void)
+ {
+     struct init_params params;
+@@ -488,6 +519,7 @@ static BOOL process_attach(void)
+     params.regcreateopenkeyexa_callback = (UINT_PTR)macdrv_regcreateopenkeyexa;
+     params.regsetvalueexa_callback = (UINT_PTR)macdrv_regsetvalueexa;
+     params.regqueryvalueexa_callback = (UINT_PTR)macdrv_regqueryvalueexa;
++    params.start_mouse_thread_callback = (UINT_PTR)macdrv_start_mouse_thread;
+ 
+     if (MACDRV_CALL(init, &params)) return FALSE;
+ 
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index 1a22e60..ca681c8 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -45,6 +45,8 @@
+ 
+ extern UINT64 app_icon_callback;
+ extern UINT64 app_quit_request_callback;
++extern UINT64 start_mouse_thread_callback;
++extern void macdrv_start_mouse_thread(void);
+ extern UINT64 regcreateopenkeyexa_callback;
+ extern UINT64 regqueryvalueexa_callback;
+ extern UINT64 regsetvalueexa_callback;
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+index b9cc6b6..e82da49 100644
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -485,6 +485,7 @@ static inline macdrv_event_mask event_mask_for_type(int type)
+ extern macdrv_event_queue macdrv_create_event_queue(macdrv_event_handler handler);
+ extern void macdrv_destroy_event_queue(macdrv_event_queue queue);
+ extern int macdrv_get_event_queue_fd(macdrv_event_queue queue);
++extern void macdrv_set_mouse_input_queue(macdrv_event_queue queue);
+ 
+ extern int macdrv_copy_event_from_queue(macdrv_event_queue queue,
+         macdrv_event_mask mask, macdrv_event **event);
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index 56e7a77..de4ce34 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -63,6 +63,8 @@ bool enable_app_nap = false;
+ 
+ UINT64 app_icon_callback = 0;
+ UINT64 app_quit_request_callback = 0;
++UINT64 start_mouse_thread_callback = 0;
++static BOOL mouse_thread_enabled = TRUE;
+ UINT64 regcreateopenkeyexa_callback = 0;
+ UINT64 regqueryvalueexa_callback = 0;
+ UINT64 regsetvalueexa_callback = 0;
+@@ -451,6 +453,11 @@ static NTSTATUS macdrv_init(void *arg)
+     regcreateopenkeyexa_callback = params->regcreateopenkeyexa_callback;
+     regqueryvalueexa_callback = params->regqueryvalueexa_callback;
+     regsetvalueexa_callback = params->regsetvalueexa_callback;
++    start_mouse_thread_callback = params->start_mouse_thread_callback;
++    {
++        const char *env = getenv("HB_MAC_MOUSE_THREAD");
++        mouse_thread_enabled = !(env && env[0] == '0');
++    }
+ 
+     status = SessionGetInfo(callerSecuritySession, NULL, &attributes);
+     if (status != noErr || !(attributes & sessionHasGraphicAccess))
+@@ -642,10 +649,44 @@ static NTSTATUS macdrv_quit_result(void *arg)
+ }
+ 
+ 
++/***********************************************************************
++ *              macdrv_mouse_thread_init
++ *
++ * Runs on the mouse thread: gives it an event queue and makes that queue the
++ * one Cocoa posts mouse input to while the mouse is locked.
++ */
++static NTSTATUS macdrv_mouse_thread_init(void *arg)
++{
++    struct macdrv_thread_data *data = macdrv_init_thread_data();
++    macdrv_set_mouse_input_queue(data->queue);
++    TRACE("mouse thread ready\n");
++    return 0;
++}
++
++
++/***********************************************************************
++ *              macdrv_start_mouse_thread
++ *
++ * Starts the mouse thread the first time a program confines the cursor.
++ */
++void macdrv_start_mouse_thread(void)
++{
++    static LONG started;
++    struct start_mouse_thread_params params = {.dispatch = {.callback = start_mouse_thread_callback}};
++    void *ret_ptr;
++    ULONG ret_len;
++
++    if (!mouse_thread_enabled || !start_mouse_thread_callback) return;
++    if (InterlockedCompareExchange(&started, 1, 0)) return;
++    KeUserDispatchCallback(&params.dispatch, sizeof(params), &ret_ptr, &ret_len);
++}
++
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     macdrv_init,
+     macdrv_quit_result,
++    macdrv_mouse_thread_init,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+@@ -662,6 +703,7 @@ static NTSTATUS wow64_init(void *arg)
+         UINT64 regcreateopenkeyexa_callback;
+         UINT64 regqueryvalueexa_callback;
+         UINT64 regsetvalueexa_callback;
++        UINT64 start_mouse_thread_callback;
+     } *params32 = arg;
+     struct init_params params;
+ 
+@@ -671,6 +713,7 @@ static NTSTATUS wow64_init(void *arg)
+     params.regcreateopenkeyexa_callback = params32->regcreateopenkeyexa_callback;
+     params.regqueryvalueexa_callback = params32->regqueryvalueexa_callback;
+     params.regsetvalueexa_callback = params32->regsetvalueexa_callback;
++    params.start_mouse_thread_callback = params32->start_mouse_thread_callback;
+     return macdrv_init(&params);
+ }
+ 
+@@ -678,6 +721,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+     wow64_init,
+     macdrv_quit_result,
++    macdrv_mouse_thread_init,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
+diff --git a/dlls/winemac.drv/mouse.c b/dlls/winemac.drv/mouse.c
+index c655f56..741acdf 100644
+--- a/dlls/winemac.drv/mouse.c
++++ b/dlls/winemac.drv/mouse.c
+@@ -669,6 +669,7 @@ BOOL macdrv_ClipCursor(const RECT *clip, BOOL reset)
+ 
+     if (clip)
+     {
++        macdrv_start_mouse_thread();
+         rect = CGRectMake(clip->left, clip->top, max(1, clip->right - clip->left),
+                           max(1, clip->bottom - clip->top));
+     }
+diff --git a/dlls/winemac.drv/unixlib.h b/dlls/winemac.drv/unixlib.h
+index 211b5a4..71cb77c 100644
+--- a/dlls/winemac.drv/unixlib.h
++++ b/dlls/winemac.drv/unixlib.h
+@@ -23,6 +23,7 @@
+ {
+     unix_init,
+     unix_quit_result,
++    unix_mouse_thread_init,
+     unix_funcs_count
+ };
+ 
+@@ -44,6 +45,7 @@
+     UINT64 regcreateopenkeyexa_callback;
+     UINT64 regqueryvalueexa_callback;
+     UINT64 regsetvalueexa_callback;
++    UINT64 start_mouse_thread_callback;
+ };
+ 
+ /* macdrv_quit_result params */
+@@ -52,6 +54,12 @@
+     int result;
+ };
+ 
++/* macdrv_start_mouse_thread params */
++struct start_mouse_thread_params
++{
++    struct dispatch_callback_params dispatch;
++};
++
+ /* macdrv_app_icon result */
+ struct app_icon_entry
+ {
