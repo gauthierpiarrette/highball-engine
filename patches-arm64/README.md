@@ -45,6 +45,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0058` ntdll-arm64ec-system-calls-write-into-the-emulators-write-trap | A system call that wrote into a page holding code that already ran failed with an access violation, where Windows writes. | Football Manager 27 | x86-64 fidelity | needs FEX's `BTCpu64NotifyMemoryDirty`; uses `0043`, test in `tests/x64-fidelity/syscallwrite` |
 | `0059` ntdll-dualstack-ipv4-options | Online sessions never started: macOS refuses IPv4 options on a dual-stack UDP socket, so the game closed its socket. | Forza Horizon 6 (online) | macOS | not sent; the Intel line's 0034, same change as MacGameFix#73 |
 | `0060` ws2_32-sio-udp-netreset-from-upstream | `SIO_UDP_NETRESET` failed with 10045, set by the same game socket right before matchmaking. | Forza Horizon 6 (online) | general | backport of Wine 19d5fbd382 (in 11.19); the Intel line's 0035 |
+| `0061` winhttp-websocket-owns-its-connection | WebSocket threads spun on WSAEWOULDBLOCK, about 15,000 receives a second each. | every winhttp WebSocket user (Forza Horizon 6 online services) | general | MetalHorizon launcher's 0002 (alexandreunitypro), ported to 11.18; licence for LGPL asked of its author |
 | `0062` ntdll-wait-on-address-wake-fast-path-and-yielding-spinlock | Forza Horizon 6's job threads spent most of their time spinning on a futex bucket's spinlock in RtlWakeAddressSingle, taken even with nobody waiting. | programs that wake by address from many threads (Forza Horizon 6) | performance | not sent |
 | `0063` ntdll-NtWriteVirtualMemory-on-the-current-process-writes-directly | WriteProcessMemory into the process's own memory failed (the server's Mach task port write is refused), so in-process hooks such as the Steam overlay's could not install. | the Steam overlay, in-process hookers | macOS | pairs with 0064 |
 | `0064` gdi32-d3dkmt-set-process-scheduling-priority-class | Steam's client service ended on an unimplemented import, Steam's main loop stalled and the game froze when its overlay opened. | the Steam overlay | general | the Intel line's 0030 |
@@ -396,6 +397,19 @@ Games on r5 with `0058` (M5 Pro, macOS 27.2, 2026-11-16):
 | CPU Render | 62.7, 47.6, 39.9 | 62.3, 46.8, 34.4 |
 | GPU | 44.4, 39.2, 37.3 | 44.6, 39.4, 35.6 |
 | GPU limited | 99.8% | 99.8% |
+
+### WebSocket connection (0061)
+
+From the MetalHorizon launcher's Wine patch 0002 (alexandreunitypro, github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher),
+ported to 11.18. Its author gave [permission under LGPL-2.1](https://github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher/issues/20#issuecomment-7043976774)
+in response to a request for LGPL-2.1-or-later. Forza Horizon 6's PlayFab and Xbox real-time
+activity WebSockets spun on WSAEWOULDBLOCK, about 15,000 receives a second per thread: the connection stayed on the
+request after the upgrade, went back to the keep-alive pool and was reused by the next request while the WebSocket
+read from it. The WebSocket now owns its connection, and WinHttpWriteData on the upgraded request returns
+ERROR_WINHTTP_INCORRECT_HANDLE_STATE. The first version's blocking-receive wait in net.c is dropped; with this alone
+an online session logged 141 "recv error 10035" in total (M5 Max, macOS 27.2, 2026-11-19). Microsoft Flight Simulator
+2024 not tried. Numbered after #40's 0059 and 0060, which carry the socket options.
+
 ### Wake by address (0062)
 
 A live profile of Forza Horizon 6 on an M5 Max (2026-11-17) had six to eight of its job threads in a five-instruction
