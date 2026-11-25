@@ -51,11 +51,13 @@ jobs:
           foreach ($t in 'cpuidtest','kattest','x87test','x87test32','ctxtest','fibertest','memtest','regiontest','cowtest','imagequery','imagemap','tsctest','syscalltest','drtest','drtest32','drdbg','drdbg32','ordertest','ordertest32','globalroot','topdown','syscallwrite','wakestress','wpmtest','msync-thread-exit','msync-pingpong','scalarminmax') {
             $out = "results/$t.txt"
             $p = Start-Process -FilePath "exe/$t.exe" -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError "results/$t.err"
-            # A killed test still holds its redirected output for a moment; wait for it, or the
-            # append below fails on a locked file and stops every test after it (drdbg on ARM64).
-            if (-not $p.WaitForExit(300000)) { $p.Kill($true); $p.WaitForExit(30000) | Out-Null; "TIMEOUT" | Out-File -Append $out }
-            try { "exit $($p.ExitCode)" | Out-File -Append $out } catch { "exit unknown: $($_.Exception.Message)" | Out-File -Append "results/$t.err" }
-            Get-Content $out | Select-String -Pattern '^(FAIL|SUMMARY)' | ForEach-Object { $_.Line }
+            # A test that hangs (drtest, drdbg on Windows 11 ARM64) can keep its redirected output
+            # locked even after a kill, so the timeout and exit code go to a file of their own, and
+            # nothing here stops the loop: every test after it still runs.
+            $st = "results/$t.status"
+            if (-not $p.WaitForExit(300000)) { try { $p.Kill($true) } catch {}; $p.WaitForExit(30000) | Out-Null; "TIMEOUT" | Out-File -Append $st }
+            "exit $(if ($p.HasExited) { $p.ExitCode } else { 'still running' })" | Out-File -Append $st
+            Get-Content $out -ErrorAction SilentlyContinue | Select-String -Pattern '^(FAIL|SUMMARY)' | ForEach-Object { $_.Line }
           }
       - uses: actions/upload-artifact@v4
         if: always()
