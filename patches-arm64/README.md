@@ -46,6 +46,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0059` ntdll-dualstack-ipv4-options | Online sessions never started: macOS refuses IPv4 options on a dual-stack UDP socket, so the game closed its socket. | Forza Horizon 6 (online) | macOS | not sent; the Intel line's 0034, same change as MacGameFix#73 |
 | `0060` ws2_32-sio-udp-netreset-from-upstream | `SIO_UDP_NETRESET` failed with 10045, set by the same game socket right before matchmaking. | Forza Horizon 6 (online) | general | backport of Wine 19d5fbd382 (in 11.19); the Intel line's 0035 |
 | `0062` ntdll-wait-on-address-wake-fast-path-and-yielding-spinlock | Forza Horizon 6's job threads spent most of their time spinning on a futex bucket's spinlock in RtlWakeAddressSingle, taken even with nobody waiting. | programs that wake by address from many threads (Forza Horizon 6) | performance | not sent |
+| `0063` ntdll-NtWriteVirtualMemory-on-the-current-process-writes-directly | WriteProcessMemory into the process's own memory failed (the server's Mach task port write is refused), so in-process hooks such as the Steam overlay's could not install. | the Steam overlay, in-process hookers | macOS | pairs with 0064 |
 
 ## Details
 
@@ -407,3 +408,23 @@ from 2.2-2.9 to 11.4-11.6 million with 16 and from 2.4-2.6 to 11.4-11.5 million 
 33 to 27 ns.
 One in-game run showed 8.7 ms CPU and 11.0 ms GPU in the overlay with the patch. There is no recorded before value
 or repeat run to establish the roughly 2 ms CPU estimate.
+### WriteProcessMemory on the own process (0063)
+
+Wine writes another process's memory through wineserver, which on macOS writes through the Mach task port. macOS
+refuses the server that port, so WriteProcessMemory failed with ERROR_ACCESS_DENIED even when a process wrote its own
+code. In-process hookers do exactly that: the Steam overlay (GameOverlayRenderer64.dll) logged "WriteProcessMemory()
+call failed trying to overwrite first 5 bytes of function body during hook" for every function and never showed.
+NtWriteVirtualMemory now writes the current process itself with virtual_uninterrupted_write_memory (write access
+checked and write watches updated under the virtual lock, then one memcpy; no probing write into the target), as
+NtReadVirtualMemory already reads it. An x64 test that rewrites the first five bytes of XInputGetState, GetCursorPos,
+CreateDXGIFactory1 and Sleep through WriteProcessMemory got ERROR_ACCESS_DENIED before and succeeds after (M5 Max,
+macOS 27.2, 2026-11-17). The overlay also needs 0064, and its swap chain hooks need DXVK's methods to be detourable
+on ARM64EC, which is a separate change.
+
+The memcpy can fault: with 0019, WRITECOPY image pages stay read-execute on the host until written, and the fault is
+resolved inside the uninterrupted section only because virtual_mutex is recursive and SIGSEGV is not blocked there.
+Pages FEX write-traps while the program sees them writable (0043) are refused by the direct write, so ntdll's ARM64EC
+NtWriteVirtualMemory gives such a page the program's protection back through NtProtectVirtualMemory (the emulator
+drops its translations of it) and writes again. Every program that patches itself through WriteProcessMemory, DRM,
+anti-cheat and mod loaders included, goes from failing to succeeding. `tests/x64-fidelity/wpmtest.c`: 10/2 with the
+unix part alone, 12/0 with both (M5 Max, macOS 27.2, 2026-11-19); memtest, smcdata and smcretire unchanged.
