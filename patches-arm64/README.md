@@ -48,6 +48,7 @@ Kinds are explained in the [top-level README](../README.md#patches-at-a-glance).
 | `0062` ntdll-wait-on-address-wake-fast-path-and-yielding-spinlock | Forza Horizon 6's job threads spent most of their time spinning on a futex bucket's spinlock in RtlWakeAddressSingle, taken even with nobody waiting. | programs that wake by address from many threads (Forza Horizon 6) | performance | not sent |
 | `0063` ntdll-NtWriteVirtualMemory-on-the-current-process-writes-directly | WriteProcessMemory into the process's own memory failed (the server's Mach task port write is refused), so in-process hooks such as the Steam overlay's could not install. | the Steam overlay, in-process hookers | macOS | pairs with 0064 |
 | `0064` gdi32-d3dkmt-set-process-scheduling-priority-class | Steam's client service ended on an unimplemented import, Steam's main loop stalled and the game froze when its overlay opened. | the Steam overlay | general | the Intel line's 0030 |
+| `0065` ntdll-server-msync-on-the-arm64-line | The arm64 line had no msync, so a bottle's msync setting did nothing and every wait went to wineserver; Forza Horizon 6 showed Low Streaming Bandwidth above 200 km/h. | every arm64 bottle in practice (msync is Highball's default sync; WINEMSYNC=1) | macOS | CrossOver 26.3.0's msync (Marc-Aurel Zent, LGPL-2.1 or later, the tarball in `inputs.json`), ported to inproc sync; server protocol 963 |
 
 ## Details
 
@@ -438,3 +439,27 @@ overlay opened in Forza Horizon 6; the overlay stayed empty and the game froze. 
 export and gets STATUS_SUCCESS. The overlay drew and closed normally in a local build that also included Wine
 `0063` and an ARM64EC DXVK change that made the swapchain methods detourable. The overlay is expected to work with
 CI's x86-64 renderers and `0063`; that combination still needs a run.
+### msync (0065)
+
+`0065` brings msync to this line. `dlls/ntdll/unix/msync.[ch]` and `server/msync.[ch]` are byte-identical to CrossOver
+26.3.0's published sources (`crossover-sources-26.3.0.tar.gz`, pinned in `inputs.json`); the glue is ported to 11.18's
+inproc sync, a thread's alert slot is no longer passed to close() when it exits, and
+`get_inproc_sync_fd` carries the msync slot index (protocol 963). `tests/x64-fidelity/msync-pingpong.c` on an M5 Max
+(2026-11-22, an engine whose ntdll.so was built 2026-11-20 and wineserver 2026-11-16), without and with msync: event
+ping-pong 18.2 to 7.0 us, 8 threads on a semaphore and a mutex 1.234 to 0.090 s, and its WaitAny/WaitAll, APC and
+abandoned-mutex checks pass both ways (12/12); `msync-thread-exit` passes both ways too. The earlier figures in this
+paragraph (18.0 to 7.2 us, 1.24 to 0.089 s) came from the same program before it moved under `tests/`, when its
+abandoned-mutex check did not abandon the mutex. Forza Horizon 6:
+"msync: up and running", 400 km/h through Tokyo with no Low Streaming Bandwidth warning. It applies to every bottle whose
+sync is msync, which is Highball's default, so in practice every arm64 bottle gets it, Microsoft Flight Simulator
+2024's included; nobody has tried that game with it yet, nor a 16 GB Mac. Upstream Wine is already at protocol 963 with
+a different layout, so the next rebase has to renumber.
+
+Other programs on the same engine with WINEMSYNC=1 (M5 Max, macOS 27.2, 2026-11-17): Steam's client, its CEF web helper
+(GPU web views on and off) and the Steam overlay ran all day; EA SPORTS FC 27 (D3D12 through vkd3d-proton) ran three
+sessions through its menus and settings; the test program above. The only hang seen was the overlay freeze that 0064
+fixes (Steam's service ending on a missing gdi32 export), not a wait. Highball's
+note that Steam's web helper hung under msync on Wine 10 did not reproduce here.
+
+Source and licence: msync is CodeWeavers' code (Marc-Aurel Zent) from CrossOver's Wine tree, published under Wine's
+LGPL-2.1 or later in CrossOver 26.3.0's source tarball; the files keep their copyright headers.
