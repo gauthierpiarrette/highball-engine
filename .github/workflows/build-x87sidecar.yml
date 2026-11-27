@@ -7,6 +7,8 @@ on:
   push:
     paths:
       - ".github/workflows/build-x87sidecar.yml"
+      - "inputs.json"
+      - "x87sidecar/patches/*.patch"
   workflow_dispatch:
     inputs:
       publish:
@@ -22,6 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: pinned source
+        id: source
         run: |
           set -euo pipefail
           repo=$(python3 -c 'import json;print(json.load(open("inputs.json"))["x87sidecar"]["repo"])')
@@ -29,7 +32,17 @@ jobs:
           git clone --quiet "$repo" src
           git -C src checkout --quiet "$commit"
           git -C src log --oneline -1
+          for p in "$PWD"/x87sidecar/patches/*.patch; do git -C src apply --index "$p"; done
+          echo "tree=$(git -C src write-tree)" >> "$GITHUB_OUTPUT"
+          echo "toolchain=$(xcodebuild -version | shasum -a 256 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.publish) }}
+        id: helper
+        with:
+          path: src/build/bin/x87sidecar
+          key: x87sidecar-${{ runner.os }}-${{ runner.arch }}-${{ steps.source.outputs.tree }}-${{ steps.source.outputs.toolchain }}-${{ hashFiles('.github/workflows/build-x87sidecar.yml') }}
       - name: build
+        if: steps.helper.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           cd src
@@ -61,4 +74,4 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$NAME" "$RUNNER_TEMP/out/$NAME.tar.xz" "$RUNNER_TEMP/out/$NAME.tar.xz.sha256" --title "$NAME" --notes "athei's x87sidecar (MIT, github.com/athei/x87sidecar) built from the commit inputs.json pins."
+        run: gh release create "$NAME" "$RUNNER_TEMP/out/$NAME.tar.xz" "$RUNNER_TEMP/out/$NAME.tar.xz.sha256" --target "$GITHUB_SHA" --title "$NAME" --notes "athei's x87sidecar (MIT, github.com/athei/x87sidecar) built from the commit inputs.json pins and the patches in x87sidecar/patches/."

@@ -27,3 +27,6 @@
 | llvm-mingw | github.com/mstorsjo/llvm-mingw | Apache-2.0 with LLVM exception | build tool only |
 
 Copyright and licence texts of each component are kept unchanged inside the built engine.
+
+The AoE IV patch includes the HDE64 decoder; see [its license in patch 0032](patches/0032-aoe4-rosetta-profile-cache.patch).
+The shared x87sidecar is MIT-licensed. Its archive includes the upstream license. See the [helper patch series and source credits](x87sidecar/patches/README.md).
